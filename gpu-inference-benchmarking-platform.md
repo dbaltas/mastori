@@ -530,6 +530,16 @@ while measuring both:
 
 Datasets such as MMLU and similar benchmarks are also relevant.
 
+### Where to get input prompts / test data
+
+- [MMLU](https://huggingface.co/datasets/cais/mmlu) — multiple-choice knowledge questions; good for quality evaluation
+- [ShareGPT](https://huggingface.co/datasets/anon8231489123/sharegpt_vicuna) — real multi-turn conversations; good for realistic serving workloads
+- [LMSYS-Chat-1M](https://huggingface.co/datasets/lmsys/lmsys-chat-1m) — 1M real-world prompts and chat sessions; good for traffic replay
+- [MT-Bench](https://huggingface.co/datasets/philschmid/mt-bench) — 80 multi-turn questions across 8 categories; good for quick quality checks
+- [OpenOrca / Alpaca](https://huggingface.co/datasets/Open-Orca/OpenOrca) — instruction-following prompts; good for generating varied prompt lengths
+
+For performance benchmarking, the input prompts and expected output token counts come from the workload profiles (§13); for quality benchmarking, the above datasets are used.
+
 Keep quality evaluation separate from the performance benchmark.
 
 The performance system asks:
