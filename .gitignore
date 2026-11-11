@@ -1,0 +1,11 @@
+# Local tooling state
+.kilo/
+
+# OS artifacts
+.DS_Store
+
+# Go build artifacts (for future code)
+bin/
+dist/
+*.test
+*.out
