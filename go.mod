@@ -3,6 +3,7 @@ module github.com/dbaltas/mastori
 go 1.27.4
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.4.0
 	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/go-chi/chi/v5 v5.2.1
 	github.com/prometheus/client_golang v1.21.1

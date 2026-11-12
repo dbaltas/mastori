@@ -128,6 +128,8 @@ func newAccumulator() *accumulator {
 		byStatus: make(map[int]int),
 		errors:   make(map[string]int),
 		datasets: make(map[string]int),
+		latency:  *newLatencyStats(),
+		ttft:     *newLatencyStats(),
 	}
 }
 

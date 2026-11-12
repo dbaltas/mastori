@@ -179,6 +179,15 @@ Redis is where requests wait before the scheduler dispatches them.
 
 This is separate from vLLM's internal queue.
 
+The V1 implementation covers the happy path. Production hardening is a
+known follow-up, with open questions to answer explicitly:
+
+- What happens when Redis dies halfway through a job?
+- What happens when a worker dies mid-generation? How are jobs reclaimed?
+- How are abandoned jobs and orphaned per-job streams cleaned up?
+- What is the retention policy for job and chunk streams?
+- What happens when a result consumer disconnects?
+
 ## 6. The Go scheduler
 
 This is probably the most interesting part of the project.
@@ -411,11 +420,28 @@ At minimum:
 ### Inference
 
 - TTFT
+- inter-token latency (TPOT — time per output token)
 - generation latency
 - input tokens/sec
 - output tokens/sec
 - total tokens/sec
 - concurrent requests
+
+Latency metrics are layer-specific, and published comparisons must say
+which layer they mean:
+
+- **Client TTFT / TPOT** — measured by the traffic generator at the SSE
+  client; includes the full path (network, API, queue, inference).
+- **API TTFT / TPOT** — measured at the Go API; `mastori_api_ttft_seconds`
+  counts from request receipt to the first streamed token.
+- **Inference TTFT / TPOT** — exported by vLLM itself as Prometheus
+  histograms (`vllm:time_to_first_token_seconds`,
+  `vllm:time_per_output_token_seconds`); excludes the queue, API, and
+  network, and has no per-request correlation to Mastori traces.
+
+The same request can legitimately have a 200 ms client TTFT and a 120 ms
+inference TTFT. Reporting "TTFT: 120 ms" without the layer label would be
+publishing the wrong number.
 
 ### GPU
 
@@ -424,7 +450,17 @@ At minimum:
 - temperature/power if available
 - GPU-level throughput metrics
 
+GPU metrics come from the DCGM exporter rather than ad-hoc collection;
+DCGM also provides the pre-benchmark hardware diagnostics described in
+§14.
+
 And then correlate them.
+
+Latency percentiles are accumulated in an HDR histogram: memory is bounded
+regardless of run length or request rate, and percentile error is bounded
+by the configured significant figures (±1% at 3 sig figs). Raw per-request
+values are persisted as JSONL, so exact percentiles remain computable
+offline from the raw records.
 
 ## 13. Traffic generator
 
@@ -453,11 +489,36 @@ And support different workloads:
 
 Varyable parameters:
 
-- input tokens
-- output tokens
+- input-length distribution
+- output-length distribution (specified separately from input)
 - request rate
 - concurrency
 - duration
+
+Input and output length distributions matter separately. An LLM's
+performance changes dramatically with token counts, and the two dimensions
+are not interchangeable: 500-token prompts with 100-token outputs behave
+like a different system than 500-token prompts with 2,000-token outputs. A
+"mixed" workload is therefore defined by both distributions, not just
+"some short and some long prompts".
+
+Workload profiles specify each distribution explicitly, for example:
+
+```yaml
+input_tokens:
+  distribution:       # mixture or empirical percentiles from the dataset
+    - {length: 500,  weight: 0.70}
+    - {length: 2000, weight: 0.25}
+    - {length: 8000, weight: 0.05}
+output_tokens:
+  distribution:
+    - {length: 100,  weight: 0.80}
+    - {length: 500,  weight: 0.20}
+```
+
+Sampling is seeded (`--seed` in the traffic CLI), so a workload profile
+produces the same request sequence for the same seed. Reproducible traffic
+is a precondition for repeatable, comparable runs (§14).
 
 This lets the project simulate things like:
 
@@ -467,9 +528,99 @@ This lets the project simulate things like:
 - 80% short + 20% long
 - sudden 10x traffic burst
 
-## 14. Experiments
+## 14. Benchmark methodology
+
+A single run produces a number. A benchmark produces a claim. The gap
+between the two is methodology — without it, cross-provider results are
+not scientifically trustworthy.
+
+### Pin the environment
+
+Every run records a run manifest alongside the results JSONL:
+
+- GPU model/SKU and clock behavior
+- driver version
+- CUDA version
+- vLLM version
+- model revision (pinned Hugging Face commit hash)
+- quantization implementation
+- model configuration: tensor parallelism, max batch size, concurrency
+- CPU/RAM/storage configuration
+- networking setup
+
+Two runs are only comparable when the manifest shows they ran on the same
+controlled environment. Any uncontrolled difference is recorded as a
+caveat next to the result.
+
+### Validate the hardware before benchmarking
+
+Renting a GPU that is labeled H100 does not guarantee a healthy H100.
+Before a provider's GPU enters any comparison, run DCGM diagnostics
+against it:
+
+- memory and compute stress checks
+- PCIe/NVLink verification
+- power and thermal behavior
+- clock/throttling behavior
+- performance outlier detection
+
+A GPU that fails or underperforms diagnostics is excluded, with the DCGM
+report attached to the run manifest. This prevents attributing a provider
+problem or a faulty card to the wrong cause.
+
+Cloud host variability is real: noisy neighbors and background workloads
+on the same host change results between two runs of the identical
+experiment. This is exactly why repetitions exist — the spread between
+runs is itself a measured property of the provider, and unusually wide
+spread is reported rather than explained away.
+
+### Repeat and report spread
+
+- Every experiment runs N times (3–5), ideally with a model/replica
+  restart between runs.
+- Report the median or mean of the N runs together with the spread
+  (min/max or standard deviation).
+- A single run is anecdote, not a measurement.
+
+### Confidence intervals and the comparison rule
+
+A comparison produces an interval, not a number:
+
+```
+Nebius +4.8% ± 1.1% tokens/sec vs AWS (5 runs, p50)
+```
+
+Interpretation rule: if the confidence intervals of two configurations
+overlap, report "no measurable difference" — never a ranking. This is what
+makes a statement like "Nebius is 12.5% faster" legitimate, instead of a
+conclusion drawn from two single-run numbers.
+
+### Outliers and failures
+
+- Exclusions (timeouts, transport errors) are defined before the run; the
+  excluded counts are reported next to the results, not hidden.
+- Failed requests never silently vanish from the summary.
+
+### Warmup and steady state
+
+- Warmup requests are excluded from measurement (the traffic generator
+  already does this).
+- Compilation, model loading, and cache filling happen outside the
+  measured window.
+
+### Cost comparability
+
+Prices drift. Cost figures are captured together with the timestamp of the
+quote, and cross-provider cost comparisons state when that snapshot was
+taken.
+
+## 15. Experiments
 
 This is where the project becomes genuinely useful.
+
+Each experiment fixes every variable except one, runs N repetitions under
+the methodology of §14, and states upfront how the results will be
+interpreted.
 
 For example:
 
@@ -526,7 +677,20 @@ while measuring both:
 - memory
 - quality
 
-## 15. Quality benchmarking
+### Experiment 7 — cross-provider comparison
+
+Same run manifest, same model revision, same workload profile, same
+scheduler; only the provider changes (§18).
+
+Reported as a difference with uncertainty under the §14 rules:
+
+```
+Nebius +4.8% ± 1.1% tokens/sec vs AWS (5 runs, p50)
+```
+
+never as single-run numbers.
+
+## 16. Quality benchmarking
 
 Datasets such as MMLU and similar benchmarks are also relevant.
 
@@ -564,7 +728,59 @@ cost / 1M tok    $X           $Y
 
 That becomes a very interesting engineering tradeoff.
 
-## 16. The provider abstraction
+## 17. Where Mastori fits among established benchmarks
+
+Mastori does not compete with the established GPU/LLM benchmarks — it
+orchestrates and normalizes them. Being explicit about what each tool does
+well is part of the design:
+
+- **MLPerf Inference** (MLCommons) — the industry standard for comparing
+  hardware and systems under standardized, peer-reviewed workloads. The
+  most credible answer to "how does this hardware compare" — but it does
+  not answer "what will *my* model, *my* workload, and *my* SLA look like
+  on provider X".
+- **MLPerf Endpoints** — measures complete inference systems through real
+  API endpoints under varying workloads, aimed at buyers comparing
+  production performance and cost. The closest existing project to
+  Mastori's goal, and the most important one to study and stay aligned
+  with.
+- **vLLM's benchmarking tools** — excellent for real LLM serving
+  performance against vLLM deployments (throughput, latency, TTFT,
+  concurrency sweeps). Mastori's workload generator should be able to
+  express equivalent scenarios.
+- **TensorRT-LLM `trtllm-bench`** — serious NVIDIA-focused LLM benchmark
+  (TTFT, time per output token, concurrency levels) when the engine is
+  TensorRT-LLM rather than vLLM.
+- **NVIDIA DCGM** — answers "is this GPU healthy and performing
+  correctly", not "is it fast". Essential as a pre-benchmark validation
+  step (§14) and as the GPU metrics exporter (§12).
+
+The gap Mastori targets is orchestration across providers: run recognized
+benchmarks plus its own standardized real-workload tests, repeatedly, on
+comparable infrastructure across clouds, and normalize the results into a
+cost/latency/throughput/reliability comparison:
+
+```
+              Mastori (orchestration + normalization)
+                    │
+      ┌─────────────┼──────────────┐
+      ▼             ▼              ▼
+   MLPerf /     vLLM bench /   DCGM
+   Endpoints    trtllm-bench   diagnostics
+      │             │              │
+      └─────────────┼──────────────┘
+                    ▼
+          standardized runs per provider
+                    │
+                    ▼
+        "best GPU for $/token, p95, and SLA"
+```
+
+The value proposition is therefore not "trust our benchmark" — it is "we
+run recognized benchmarks in a standardized, repeated, environment-pinned
+way across providers, and report the differences with uncertainty".
+
+## 18. The provider abstraction
 
 This is a particularly valuable part of the idea.
 
@@ -624,9 +840,11 @@ provider: verda
 
 and run the same experiment.
 
-That gives reproducibility.
+That gives reproducibility. Reproducible setup is not yet comparable
+results, though — §14 defines what additionally makes the numbers
+trustworthy.
 
-## 17. The eventual CLI
+## 19. The eventual CLI
 
 Don't implement this first, but this is the direction to aim for:
 
@@ -659,7 +877,7 @@ The ideal experience is:
 
 > one command → infrastructure → Kubernetes → model → observability → traffic → results → teardown.
 
-## 18. Repository structure
+## 20. Repository structure
 
 A good starting point:
 
@@ -704,7 +922,7 @@ mastori/
 
 Don't worry if this evolves. The important thing is keeping provider infrastructure, Kubernetes deployment, scheduling, inference, and benchmarking separate.
 
-## 19. Most importantly: don't build all of this at once
+## 21. Most importantly: don't build all of this at once
 
 Follow this sequence.
 

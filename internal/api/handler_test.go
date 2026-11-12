@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/dbaltas/mastori/internal/config"
 	"github.com/dbaltas/mastori/internal/metrics"
 	"github.com/dbaltas/mastori/internal/queue"
@@ -18,16 +19,20 @@ import (
 )
 
 type fakeQueue struct {
-	mu         sync.Mutex
-	enqueued   []queue.Job
-	enqueueErr error
-	waitFn     func(ctx context.Context, id string) (queue.Result, error)
-	pingErr    error
-	chunkFn    func(ctx context.Context, id string) (<-chan queue.Chunk, <-chan error)
-	abandoned  []string
+	mu           sync.Mutex
+	enqueued     []queue.Job
+	enqueueErr   error
+	enqueueDelay time.Duration
+	waitFn       func(ctx context.Context, id string) (queue.Result, error)
+	pingErr      error
+	chunkFn      func(ctx context.Context, id string) (<-chan queue.Chunk, <-chan error)
+	abandoned    []string
 }
 
 func (f *fakeQueue) Enqueue(_ context.Context, job queue.Job) error {
+	if f.enqueueDelay > 0 {
+		time.Sleep(f.enqueueDelay)
+	}
 	if f.enqueueErr != nil {
 		return f.enqueueErr
 	}
@@ -420,6 +425,60 @@ func TestStreamInvalidBody(t *testing.T) {
 	if len(fq.enqueued) != 0 {
 		t.Errorf("unexpected enqueue on invalid request")
 	}
+}
+
+func TestStreamTTFTIncludesParseAndEnqueue(t *testing.T) {
+	fq := &fakeQueue{
+		enqueueDelay: 100 * time.Millisecond,
+		chunkFn: func(_ context.Context, id string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk, 1)
+			chunks <- queue.Chunk{JobID: id, Text: "ok", Done: true, TokensOut: 1}
+			close(chunks)
+			errCh := make(chan error)
+			return chunks, errCh
+		},
+	}
+	m := metrics.New()
+	h := NewHandler(&config.Config{
+		RequestTimeout: 5 * time.Second,
+		MaxInflight:    1000,
+		DefaultModel:   "test-model",
+	}, fq, m, slog.New(slog.DiscardHandler))
+	srv := NewRouter(&config.Config{}, m, slog.New(slog.DiscardHandler), fq.Ping, h)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	count, sum := ttftSample(m.Registry)
+	if count != 1 {
+		t.Fatalf("ttft sample count = %d, want 1", count)
+	}
+	if sum < 0.05 {
+		t.Errorf("ttft = %.6fs, want >= 50ms: metric must cover parse and enqueue time from request receipt", sum)
+	}
+}
+
+func ttftSample(reg *prometheus.Registry) (uint64, float64) {
+	families, err := reg.Gather()
+	if err != nil {
+		return 0, 0
+	}
+	for _, mf := range families {
+		if mf.GetName() != "mastori_api_ttft_seconds" {
+			continue
+		}
+		for _, ms := range mf.GetMetric() {
+			if hist := ms.GetHistogram(); hist != nil {
+				return hist.GetSampleCount(), hist.GetSampleSum()
+			}
+		}
+	}
+	return 0, 0
 }
 
 func TestMetricsExposed(t *testing.T) {

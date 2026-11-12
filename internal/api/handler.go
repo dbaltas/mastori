@@ -100,6 +100,8 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "api.generate_stream")
 	defer span.End()
 
+	waitStart := time.Now()
+
 	sq, ok := h.queue.(queue.StreamingQueue)
 	if !ok {
 		writeError(w, http.StatusNotImplemented, "streaming not supported by queue")
@@ -126,7 +128,6 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 	waitCtx, cancel := context.WithTimeout(ctx, h.cfg.RequestTimeout)
 	defer cancel()
 
-	waitStart := time.Now()
 	chunks, errCh := sq.ConsumeChunks(waitCtx, job.ID)
 
 	w.Header().Set("Content-Type", "text/event-stream")
