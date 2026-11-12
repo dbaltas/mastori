@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -51,44 +52,10 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "api.generate")
 	defer span.End()
 
-	var req generateRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	job, ok := h.parseAndEnqueue(w, r, ctx, span)
+	if !ok {
 		return
 	}
-	if req.Prompt == "" {
-		writeError(w, http.StatusBadRequest, "prompt is required")
-		return
-	}
-	model := req.Model
-	if model == "" {
-		model = h.cfg.DefaultModel
-	}
-
-	span.SetAttributes(
-		attribute.String("job.model", model),
-		attribute.Int("job.prompt_len", len(req.Prompt)),
-	)
-
-	job := queue.Job{
-		ID:        newJobID(),
-		TraceID:   traceIDFromContext(ctx),
-		Model:     model,
-		Prompt:    req.Prompt,
-		CreatedAt: time.Now().UTC(),
-	}
-	span.SetAttributes(attribute.String("job.id", job.ID))
-
-	enqStart := time.Now()
-	if err := h.queue.Enqueue(ctx, job); err != nil {
-		h.m.EnqueueErrors.Inc()
-		span.RecordError(err)
-		h.logger.ErrorContext(ctx, "enqueue failed", "error", err)
-		writeError(w, http.StatusServiceUnavailable, "queue unavailable")
-		return
-	}
-	h.m.EnqueueSeconds.Observe(time.Since(enqStart).Seconds())
-	h.m.JobsEnqueued.Inc()
 
 	h.m.Inflight.Inc()
 	defer h.m.Inflight.Dec()
@@ -122,6 +89,159 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		TokensOut: res.TokensOut,
 		TotalMs:   time.Since(waitStart).Milliseconds(),
 	})
+}
+
+func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
+	ctx, span := tracer.Start(r.Context(), "api.generate_stream")
+	defer span.End()
+
+	sq, ok := h.queue.(queue.StreamingQueue)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "streaming not supported by queue")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported by writer")
+		return
+	}
+
+	job, ok := h.parseAndEnqueue(w, r, ctx, span)
+	if !ok {
+		return
+	}
+
+	h.m.Inflight.Inc()
+	defer h.m.Inflight.Dec()
+
+	waitCtx, cancel := context.WithTimeout(ctx, h.cfg.RequestTimeout)
+	defer cancel()
+
+	waitStart := time.Now()
+	chunks, errCh := sq.ConsumeChunks(waitCtx, job.ID)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	completed := false
+	firstToken := true
+
+	failStream := func(err error, msg string) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			span.SetAttributes(attribute.Bool("job.timed_out", true))
+			msg = "request timed out waiting for result"
+		} else {
+			span.RecordError(err)
+			h.logger.ErrorContext(ctx, "stream failed", "error", err, "job_id", job.ID)
+		}
+		_ = writeSSE(w, "error", map[string]string{"error": msg})
+		flusher.Flush()
+		_ = sq.Abandon(context.WithoutCancel(waitCtx), job.ID)
+	}
+
+	for !completed {
+		select {
+		case chunk, ok := <-chunks:
+			if !ok {
+				select {
+				case err := <-errCh:
+					if err != nil {
+						failStream(err, "failed to retrieve result")
+						return
+					}
+				default:
+				}
+				completed = true
+				break
+			}
+			if firstToken {
+				h.m.TTFTSeconds.Observe(time.Since(waitStart).Seconds())
+				firstToken = false
+			}
+			h.m.ChunksStreamed.Inc()
+			if !writeSSE(w, "chunk", chunk) {
+				_ = sq.Abandon(context.WithoutCancel(waitCtx), job.ID)
+				return
+			}
+			flusher.Flush()
+			if chunk.Done {
+				span.SetAttributes(
+					attribute.Int64("job.tokens_out", chunk.TokensOut),
+					attribute.Int64("job.duration_ms", chunk.DurationMs),
+				)
+				completed = true
+			}
+		case err := <-errCh:
+			failStream(err, "failed to retrieve result")
+			return
+		case <-waitCtx.Done():
+			failStream(waitCtx.Err(), "request timed out waiting for result")
+			return
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "event: done\ndata: [DONE]\n\n"); err != nil {
+		return
+	}
+	flusher.Flush()
+}
+
+func (h *Handler) parseAndEnqueue(w http.ResponseWriter, r *http.Request, ctx context.Context, span trace.Span) (queue.Job, bool) {
+	var req generateRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return queue.Job{}, false
+	}
+	if req.Prompt == "" {
+		writeError(w, http.StatusBadRequest, "prompt is required")
+		return queue.Job{}, false
+	}
+	model := req.Model
+	if model == "" {
+		model = h.cfg.DefaultModel
+	}
+
+	span.SetAttributes(
+		attribute.String("job.model", model),
+		attribute.Int("job.prompt_len", len(req.Prompt)),
+	)
+
+	job := queue.Job{
+		ID:        newJobID(),
+		TraceID:   traceIDFromContext(ctx),
+		Model:     model,
+		Prompt:    req.Prompt,
+		CreatedAt: time.Now().UTC(),
+	}
+	span.SetAttributes(attribute.String("job.id", job.ID))
+
+	enqStart := time.Now()
+	if err := h.queue.Enqueue(ctx, job); err != nil {
+		h.m.EnqueueErrors.Inc()
+		span.RecordError(err)
+		h.logger.ErrorContext(ctx, "enqueue failed", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "queue unavailable")
+		return queue.Job{}, false
+	}
+	h.m.EnqueueSeconds.Observe(time.Since(enqStart).Seconds())
+	h.m.JobsEnqueued.Inc()
+
+	return job, true
+}
+
+func writeSSE(w http.ResponseWriter, event string, payload any) bool {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b); err != nil {
+		return false
+	}
+	return true
 }
 
 func newJobID() string {

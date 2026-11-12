@@ -12,6 +12,8 @@ type Config struct {
 	RedisAddr      string
 	RedisStream    string
 	ResultPrefix   string
+	ChunksPrefix   string
+	AbandonPrefix  string
 	RequestTimeout time.Duration
 	DefaultModel   string
 	OTLPEndpoint   string
@@ -25,6 +27,8 @@ func Load() (*Config, error) {
 		RedisAddr:      getenv("REDIS_ADDR", "localhost:6379"),
 		RedisStream:    getenv("REDIS_STREAM", "jobs"),
 		ResultPrefix:   getenv("REDIS_RESULT_PREFIX", "jobs:result:"),
+		ChunksPrefix:   getenv("REDIS_CHUNKS_PREFIX", "jobs:chunks:"),
+		AbandonPrefix:  getenv("REDIS_ABANDON_PREFIX", "jobs:abandon:"),
 		RequestTimeout: 60 * time.Second,
 		DefaultModel:   getenv("DEFAULT_MODEL", "default"),
 		OTLPEndpoint:   os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),

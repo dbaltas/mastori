@@ -41,6 +41,7 @@ func NewRouter(cfg *config.Config, m *metrics.Metrics, logger *slog.Logger, read
 		_, _ = w.Write([]byte("ready"))
 	})
 	r.Post("/generate", h.Generate)
+	r.Post("/generate/stream", h.GenerateStream)
 
 	return r
 }

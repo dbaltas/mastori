@@ -12,6 +12,8 @@ type Metrics struct {
 	JobsEnqueued    prometheus.Counter
 	EnqueueErrors   prometheus.Counter
 	Inflight        prometheus.Gauge
+	TTFTSeconds     prometheus.Histogram
+	ChunksStreamed  prometheus.Counter
 }
 
 func New() *Metrics {
@@ -71,6 +73,23 @@ func New() *Metrics {
 				Help:      "Number of requests currently waiting for a result.",
 			},
 		),
+		TTFTSeconds: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Namespace: "mastori",
+				Subsystem: "api",
+				Name:      "ttft_seconds",
+				Help:      "Time from request received to first streamed token.",
+				Buckets:   []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+			},
+		),
+		ChunksStreamed: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: "mastori",
+				Subsystem: "api",
+				Name:      "chunks_streamed_total",
+				Help:      "Total chunks streamed to clients.",
+			},
+		),
 	}
 
 	reg.MustRegister(
@@ -80,6 +99,8 @@ func New() *Metrics {
 		m.JobsEnqueued,
 		m.EnqueueErrors,
 		m.Inflight,
+		m.TTFTSeconds,
+		m.ChunksStreamed,
 	)
 
 	return m

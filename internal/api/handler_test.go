@@ -23,6 +23,8 @@ type fakeQueue struct {
 	enqueueErr error
 	waitFn     func(ctx context.Context, id string) (queue.Result, error)
 	pingErr    error
+	chunkFn    func(ctx context.Context, id string) (<-chan queue.Chunk, <-chan error)
+	abandoned  []string
 }
 
 func (f *fakeQueue) Enqueue(_ context.Context, job queue.Job) error {
@@ -42,9 +44,47 @@ func (f *fakeQueue) WaitResult(ctx context.Context, id string) (queue.Result, er
 	return queue.Result{JobID: id, Text: "ok"}, nil
 }
 
+func (f *fakeQueue) ConsumeChunks(ctx context.Context, id string) (<-chan queue.Chunk, <-chan error) {
+	if f.chunkFn != nil {
+		return f.chunkFn(ctx, id)
+	}
+	chunks := make(chan queue.Chunk, 1)
+	chunks <- queue.Chunk{JobID: id, Text: "ok", Done: true, TokensOut: 5}
+	close(chunks)
+	errCh := make(chan error)
+	return chunks, errCh
+}
+
+func (f *fakeQueue) Abandon(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.abandoned = append(f.abandoned, id)
+	return nil
+}
+
 func (f *fakeQueue) Ping(_ context.Context) error { return f.pingErr }
 
 func (f *fakeQueue) Close() error { return nil }
+
+type blockingOnlyQueue struct {
+	mu       sync.Mutex
+	enqueued []queue.Job
+}
+
+func (b *blockingOnlyQueue) Enqueue(_ context.Context, job queue.Job) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.enqueued = append(b.enqueued, job)
+	return nil
+}
+
+func (*blockingOnlyQueue) WaitResult(_ context.Context, id string) (queue.Result, error) {
+	return queue.Result{JobID: id, Text: "ok"}, nil
+}
+
+func (*blockingOnlyQueue) Ping(_ context.Context) error { return nil }
+
+func (*blockingOnlyQueue) Close() error { return nil }
 
 func newTestServer(t *testing.T, q queue.Queue, timeout time.Duration) http.Handler {
 	t.Helper()
@@ -209,6 +249,126 @@ func TestHealthEndpoints(t *testing.T) {
 			t.Errorf("healthz status = %d, want 200", rec.Code)
 		}
 	})
+}
+
+func TestStreamSuccess(t *testing.T) {
+	fq := &fakeQueue{
+		chunkFn: func(_ context.Context, id string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk, 3)
+			chunks <- queue.Chunk{JobID: id, Text: "hel"}
+			chunks <- queue.Chunk{JobID: id, Text: "lo"}
+			chunks <- queue.Chunk{JobID: id, Text: "", Done: true, TokensIn: 2, TokensOut: 5, QueueWaitMs: 1, DurationMs: 9}
+			close(chunks)
+			errCh := make(chan error)
+			return chunks, errCh
+		},
+	}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("content-type = %q, want text/event-stream", ct)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{"event: chunk", `"text":"hel"`, `"text":"lo"`, `"done":true`, `"tokens_out":5`, "event: done", "data: [DONE]"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stream body missing %q; body:\n%s", want, body)
+		}
+	}
+	if len(fq.abandoned) != 0 {
+		t.Errorf("unexpected abandon on successful stream: %v", fq.abandoned)
+	}
+}
+
+func TestStreamTimeout(t *testing.T) {
+	fq := &fakeQueue{
+		chunkFn: func(ctx context.Context, _ string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk)
+			errCh := make(chan error, 1)
+			go func() {
+				<-ctx.Done()
+				errCh <- ctx.Err()
+				close(chunks)
+			}()
+			return chunks, errCh
+		},
+	}
+	srv := newTestServer(t, fq, 50*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (SSE headers already sent)", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "timed out") {
+		t.Errorf("stream body missing error event; body:\n%s", body)
+	}
+	if len(fq.abandoned) != 1 {
+		t.Errorf("job not abandoned after timeout")
+	}
+}
+
+func TestStreamQueueError(t *testing.T) {
+	fq := &fakeQueue{
+		chunkFn: func(_ context.Context, _ string) (<-chan queue.Chunk, <-chan error) {
+			errCh := make(chan error, 1)
+			errCh <- errors.New("redis died")
+			chunks := make(chan queue.Chunk)
+			close(chunks)
+			return chunks, errCh
+		},
+	}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Errorf("stream body missing error event; body:\n%s", body)
+	}
+	if len(fq.abandoned) != 1 {
+		t.Errorf("job not abandoned after queue error")
+	}
+}
+
+func TestStreamNotSupportedByQueue(t *testing.T) {
+	srv := newTestServer(t, &blockingOnlyQueue{}, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", rec.Code)
+	}
+}
+
+func TestStreamInvalidBody(t *testing.T) {
+	fq := &fakeQueue{}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": ""}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if len(fq.enqueued) != 0 {
+		t.Errorf("unexpected enqueue on invalid request")
+	}
 }
 
 func TestMetricsExposed(t *testing.T) {

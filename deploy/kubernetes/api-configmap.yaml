@@ -8,6 +8,8 @@ data:
   REDIS_ADDR: "redis.mastori.svc.cluster.local:6379"
   REDIS_STREAM: "jobs"
   REDIS_RESULT_PREFIX: "jobs:result:"
+  REDIS_CHUNKS_PREFIX: "jobs:chunks:"
+  REDIS_ABANDON_PREFIX: "jobs:abandon:"
   REQUEST_TIMEOUT: "60"
   DEFAULT_MODEL: "default"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
