@@ -22,3 +22,7 @@ Before jumping into coding, discuss whether integration tests should be implemen
 - Consider integration tests when the change crosses component boundaries (e.g. API → Redis → scheduler → worker), depends on real infrastructure behavior (Redis semantics, Kubernetes, Prometheus scraping), or touches a provider abstraction.
 - Agree on scope (what is covered, what infrastructure is needed, how it runs locally and in CI) before writing code.
 - If the decision is to skip them, note the reason briefly in the PR or task summary.
+
+## Local ports
+
+- All host ports for the local stacks (kind `extraPortMappings` and `docker compose`) must be in the range 7000–7999.

@@ -14,6 +14,9 @@ nodes:
       - containerPort: 30080
         hostPort: 7080
         protocol: TCP
+      - containerPort: 30081
+        hostPort: 7081
+        protocol: TCP
   - role: worker
     labels:
       mastori/pool: cpu
