@@ -1,0 +1,30 @@
+name: API tests
+
+on:
+  push:
+    paths:
+      - "cmd/api/**"
+      - "internal/api/**"
+      - "internal/queue/**"
+      - "internal/metrics/**"
+      - "internal/tracing/**"
+      - "internal/config/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/api-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./cmd/api/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/...
+      - name: Unit tests
+        run: go test -race ./cmd/api/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/...
