@@ -1,0 +1,37 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_ADDR: redis:6379
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+      LOG_LEVEL: info
+    depends_on:
+      - redis
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.120.0
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./deploy/otel/collector-config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8889:8889"
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
