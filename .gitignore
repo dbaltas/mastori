@@ -12,3 +12,6 @@ dist/
 
 # Dataset cache (fetched at run time, never committed)
 benchmark/workloads/cache/
+
+# Traffic run artifacts (results JSONL, run metadata)
+benchmark/results/
