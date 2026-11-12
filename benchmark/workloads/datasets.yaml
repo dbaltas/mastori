@@ -1,0 +1,56 @@
+# Dataset manifest for Mastori benchmarks.
+#
+# Each entry defines a deterministic fetch recipe against a pinned Hugging Face
+# dataset revision. Rows are retrieved through the HF datasets-server /rows API
+# and written as JSONL into the local cache (benchmark/workloads/cache/,
+# gitignored). The `validate` section lets `mastori-datasets validate` verify a
+# cache file: minimum row count, required fields, and exact content spot checks.
+
+datasets:
+  mmlu-short:
+    description: >
+      MMLU multiple-choice questions. Short prompts (question + 4 choices,
+      ~50 tokens median) and single-letter answers. Used for short-prompt
+      workloads and quality benchmarking.
+    source: cais/mmlu
+    config: all
+    split: test
+    revision: c30699e8356da336a370243923dbaf21066bb9fe
+    extract: mmlu
+    selection:
+      start: 0
+      count: 500
+    validate:
+      min_rows: 500
+      required_fields: [subject, question, choices, answer]
+      spot_checks:
+        - index: 0
+          contains: "field extension Q(sqrt(2), sqrt(3), sqrt(18))"
+        - index: 249
+          contains: "Milky Way is part of a giant supercluster"
+        - index: 499
+          contains: "Ammonia is produced in repeated high intensity exercise"
+
+  sharegpt-long:
+    description: >
+      ShareGPT real conversations. First human turn as prompt, real assistant
+      responses with long outputs (p50 ~390 tokens). Used for medium/long
+      workloads.
+    source: Aeala/ShareGPT_Vicuna_unfiltered
+    config: default
+    split: train
+    revision: 8b0048ad6ae8c22f46a78c15559dec98feef5539
+    extract: first_human_turn
+    selection:
+      start: 0
+      count: 500
+    validate:
+      min_rows: 500
+      required_fields: [prompt]
+      spot_checks:
+        - index: 0
+          contains: "Product Launch Formula"
+        - index: 123
+          contains: "SWOT Analysis"
+        - index: 499
+          contains: "are people more creative when they view many pieces"
