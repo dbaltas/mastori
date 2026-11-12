@@ -2,6 +2,10 @@
 
 Guidance for AI agents and contributors working on Mastori. See [README.md](README.md) and the [design document](gpu-inference-benchmarking-platform.md) for project context.
 
+## Sessions
+
+- Unless the user specifically says otherwise, start every session by rebasing onto the latest `origin/main` (`git fetch origin && git rebase origin/main`).
+
 ## Testing
 
 ### Unit tests

@@ -54,6 +54,7 @@ func main() {
 	maxInflight := fs.Int("max-inflight", 0, "cap on in-flight requests (open loop, default 4x rate)")
 	duration := fs.Duration("duration", 5*time.Minute, "measured run duration")
 	warmup := fs.Duration("warmup", 0, "warmup duration, excluded from the summary")
+	drainGrace := fs.Duration("warmup-drain-grace", 0, "max wait for in-flight warmup requests to finish before measured traffic starts (default timeout+10s)")
 	timeout := fs.Duration("timeout", 65*time.Second, "per-request timeout")
 
 	seed := fs.Int64("seed", 42, "seed for dataset sampling and arrival jitter")
@@ -94,6 +95,7 @@ func main() {
 		Weights:     weights,
 		Seed:        *seed,
 		Warmup:      *warmup,
+		DrainGrace:  *drainGrace,
 		Duration:    *duration,
 		Concurrency: *concurrency,
 		Rate:        *rate,

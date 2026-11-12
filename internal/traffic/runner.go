@@ -30,7 +30,10 @@ type Config struct {
 	MaxInflight int
 	Stream      bool // use the SSE /generate/stream endpoint
 	Timeout     time.Duration
-	OutputPath  string
+	// DrainGrace caps how long the measured phase waits for in-flight
+	// warmup requests to finish (default Timeout + 10s).
+	DrainGrace time.Duration
+	OutputPath string
 }
 
 func (c *Config) Validate() error {
@@ -45,6 +48,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = 65 * time.Second
+	}
+	if c.DrainGrace < 0 {
+		return fmt.Errorf("drain grace must not be negative")
 	}
 	if c.RunID == "" {
 		c.RunID = time.Now().UTC().Format("20060102T150405")
@@ -81,31 +87,33 @@ func (c *Config) inflightLimit() int {
 }
 
 type Summary struct {
-	RunID            string         `json:"run_id"`
-	StartedAt        time.Time      `json:"started_at"`
-	FinishedAt       time.Time      `json:"finished_at"`
-	WarmupRequests   int            `json:"warmup_requests"`
-	Requests         int            `json:"requests"`
-	Successes        int            `json:"successes"`
-	Failures         int            `json:"failures"`
-	ByStatus         map[int]int    `json:"by_status"`
-	Errors           map[string]int `json:"errors"`
-	RequestedRate    float64        `json:"requested_rate"`
-	AchievedSendRate float64        `json:"achieved_send_rate"`
-	Throughput       float64        `json:"throughput_rps"`
-	LatencyMsP50     float64        `json:"latency_ms_p50"`
-	LatencyMsP95     float64        `json:"latency_ms_p95"`
-	LatencyMsP99     float64        `json:"latency_ms_p99"`
-	LatencyMsMean    float64        `json:"latency_ms_mean"`
-	LatencyMsMin     float64        `json:"latency_ms_min"`
-	LatencyMsMax     float64        `json:"latency_ms_max"`
-	TTFTMsP50        float64        `json:"ttft_ms_p50"`
-	TTFTMsP95        float64        `json:"ttft_ms_p95"`
-	TTFTMsMean       float64        `json:"ttft_ms_mean"`
-	TokensOutTotal   int64          `json:"tokens_out_total"`
-	OutputPath       string         `json:"output_path"`
-	Mode             string         `json:"mode"`
-	Datasets         map[string]int `json:"datasets"`
+	RunID             string         `json:"run_id"`
+	StartedAt         time.Time      `json:"started_at"`
+	MeasuredStartedAt time.Time      `json:"measured_started_at"`
+	WarmupDrainMs     int64          `json:"warmup_drain_ms"`
+	FinishedAt        time.Time      `json:"finished_at"`
+	WarmupRequests    int            `json:"warmup_requests"`
+	Requests          int            `json:"requests"`
+	Successes         int            `json:"successes"`
+	Failures          int            `json:"failures"`
+	ByStatus          map[int]int    `json:"by_status"`
+	Errors            map[string]int `json:"errors"`
+	RequestedRate     float64        `json:"requested_rate"`
+	AchievedSendRate  float64        `json:"achieved_send_rate"`
+	Throughput        float64        `json:"throughput_rps"`
+	LatencyMsP50      float64        `json:"latency_ms_p50"`
+	LatencyMsP95      float64        `json:"latency_ms_p95"`
+	LatencyMsP99      float64        `json:"latency_ms_p99"`
+	LatencyMsMean     float64        `json:"latency_ms_mean"`
+	LatencyMsMin      float64        `json:"latency_ms_min"`
+	LatencyMsMax      float64        `json:"latency_ms_max"`
+	TTFTMsP50         float64        `json:"ttft_ms_p50"`
+	TTFTMsP95         float64        `json:"ttft_ms_p95"`
+	TTFTMsMean        float64        `json:"ttft_ms_mean"`
+	TokensOutTotal    int64          `json:"tokens_out_total"`
+	OutputPath        string         `json:"output_path"`
+	Mode              string         `json:"mode"`
+	Datasets          map[string]int `json:"datasets"`
 }
 
 // accumulator collects counters from concurrent send goroutines.
@@ -158,6 +166,74 @@ func (a *accumulator) add(r Record, ok bool) {
 	}
 }
 
+// warmupBarrier separates the warmup phase from the measured phase. Sends
+// scheduled before the boundary are registered as in flight; the measured
+// phase starts only after every registered request has completed, bounded
+// by maxWait so a hung warmup request cannot wedge the run.
+type warmupBarrier struct {
+	mu        sync.Mutex
+	wg        sync.WaitGroup
+	boundary  time.Time
+	maxWait   time.Duration
+	once      sync.Once
+	drainDone chan struct{}
+	drainWall time.Duration
+	drainOK   bool
+	start     time.Time // when the measured phase began
+}
+
+func newWarmupBarrier(boundary time.Time, maxWait time.Duration) *warmupBarrier {
+	return &warmupBarrier{
+		boundary:  boundary,
+		maxWait:   maxWait,
+		drainDone: make(chan struct{}),
+	}
+}
+
+// mark classifies a send scheduled at t. Warmup sends are registered as
+// in flight (the caller must call done after completion); sends at or past
+// the boundary are measured and untracked.
+func (b *warmupBarrier) mark(t time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !t.Before(b.boundary) {
+		return false
+	}
+	b.wg.Add(1)
+	return true
+}
+
+func (b *warmupBarrier) done() { b.wg.Done() }
+
+// close ends the warmup phase and waits until every in-flight warmup
+// request has completed, bounded by maxWait or ctx. It reports the wait
+// duration and whether the drain fully completed. Concurrent callers block
+// until the first wait resolves.
+func (b *warmupBarrier) close(ctx context.Context) (time.Duration, bool) {
+	b.once.Do(func() {
+		waitStart := time.Now()
+		drained := make(chan struct{})
+		go func() {
+			b.wg.Wait()
+			close(drained)
+		}()
+		timer := time.NewTimer(b.maxWait)
+		defer timer.Stop()
+		select {
+		case <-drained:
+			b.drainOK = true
+		case <-timer.C:
+			fmt.Fprintf(os.Stderr, "warning: warmup requests still in flight after %v; measured phase may be contaminated\n", b.maxWait)
+		case <-ctx.Done():
+		}
+		b.drainWall = time.Since(waitStart)
+		b.start = time.Now()
+		close(b.drainDone)
+	})
+	<-b.drainDone
+	return b.drainWall, b.drainOK
+}
+
 // Run executes the configured traffic run and returns its summary.
 func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	if err := cfg.Validate(); err != nil {
@@ -176,19 +252,38 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	total := cfg.Warmup + cfg.Duration
 	started := time.Now()
 	warmupEnd := started.Add(cfg.Warmup)
+	drainGrace := cfg.DrainGrace
+	if drainGrace <= 0 {
+		drainGrace = cfg.Timeout + 10*time.Second
+	}
+	barrier := newWarmupBarrier(warmupEnd, drainGrace)
 
 	var seq atomic.Int64
 	acc := newAccumulator()
 
 	var wg sync.WaitGroup
 	if cfg.Concurrency > 0 {
-		deadline := started.Add(total)
 		for i := 0; i < cfg.Concurrency; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for time.Now().Before(deadline) {
-					runSend(ctx, sender, selector, writer, acc, &seq, warmupEnd, cfg)
+				crossed := false
+				deadline := started.Add(total)
+				for {
+					now := time.Now()
+					warmup := now.Before(warmupEnd)
+					if !warmup && !crossed {
+						// Drain in-flight warmup requests before
+						// the first measured send leaves this worker.
+						barrier.close(ctx)
+						deadline = time.Now().Add(cfg.Duration)
+						crossed = true
+					}
+					if !now.Before(deadline) {
+						return
+					}
+					tracked := barrier.mark(now)
+					runSend(ctx, sender, selector, writer, acc, &seq, cfg, warmup, barrier, tracked)
 					if ctx.Err() != nil {
 						return
 					}
@@ -200,31 +295,70 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			end := started.Add(total)
-			for {
-				elapsed := time.Since(started)
-				if !time.Now().Before(end) {
-					return
-				}
-				delay := pattern.NextDelay(elapsed)
+			launch := func(delay time.Duration, sendAt time.Time, warmup, tracked bool) bool {
 				timer := time.NewTimer(delay)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					return
+					if tracked {
+						barrier.done()
+					}
+					return false
 				case <-timer.C:
 				}
 				select {
 				case <-ctx.Done():
-					return
+					if tracked {
+						barrier.done()
+					}
+					return false
 				case sem <- struct{}{}:
 				}
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					defer func() { <-sem }()
-					runSend(ctx, sender, selector, writer, acc, &seq, warmupEnd, cfg)
+					runSend(ctx, sender, selector, writer, acc, &seq, cfg, warmup, barrier, tracked)
 				}()
+				return true
+			}
+
+			// Warmup phase: pattern clock anchored at the run start,
+			// stopping at the boundary.
+			if cfg.Warmup > 0 {
+				for {
+					now := time.Now()
+					if !now.Before(warmupEnd) {
+						break
+					}
+					sendAt := now.Add(pattern.NextDelay(now.Sub(started)))
+					if !sendAt.Before(warmupEnd) {
+						// The next scheduled send lands past the
+						// boundary; cut warmup traffic here.
+						break
+					}
+					if !launch(sendAt.Sub(now), sendAt, true, barrier.mark(sendAt)) {
+						return
+					}
+				}
+				barrier.close(ctx)
+			}
+
+			// Measured phase: pattern clock anchored at measuredStart so
+			// the drain gap does not skip scheduled arrivals, and ramp or
+			// step patterns span the measured window.
+			measuredStart := time.Now()
+			end := measuredStart.Add(cfg.Duration)
+			for {
+				now := time.Now()
+				if !now.Before(end) {
+					return
+				}
+				delay := pattern.NextDelay(now.Sub(measuredStart))
+				sendAt := now.Add(delay)
+				if !launch(delay, sendAt, false, false) {
+					return
+				}
 			}
 		}()
 	}
@@ -239,7 +373,7 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(total + cfg.Timeout + 10*time.Second):
+	case <-time.After(total + drainGrace + cfg.Timeout + 10*time.Second):
 		fmt.Fprintf(os.Stderr, "warning: in-flight requests did not drain within grace; returning partial summary\n")
 	}
 	finished := time.Now()
@@ -247,12 +381,20 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	s := acc.snapshot(cfg)
 	s.RunID = cfg.RunID
 	s.StartedAt = started
+	s.MeasuredStartedAt = barrier.start
+	if s.MeasuredStartedAt.IsZero() {
+		s.MeasuredStartedAt = started
+	}
+	s.WarmupDrainMs = barrier.drainWall.Milliseconds()
 	s.FinishedAt = finished
 	s.OutputPath = cfg.OutputPath
 	return s, nil
 }
 
-func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, writer *ResultWriter, acc *accumulator, seq *atomic.Int64, warmupEnd time.Time, cfg *Config) {
+func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, writer *ResultWriter, acc *accumulator, seq *atomic.Int64, cfg *Config, warmup bool, barrier *warmupBarrier, tracked bool) {
+	if tracked {
+		defer barrier.done()
+	}
 	sctx, cancel := context.WithTimeout(ctx, cfg.Timeout+5*time.Second)
 	defer cancel()
 
@@ -271,7 +413,7 @@ func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, w
 		Seq:        seq.Add(1),
 		Dataset:    row.Dataset,
 		RowIndex:   row.Index,
-		Warmup:     sendAt.Before(warmupEnd),
+		Warmup:     warmup,
 		SendAt:     sendAt,
 		Status:     res.Status,
 		LatencyMs:  latency.Milliseconds(),
