@@ -9,3 +9,6 @@ bin/
 dist/
 *.test
 *.out
+
+# Dataset cache (fetched at run time, never committed)
+benchmark/workloads/cache/

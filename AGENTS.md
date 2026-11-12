@@ -12,6 +12,7 @@ Always aim for basic unit tests.
 - Keep unit tests fast, deterministic, and independent of external services (no real Redis, Kubernetes, GPUs, or cloud providers). Use fakes or mocks at the boundaries.
 - Bug fixes should include a test that fails without the fix.
 - If a change genuinely cannot be unit tested, say so explicitly and explain why.
+- Unit tests must run in CI. Every package with unit tests needs a GitHub Actions job (under `.github/workflows/`) that runs them on push, scoped with `paths:` filters to the related code. When adding a new component with tests, add or extend its workflow in the same change.
 
 ### Integration tests
 
