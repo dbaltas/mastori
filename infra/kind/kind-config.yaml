@@ -11,8 +11,8 @@ nodes:
     labels:
       mastori/pool: infra
     extraPortMappings:
-      - containerPort: 80
-        hostPort: 8080
+      - containerPort: 30080
+        hostPort: 7080
         protocol: TCP
   - role: worker
     labels:

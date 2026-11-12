@@ -62,6 +62,12 @@ func (f *fakeQueue) Abandon(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeQueue) enqueuedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.enqueued)
+}
+
 func (f *fakeQueue) Ping(_ context.Context) error { return f.pingErr }
 
 func (f *fakeQueue) Close() error { return nil }
@@ -91,9 +97,54 @@ func newTestServer(t *testing.T, q queue.Queue, timeout time.Duration) http.Hand
 	m := metrics.New()
 	h := NewHandler(&config.Config{
 		RequestTimeout: timeout,
+		MaxInflight:    1000,
 		DefaultModel:   "test-model",
 	}, q, m, slog.New(slog.DiscardHandler))
 	return NewRouter(&config.Config{}, m, slog.New(slog.DiscardHandler), q.Ping, h)
+}
+
+func TestInflightCap(t *testing.T) {
+	fq := &fakeQueue{
+		waitFn: func(ctx context.Context, _ string) (queue.Result, error) {
+			select {
+			case <-ctx.Done():
+				return queue.Result{}, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+				return queue.Result{Text: "ok"}, nil
+			}
+		},
+	}
+	h := NewHandler(&config.Config{
+		RequestTimeout: 5 * time.Second,
+		MaxInflight:    1,
+		DefaultModel:   "test-model",
+	}, fq, metrics.New(), slog.New(slog.DiscardHandler))
+	srv := NewRouter(&config.Config{}, metrics.New(), slog.New(slog.DiscardHandler), fq.Ping, h)
+
+	recCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt": "hi"}`))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		recCh <- rec
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("second request status = %d, want 429", rec.Code)
+	}
+	if got := fq.enqueuedCount(); got != 1 {
+		t.Errorf("rejected request should not be enqueued; enqueued = %d", got)
+	}
+
+	rec1 := <-recCh
+	if rec1.Code != http.StatusOK {
+		t.Errorf("first request status = %d, want 200", rec1.Code)
+	}
 }
 
 func TestGenerateSuccess(t *testing.T) {

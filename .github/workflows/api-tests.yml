@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "cmd/api/**"
+      - "cmd/mockworker/**"
       - "internal/api/**"
       - "internal/queue/**"
       - "internal/metrics/**"
       - "internal/tracing/**"
       - "internal/config/**"
+      - "internal/worker/**"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/api-tests.yml"
@@ -25,6 +27,6 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Vet
-        run: go vet ./cmd/api/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/...
+        run: go vet ./cmd/api/... ./cmd/mockworker/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/... ./internal/worker/...
       - name: Unit tests
-        run: go test -race ./cmd/api/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/...
+        run: go test -race ./cmd/api/... ./cmd/mockworker/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/... ./internal/worker/...

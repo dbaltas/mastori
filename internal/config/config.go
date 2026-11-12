@@ -11,10 +11,10 @@ type Config struct {
 	ListenAddr     string
 	RedisAddr      string
 	RedisStream    string
-	ResultPrefix   string
 	ChunksPrefix   string
 	AbandonPrefix  string
 	RequestTimeout time.Duration
+	MaxInflight    int
 	DefaultModel   string
 	OTLPEndpoint   string
 	SamplerRatio   float64
@@ -26,14 +26,22 @@ func Load() (*Config, error) {
 		ListenAddr:     getenv("LISTEN_ADDR", ":8080"),
 		RedisAddr:      getenv("REDIS_ADDR", "localhost:6379"),
 		RedisStream:    getenv("REDIS_STREAM", "jobs"),
-		ResultPrefix:   getenv("REDIS_RESULT_PREFIX", "jobs:result:"),
 		ChunksPrefix:   getenv("REDIS_CHUNKS_PREFIX", "jobs:chunks:"),
 		AbandonPrefix:  getenv("REDIS_ABANDON_PREFIX", "jobs:abandon:"),
 		RequestTimeout: 60 * time.Second,
+		MaxInflight:    1000,
 		DefaultModel:   getenv("DEFAULT_MODEL", "default"),
 		OTLPEndpoint:   os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 		SamplerRatio:   1.0,
 		LogLevel:       getenv("LOG_LEVEL", "info"),
+	}
+
+	if v := os.Getenv("MAX_INFLIGHT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid MAX_INFLIGHT %q: must be a positive integer", v)
+		}
+		cfg.MaxInflight = n
 	}
 
 	if v := os.Getenv("REQUEST_TIMEOUT"); v != "" {

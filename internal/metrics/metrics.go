@@ -14,6 +14,7 @@ type Metrics struct {
 	Inflight        prometheus.Gauge
 	TTFTSeconds     prometheus.Histogram
 	ChunksStreamed  prometheus.Counter
+	BusyRejections  prometheus.Counter
 }
 
 func New() *Metrics {
@@ -90,6 +91,14 @@ func New() *Metrics {
 				Help:      "Total chunks streamed to clients.",
 			},
 		),
+		BusyRejections: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: "mastori",
+				Subsystem: "api",
+				Name:      "busy_rejections_total",
+				Help:      "Total requests rejected because the in-flight cap was reached.",
+			},
+		),
 	}
 
 	reg.MustRegister(
@@ -101,6 +110,7 @@ func New() *Metrics {
 		m.Inflight,
 		m.TTFTSeconds,
 		m.ChunksStreamed,
+		m.BusyRejections,
 	)
 
 	return m

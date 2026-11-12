@@ -39,7 +39,7 @@ func main() {
 		}
 	}()
 
-	q := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisStream, cfg.ResultPrefix, cfg.ChunksPrefix, cfg.AbandonPrefix)
+	q := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisStream, cfg.ChunksPrefix, cfg.AbandonPrefix)
 	defer func() {
 		if err := q.Close(); err != nil {
 			logger.Warn("redis close error", "error", err)

@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mockworker
+  namespace: mastori
+  labels:
+    app: mockworker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mockworker
+  template:
+    metadata:
+      labels:
+        app: mockworker
+    spec:
+      containers:
+        - name: mockworker
+          image: mastori/api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/mockworker"]
+          envFrom:
+            - configMapRef:
+                name: mockworker-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi

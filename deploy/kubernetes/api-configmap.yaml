@@ -7,11 +7,26 @@ data:
   LISTEN_ADDR: ":8080"
   REDIS_ADDR: "redis.mastori.svc.cluster.local:6379"
   REDIS_STREAM: "jobs"
-  REDIS_RESULT_PREFIX: "jobs:result:"
   REDIS_CHUNKS_PREFIX: "jobs:chunks:"
   REDIS_ABANDON_PREFIX: "jobs:abandon:"
   REQUEST_TIMEOUT: "60"
+  MAX_INFLIGHT: "1000"
   DEFAULT_MODEL: "default"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
   OTEL_TRACES_SAMPLER_ARG: "1.0"
   LOG_LEVEL: "info"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mockworker-config
+  namespace: mastori
+data:
+  REDIS_ADDR: "redis.mastori.svc.cluster.local:6379"
+  REDIS_STREAM: "jobs"
+  REDIS_CHUNKS_PREFIX: "jobs:chunks:"
+  REDIS_ABANDON_PREFIX: "jobs:abandon:"
+  WORKER_MIN_TOKENS: "16"
+  WORKER_MAX_TOKENS: "96"
+  WORKER_TOKEN_DELAY_MS: "10"
+  WORKER_FIRST_DELAY_MS: "30"

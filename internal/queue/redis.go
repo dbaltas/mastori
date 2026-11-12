@@ -2,10 +2,10 @@ package queue
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,18 +19,16 @@ const (
 type RedisQueue struct {
 	client        *redis.Client
 	stream        string
-	resultPrefix  string
 	chunksPrefix  string
 	abandonPrefix string
 }
 
-func NewRedisQueue(addr, stream, resultPrefix, chunksPrefix, abandonPrefix string) *RedisQueue {
+func NewRedisQueue(addr, stream, chunksPrefix, abandonPrefix string) *RedisQueue {
 	return &RedisQueue{
 		client: redis.NewClient(&redis.Options{
 			Addr: addr,
 		}),
 		stream:        stream,
-		resultPrefix:  resultPrefix,
 		chunksPrefix:  chunksPrefix,
 		abandonPrefix: abandonPrefix,
 	}
@@ -52,24 +50,34 @@ func (q *RedisQueue) Enqueue(ctx context.Context, job Job) error {
 }
 
 func (q *RedisQueue) WaitResult(ctx context.Context, jobID string) (Result, error) {
-	channel := q.resultPrefix + jobID
-	key := channel
+	chunks, errCh := q.ConsumeChunks(ctx, jobID)
 
-	sub := q.client.Subscribe(ctx, channel)
-	defer sub.Close()
-
-	if val, err := q.client.Get(ctx, key).Result(); err == nil {
-		return parseResult(val)
-	}
-
-	select {
-	case msg, ok := <-sub.Channel():
-		if !ok {
-			return Result{}, fmt.Errorf("queue: subscription closed for job %s", jobID)
+	var sb strings.Builder
+	for {
+		select {
+		case chunk, ok := <-chunks:
+			if !ok {
+				return Result{}, fmt.Errorf("queue: chunk stream closed before done for job %s", jobID)
+			}
+			sb.WriteString(chunk.Text)
+			if chunk.Done {
+				return Result{
+					JobID:       chunk.JobID,
+					Text:        sb.String(),
+					TokensIn:    chunk.TokensIn,
+					TokensOut:   chunk.TokensOut,
+					QueueWaitMs: chunk.QueueWaitMs,
+					DurationMs:  chunk.DurationMs,
+				}, nil
+			}
+		case err := <-errCh:
+			if err == nil {
+				return Result{}, fmt.Errorf("queue: chunk stream ended unexpectedly for job %s", jobID)
+			}
+			return Result{}, err
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
 		}
-		return parseResult(msg.Payload)
-	case <-ctx.Done():
-		return Result{}, ctx.Err()
 	}
 }
 
@@ -174,12 +182,4 @@ func chunkFromValues(values map[string]any) (Chunk, error) {
 func stringValue(v any) string {
 	s, _ := v.(string)
 	return s
-}
-
-func parseResult(payload string) (Result, error) {
-	var res Result
-	if err := json.Unmarshal([]byte(payload), &res); err != nil {
-		return Result{}, fmt.Errorf("queue: malformed result payload: %w", err)
-	}
-	return res, nil
 }

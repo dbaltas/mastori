@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -25,10 +26,11 @@ const maxBodyBytes = 1 << 20
 var tracer = otel.Tracer("mastori/api")
 
 type Handler struct {
-	cfg    *config.Config
-	queue  queue.Queue
-	m      *metrics.Metrics
-	logger *slog.Logger
+	cfg      *config.Config
+	queue    queue.Queue
+	m        *metrics.Metrics
+	logger   *slog.Logger
+	inflight atomic.Int64
 }
 
 func NewHandler(cfg *config.Config, q queue.Queue, m *metrics.Metrics, logger *slog.Logger) *Handler {
@@ -52,13 +54,16 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "api.generate")
 	defer span.End()
 
+	release, ok := h.acquire(w)
+	if !ok {
+		return
+	}
+	defer release()
+
 	job, ok := h.parseAndEnqueue(w, r, ctx, span)
 	if !ok {
 		return
 	}
-
-	h.m.Inflight.Inc()
-	defer h.m.Inflight.Dec()
 
 	waitCtx, cancel := context.WithTimeout(ctx, h.cfg.RequestTimeout)
 	defer cancel()
@@ -107,13 +112,16 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	release, ok := h.acquire(w)
+	if !ok {
+		return
+	}
+	defer release()
+
 	job, ok := h.parseAndEnqueue(w, r, ctx, span)
 	if !ok {
 		return
 	}
-
-	h.m.Inflight.Inc()
-	defer h.m.Inflight.Dec()
 
 	waitCtx, cancel := context.WithTimeout(ctx, h.cfg.RequestTimeout)
 	defer cancel()
@@ -188,6 +196,24 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
+}
+
+func (h *Handler) acquire(w http.ResponseWriter) (func(), bool) {
+	for {
+		cur := h.inflight.Load()
+		if cur >= int64(h.cfg.MaxInflight) {
+			h.m.BusyRejections.Inc()
+			writeError(w, http.StatusTooManyRequests, "server busy: in-flight request cap reached")
+			return nil, false
+		}
+		if h.inflight.CompareAndSwap(cur, cur+1) {
+			h.m.Inflight.Inc()
+			return func() {
+				h.inflight.Add(-1)
+				h.m.Inflight.Dec()
+			}, true
+		}
+	}
 }
 
 func (h *Handler) parseAndEnqueue(w http.ResponseWriter, r *http.Request, ctx context.Context, span trace.Span) (queue.Job, bool) {

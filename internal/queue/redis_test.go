@@ -14,7 +14,7 @@ import (
 func newTestQueue(t *testing.T) (*RedisQueue, *miniredis.Miniredis, *redis.Client) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	q := NewRedisQueue(mr.Addr(), "jobs", "jobs:result:", "jobs:chunks:", "jobs:abandon:")
+	q := NewRedisQueue(mr.Addr(), "jobs", "jobs:chunks:", "jobs:abandon:")
 	t.Cleanup(func() { _ = q.Close() })
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -53,7 +53,7 @@ func TestEnqueueWritesJobFields(t *testing.T) {
 	}
 }
 
-func TestWaitResultReceivesPublishedResult(t *testing.T) {
+func TestWaitResultAggregatesChunks(t *testing.T) {
 	q, _, client := newTestQueue(t)
 
 	resCh := make(chan Result, 1)
@@ -69,14 +69,34 @@ func TestWaitResultReceivesPublishedResult(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	payload := `{"job_id":"job-1","text":"answer","tokens_in":3,"tokens_out":10,"queue_wait_ms":5,"duration_ms":42}`
-	if err := client.Publish(context.Background(), "jobs:result:job-1", payload).Err(); err != nil {
-		t.Fatalf("publish: %v", err)
+	for _, c := range []struct {
+		text string
+		done bool
+	}{
+		{"hel", false},
+		{"lo ", false},
+		{"world", false},
+		{"", true},
+	} {
+		if err := client.XAdd(context.Background(), &redis.XAddArgs{
+			Stream: "jobs:chunks:job-1",
+			Values: map[string]any{
+				"job_id":        "job-1",
+				"text":          c.text,
+				"done":          strconv.FormatBool(c.done),
+				"tokens_in":     "3",
+				"tokens_out":    "10",
+				"queue_wait_ms": "5",
+				"duration_ms":   "42",
+			},
+		}).Err(); err != nil {
+			t.Fatalf("xadd: %v", err)
+		}
 	}
 
 	select {
 	case res := <-resCh:
-		if res.Text != "answer" || res.TokensIn != 3 || res.TokensOut != 10 || res.DurationMs != 42 {
+		if res.Text != "hello world" || res.TokensIn != 3 || res.TokensOut != 10 || res.DurationMs != 42 {
 			t.Errorf("result = %+v", res)
 		}
 		if res.JobID != "job-1" {
@@ -86,26 +106,6 @@ func TestWaitResultReceivesPublishedResult(t *testing.T) {
 		t.Fatalf("wait: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for result")
-	}
-}
-
-func TestWaitResultFallbackKey(t *testing.T) {
-	q, _, client := newTestQueue(t)
-
-	if err := client.Set(context.Background(), "jobs:result:job-2",
-		`{"job_id":"job-2","text":"stored"}`, time.Minute).Err(); err != nil {
-		t.Fatalf("set: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	res, err := q.WaitResult(ctx, "job-2")
-	if err != nil {
-		t.Fatalf("wait: %v", err)
-	}
-	if res.Text != "stored" {
-		t.Errorf("text = %q, want %q", res.Text, "stored")
 	}
 }
 
@@ -121,7 +121,7 @@ func TestWaitResultTimeout(t *testing.T) {
 	}
 }
 
-func TestWaitResultMalformedPayload(t *testing.T) {
+func TestWaitResultMalformedChunk(t *testing.T) {
 	q, _, client := newTestQueue(t)
 
 	errCh := make(chan error, 1)
@@ -131,8 +131,11 @@ func TestWaitResultMalformedPayload(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	if err := client.Publish(context.Background(), "jobs:result:job-4", "not-json").Err(); err != nil {
-		t.Fatalf("publish: %v", err)
+	if err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "jobs:chunks:job-4",
+		Values: map[string]any{"job_id": "job-4", "text": "x", "done": "maybe"},
+	}).Err(); err != nil {
+		t.Fatalf("xadd: %v", err)
 	}
 
 	select {
