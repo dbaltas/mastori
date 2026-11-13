@@ -15,6 +15,15 @@ data:
         url: http://prometheus.mastori.svc:9090
         isDefault: true
         editable: true
+  tempo.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.observability.svc:3200
+        isDefault: false
+        editable: true
 ---
 apiVersion: v1
 kind: ConfigMap

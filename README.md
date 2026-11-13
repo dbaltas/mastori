@@ -44,7 +44,7 @@ All host ports are in the 7000–7999 range.
 make compose-up
 ```
 
-Runs the API (7080), Redis (7079), Prometheus (7090), and Grafana (7091) with mock workers pulling jobs from Redis.
+Runs the API (7080), Redis (7079), Prometheus (7090) with mock workers pulling jobs from Redis. Note: the kind cluster also maps API 7080, so only one stack can own it at a time.
 
 ### kind
 
@@ -53,11 +53,15 @@ make cluster-up        # kind create cluster (extraPortMappings: API 7080, Grafa
 make cluster-deploy    # build + load image, apply deploy/kubernetes/
 ```
 
-The cluster runs API (2 replicas), Redis, mock workers, Prometheus, and Grafana in the `mastori` namespace. Dashboards are provisioned automatically; open http://localhost:7081 (anonymous admin login).
+The cluster runs API (2 replicas), Redis, mock workers, Prometheus, and Grafana in the `mastori` namespace, plus the OTel collector and Grafana Tempo in `observability`. Dashboards and the Tempo datasource are provisioned automatically; open http://localhost:7081 (anonymous admin login).
 
 ### Metrics
 
 The API exposes Prometheus metrics on `/metrics`: request rate and latency by route, time to first token, enqueue latency, jobs enqueued/errors, in-flight requests, chunks streamed, and busy rejections. The provisioned "Mastori API Overview" dashboard covers all of them.
+
+### Traces
+
+The API emits OpenTelemetry traces to the OTel collector (`deploy/otel/collector-config.yaml`), which forwards them to Grafana Tempo (`deploy/tempo/tempo.yaml`, local storage). In the kind cluster both run in the `observability` namespace (`deploy/kubernetes/observability.yaml`); the cluster Grafana has a provisioned Tempo datasource: open http://localhost:7081 → Explore → Tempo and search for traces from `mastori-api` (e.g. the `api.generate` root span), or paste a `trace_id` from the API logs.
 
 ### Datasets
 

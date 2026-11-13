@@ -92,7 +92,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
-          "expr": "sum(rate(mastori_api_requests_total{status!=\"OK\"}[$__rate_interval]))",
+          "expr": "sum(rate(mastori_api_requests_total{status!=\"OK\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "errors/s",
           "refId": "A"
         }
@@ -331,7 +331,7 @@
           "refId": "C"
         }
       ],
-      "title": "Time to first token (TTFT)",
+      "title": "API Time to first token (TTFT)",
       "type": "timeseries"
     },
     {

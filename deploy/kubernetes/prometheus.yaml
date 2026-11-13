@@ -15,6 +15,7 @@ spec:
       labels:
         app: prometheus
     spec:
+      serviceAccountName: prometheus
       containers:
         - name: prometheus
           image: prom/prometheus:v3.2.1
@@ -46,6 +47,42 @@ spec:
             name: prometheus-config
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: mastori
+  labels:
+    app: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus
+  namespace: mastori
+  labels:
+    app: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus
+  namespace: mastori
+  labels:
+    app: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: mastori
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: prometheus-config
@@ -58,9 +95,27 @@ data:
       scrape_interval: 5s
 
     scrape_configs:
-      - job_name: api
-        static_configs:
-          - targets: ["api.mastori.svc:80"]
+      - job_name: mastori-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [mastori]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Pending|Running
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: api|scheduler
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: http
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: job
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: instance
 
       - job_name: prometheus
         static_configs:

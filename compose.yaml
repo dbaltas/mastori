@@ -11,13 +11,10 @@ services:
       - "7080:8080"
     environment:
       REDIS_ADDR: redis:6379
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
-      OTEL_TRACES_SAMPLER_ARG: "1.0"
       MAX_INFLIGHT: "1000"
       LOG_LEVEL: info
     depends_on:
       - redis
-      - otel-collector
 
   mockworker:
     build: .
@@ -31,12 +28,6 @@ services:
     depends_on:
       - redis
 
-  otel-collector:
-    image: otel/opentelemetry-collector:0.120.0
-    command: ["--config=/etc/otel/config.yaml"]
-    volumes:
-      - ./deploy/otel/collector-config.yaml:/etc/otel/config.yaml:ro
-
   prometheus:
     image: prom/prometheus:v3.2.1
     command:
@@ -45,17 +36,3 @@ services:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "7090:9090"
-
-  grafana:
-    image: grafana/grafana:11.6.0
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_AUTH_BASIC_ENABLED: "false"
-    volumes:
-      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports:
-      - "7091:3000"
-    depends_on:
-      - prometheus
