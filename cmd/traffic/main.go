@@ -52,7 +52,7 @@ func main() {
 	stepsSpec := fs.String("steps", "", "step pattern as rate:duration pairs, e.g. \"10:60s,50:60s\" (overrides rate/arrival/ramp)")
 	concurrency := fs.Int("concurrency", 0, "closed-loop worker count (0 = open loop)")
 	maxInflight := fs.Int("max-inflight", 0, "cap on in-flight requests (open loop, default 4x rate)")
-	duration := fs.Duration("duration", 5*time.Minute, "measured run duration")
+	duration := fs.Duration("duration", 0, "measured run duration (default: sum of --steps durations, else 5m)")
 	warmup := fs.Duration("warmup", 0, "warmup duration, excluded from the summary")
 	drainGrace := fs.Duration("warmup-drain-grace", 0, "max wait for in-flight warmup requests to finish before measured traffic starts (default timeout+10s)")
 	timeout := fs.Duration("timeout", 65*time.Second, "per-request timeout")
@@ -81,6 +81,12 @@ func main() {
 		}
 	}
 
+	runDuration, err := resolveDuration(steps, *duration)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	runID := time.Now().UTC().Format("20060102T150405Z") + fmt.Sprintf("-%d", time.Now().UnixNano()%1000)
 	outPath := *output
 	if outPath == "" {
@@ -96,7 +102,7 @@ func main() {
 		Seed:        *seed,
 		Warmup:      *warmup,
 		DrainGrace:  *drainGrace,
-		Duration:    *duration,
+		Duration:    runDuration,
 		Concurrency: *concurrency,
 		Rate:        *rate,
 		Arrival:     *arrival,
@@ -112,7 +118,7 @@ func main() {
 	defer stop()
 
 	fmt.Printf("run %s: workload=%s rate=%.1f duration=%s warmup=%s seed=%d -> %s\n",
-		runID, *workload, *rate, *duration, *warmup, *seed, outPath)
+		runID, *workload, *rate, runDuration, *warmup, *seed, outPath)
 	summary, err := traffic.Run(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -125,6 +131,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: encode summary: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// resolveDuration picks the measured run duration: an explicit --duration
+// wins, then the sum of step durations when a step pattern is used, then the
+// 5m default. Without this, a short step pattern would run for the full
+// default duration at the final segment's rate.
+func resolveDuration(steps []traffic.StepSeg, explicit time.Duration) (time.Duration, error) {
+	if explicit > 0 {
+		return explicit, nil
+	}
+	if len(steps) > 0 {
+		var total time.Duration
+		for _, s := range steps {
+			if s.Duration <= 0 {
+				return 0, fmt.Errorf("invalid step duration %q", s.Duration)
+			}
+			total += s.Duration
+		}
+		return total, nil
+	}
+	return 5 * time.Minute, nil
 }
 
 // resolveWorkload maps the workload profile to dataset names and weights.

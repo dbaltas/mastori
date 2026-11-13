@@ -1,6 +1,6 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration vet fmt run docker-build compose-up compose-down cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api
+.PHONY: build test test-integration vet fmt run docker-build compose-up compose-up-inference compose-down cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference
 
 build:
 	go build ./...
@@ -31,6 +31,10 @@ docker-build:
 compose-up:
 	docker compose up --build -d
 
+compose-up-inference:
+	docker compose --profile inference up --build -d
+	docker compose exec ollama ollama pull $${INFERENCE_MODEL:-qwen2.5:0.5b}
+
 compose-down:
 	docker compose down -v
 
@@ -52,3 +56,8 @@ cluster-redeploy-api: docker-build
 	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
 	kubectl -n mastori set image deployment/api api=mastori/api:latest
 	kubectl -n mastori rollout restart deployment/api deployment/scheduler deployment/mockworker
+
+cluster-deploy-inference: docker-build
+	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
+	kubectl apply -f deploy/inference/
+	kubectl -n mastori rollout restart deployment/inference-adapter deployment/vllmworker

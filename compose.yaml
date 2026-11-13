@@ -4,7 +4,6 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "7079:6379"
-
   api:
     build: .
     ports:
@@ -41,6 +40,38 @@ services:
       - redis
       - scheduler
 
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    profiles: ["inference"]
+
+  inference-adapter:
+    build: .
+    entrypoint: ["/adapter"]
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      DEFAULT_MODEL: ${INFERENCE_MODEL:-qwen2.5:0.5b}
+      LOG_LEVEL: info
+    ports:
+      - "7082:8080"
+    profiles: ["inference"]
+    depends_on:
+      - ollama
+      - redis
+
+  vllmworker:
+    build: .
+    entrypoint: ["/vllmworker"]
+    environment:
+      REDIS_ADDR: redis:6379
+      INFERENCE_BASE_URL: http://inference-adapter:8080
+      INFERENCE_MODEL: ${INFERENCE_MODEL:-qwen2.5:0.5b}
+    profiles: ["inference"]
+    depends_on:
+      - redis
+      - inference-adapter
+
   prometheus:
     image: prom/prometheus:v3.2.1
     command:
@@ -49,3 +80,6 @@ services:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "7090:9090"
+
+volumes:
+  ollama:

@@ -4,7 +4,7 @@ A benchmarking platform for LLM inference on GPU infrastructure.
 
 Run the same LLM workload on identical GPU resources across different providers — AWS, Azure, Nebius, Verda, or any other — and compare throughput, latency, utilization, and cost.
 
-> **Status: early implementation.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployable on Docker Compose or a local kind cluster. Real vLLM workers, scheduling policies, and cloud providers are still ahead. See the [design document](gpu-inference-benchmarking-platform.md) for the full plan.
+> **Status: early implementation.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployable on Docker Compose or a local kind cluster. An optional inference profile adds real local generation: a vLLM-compatible adapter (`cmd/adapter`) backed by Ollama plus a real inference worker (`cmd/vllmworker`) that speaks the same API surface a cloud vLLM server will. Scheduling policies and cloud providers are still ahead. See the [design document](gpu-inference-benchmarking-platform.md) for the full plan.
 
 ![Grafana dashboard](docs/grafana-overview.png)
 
@@ -30,7 +30,7 @@ Run the same LLM workload on identical GPU resources across different providers 
 1. ~~Local stack: Go API → Redis → Go scheduler → mock workers~~
 2. ~~Kubernetes with Prometheus and Grafana~~
 3. ~~Traffic generator and workload profiles~~
-4. Real local inference workers
+4. ~~Real local inference workers (Ollama behind a vLLM-compatible adapter)~~
 5. Cloud deployment (CPU + GPU pools) with IaC
 6. Cross-provider experiments
 
@@ -45,6 +45,20 @@ make compose-up
 ```
 
 Runs the API (7080), Redis (7079), the scheduler, two mock workers, and Prometheus (7090). Note: the kind cluster also maps API 7080, so only one stack can own it at a time.
+
+### Real local inference (Ollama)
+
+```sh
+make compose-up-inference
+```
+
+Adds the `inference` profile on top of the mock stack: Ollama, the vLLM-compatible adapter (`inference-adapter` on 7082), and `vllmworker` instances that pull jobs from the same Redis queue and generate through the adapter. The adapter serves `POST /v1/completions`, `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, and a `/metrics` endpoint with synthesized `vllm:*` Prometheus metrics (TTFT, TPOT, e2e latency, token counters), so anything written against a vLLM OpenAI server works unchanged. Set `INFERENCE_MODEL=<model>` to pick the model (default `qwen2.5:0.5b`). Mock and inference workers can run side by side; the scheduler routes jobs to both like any other registered worker.
+
+```sh
+curl -s localhost:7082/v1/completions -d '{"prompt":"Explain Redis streams","max_tokens":32}' | jq
+```
+
+Local runs are functional tests and relative comparisons only — numbers are not comparable to cloud vLLM results and are excluded from cross-provider benchmarks.
 
 ### kind
 
@@ -75,6 +89,14 @@ API --XADD--> jobs --scheduler--> jobs:worker:<id> --> worker --XADD--> jobs:chu
 make test              # unit tests (miniredis, no external services)
 make test-integration  # API -> Redis -> scheduler -> workers against a real Redis (needs Docker)
 ```
+
+To add real inference to the kind cluster, run Ollama on the host (`ollama serve` + `ollama pull qwen2.5:0.5b`) and deploy the inference layer:
+
+```sh
+make cluster-deploy-inference   # apply deploy/inference/ (adapter + vllmworker)
+```
+
+The adapter reaches host Ollama via `host.docker.internal` (see `deploy/inference/adapter.yaml`). The scheduler routes jobs to the `vllmworker` like any other registered worker.
 
 ### Metrics
 

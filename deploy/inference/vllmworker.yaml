@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllmworker
+  namespace: mastori
+  labels:
+    app: vllmworker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllmworker
+  template:
+    metadata:
+      labels:
+        app: vllmworker
+    spec:
+      containers:
+        - name: vllmworker
+          image: mastori/api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/vllmworker"]
+          env:
+            - name: REDIS_ADDR
+              value: "redis.mastori.svc.cluster.local:6379"
+            - name: REDIS_WORKER_STREAM_PREFIX
+              value: "jobs:worker:"
+            - name: REDIS_WORKER_REGISTRY_PREFIX
+              value: "workers:"
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: INFERENCE_BASE_URL
+              value: "http://inference-adapter.mastori.svc.cluster.local:8080"
+          envFrom:
+            - configMapRef:
+                name: inference-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi

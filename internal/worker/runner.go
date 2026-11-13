@@ -51,7 +51,7 @@ func (c RunnerConfig) withDefaults() RunnerConfig {
 type Runner struct {
 	client *redis.Client
 	reg    *registry.Registry
-	gen    *MockGenerator
+	gen    Generator
 	logger *slog.Logger
 	cfg    RunnerConfig
 
@@ -59,7 +59,7 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 }
 
-func NewRunner(client *redis.Client, reg *registry.Registry, gen *MockGenerator, logger *slog.Logger, cfg RunnerConfig) *Runner {
+func NewRunner(client *redis.Client, reg *registry.Registry, gen Generator, logger *slog.Logger, cfg RunnerConfig) *Runner {
 	return &Runner{
 		client:  client,
 		reg:     reg,
