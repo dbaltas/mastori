@@ -23,10 +23,26 @@ metadata:
   namespace: mastori
 data:
   REDIS_ADDR: "redis.mastori.svc.cluster.local:6379"
-  REDIS_STREAM: "jobs"
+  REDIS_WORKER_STREAM_PREFIX: "jobs:worker:"
+  REDIS_WORKER_REGISTRY_PREFIX: "workers:"
   REDIS_CHUNKS_PREFIX: "jobs:chunks:"
   REDIS_ABANDON_PREFIX: "jobs:abandon:"
   WORKER_MIN_TOKENS: "16"
   WORKER_MAX_TOKENS: "96"
   WORKER_TOKEN_DELAY_MS: "10"
   WORKER_FIRST_DELAY_MS: "30"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: mastori
+data:
+  LISTEN_ADDR: ":8081"
+  REDIS_ADDR: "redis.mastori.svc.cluster.local:6379"
+  REDIS_STREAM: "jobs"
+  REDIS_WORKER_STREAM_PREFIX: "jobs:worker:"
+  REDIS_WORKER_REGISTRY_PREFIX: "workers:"
+  SCHEDULER_POLICY: "round-robin"
+  SCHEDULER_JOB_TTL: "60"
+  LOG_LEVEL: "info"

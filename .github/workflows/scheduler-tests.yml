@@ -1,0 +1,59 @@
+name: Scheduler tests
+
+on:
+  push:
+    paths:
+      - "cmd/scheduler/**"
+      - "cmd/mockworker/**"
+      - "cmd/api/**"
+      - "internal/scheduler/**"
+      - "internal/registry/**"
+      - "internal/worker/**"
+      - "internal/queue/**"
+      - "internal/api/**"
+      - "internal/metrics/**"
+      - "internal/config/**"
+      - "test/integration/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/scheduler-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./cmd/scheduler/... ./internal/scheduler/... ./internal/registry/...
+      - name: Unit tests
+        run: go test -race ./cmd/scheduler/... ./internal/scheduler/... ./internal/registry/...
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      INTEGRATION_REDIS_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet -tags integration ./test/integration/...
+      - name: Integration tests
+        run: go test -race -tags integration ./test/integration/...

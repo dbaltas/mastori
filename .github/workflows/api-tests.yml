@@ -11,6 +11,7 @@ on:
       - "internal/tracing/**"
       - "internal/config/**"
       - "internal/worker/**"
+      - "internal/registry/**"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/api-tests.yml"
@@ -27,6 +28,6 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Vet
-        run: go vet ./cmd/api/... ./cmd/mockworker/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/... ./internal/worker/...
+        run: go vet ./cmd/api/... ./cmd/mockworker/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/... ./internal/worker/... ./internal/registry/...
       - name: Unit tests
-        run: go test -race ./cmd/api/... ./cmd/mockworker/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/... ./internal/worker/...
+        run: go test -race ./cmd/api/... ./cmd/mockworker/... ./internal/api/... ./internal/queue/... ./internal/metrics/... ./internal/tracing/... ./internal/config/... ./internal/worker/... ./internal/registry/...

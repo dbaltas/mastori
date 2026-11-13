@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: mastori
+  labels:
+    app: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scheduler
+  template:
+    metadata:
+      labels:
+        app: scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: mastori/api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/scheduler"]
+          envFrom:
+            - configMapRef:
+                name: scheduler-config
+          ports:
+            - containerPort: 8081
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheduler
+  namespace: mastori
+  labels:
+    app: scheduler
+spec:
+  type: ClusterIP
+  selector:
+    app: scheduler
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http

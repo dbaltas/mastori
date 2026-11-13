@@ -10,41 +10,50 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/dbaltas/mastori/internal/queue"
+	"github.com/dbaltas/mastori/internal/registry"
 	"github.com/dbaltas/mastori/internal/worker"
 )
 
 type mockConfig struct {
-	redisAddr     string
-	stream        string
-	chunksPrefix  string
-	abandonPrefix string
-	group         string
-	workerID      string
-	minTokens     int
-	maxTokens     int
-	tokenDelayMs  int
-	firstDelayMs  int
+	redisAddr            string
+	workerStreamPrefix   string
+	workerRegistryPrefix string
+	chunksPrefix         string
+	abandonPrefix        string
+	workerID             string
+	models               []string
+	minTokens            int
+	maxTokens            int
+	tokenDelayMs         int
+	firstDelayMs         int
+	heartbeatMs          int
 }
 
 func loadMockConfig() (*mockConfig, error) {
 	cfg := &mockConfig{
-		redisAddr:     getenvOr("REDIS_ADDR", "localhost:6379"),
-		stream:        getenvOr("REDIS_STREAM", "jobs"),
-		chunksPrefix:  getenvOr("REDIS_CHUNKS_PREFIX", "jobs:chunks:"),
-		abandonPrefix: getenvOr("REDIS_ABANDON_PREFIX", "jobs:abandon:"),
-		group:         getenvOr("WORKER_CONSUMER_GROUP", "mastori-workers"),
-		workerID:      getenvOr("WORKER_ID", "mock-"+randomID()),
-		minTokens:     16,
-		maxTokens:     96,
-		tokenDelayMs:  20,
-		firstDelayMs:  50,
+		redisAddr:            getenvOr("REDIS_ADDR", "localhost:6379"),
+		workerStreamPrefix:   getenvOr("REDIS_WORKER_STREAM_PREFIX", registry.DefaultStreamPrefix),
+		workerRegistryPrefix: getenvOr("REDIS_WORKER_REGISTRY_PREFIX", registry.DefaultPrefix),
+		chunksPrefix:         getenvOr("REDIS_CHUNKS_PREFIX", "jobs:chunks:"),
+		abandonPrefix:        getenvOr("REDIS_ABANDON_PREFIX", "jobs:abandon:"),
+		workerID:             getenvOr("WORKER_ID", "mock-"+randomID()),
+		minTokens:            16,
+		maxTokens:            96,
+		tokenDelayMs:         20,
+		firstDelayMs:         50,
+		heartbeatMs:          1000,
+	}
+	if v := os.Getenv("WORKER_MODELS"); v != "" {
+		for _, m := range strings.Split(v, ",") {
+			if m = strings.TrimSpace(m); m != "" {
+				cfg.models = append(cfg.models, m)
+			}
+		}
 	}
 	for _, f := range []struct {
 		key    string
@@ -54,6 +63,7 @@ func loadMockConfig() (*mockConfig, error) {
 		{"WORKER_MAX_TOKENS", &cfg.maxTokens},
 		{"WORKER_TOKEN_DELAY_MS", &cfg.tokenDelayMs},
 		{"WORKER_FIRST_DELAY_MS", &cfg.firstDelayMs},
+		{"WORKER_HEARTBEAT_MS", &cfg.heartbeatMs},
 	} {
 		if v := os.Getenv(f.key); v != "" {
 			n, err := strconv.Atoi(v)
@@ -62,6 +72,9 @@ func loadMockConfig() (*mockConfig, error) {
 			}
 			*f.target = n
 		}
+	}
+	if cfg.heartbeatMs == 0 {
+		return nil, fmt.Errorf("invalid WORKER_HEARTBEAT_MS: must be positive")
 	}
 	return cfg, nil
 }
@@ -96,10 +109,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := ensureGroup(ctx, client, cfg.stream, cfg.group); err != nil {
-		logger.Error("ensure consumer group failed", "error", err)
-		os.Exit(1)
-	}
+	hb := time.Duration(cfg.heartbeatMs) * time.Millisecond
+	reg := registry.New(client, cfg.workerRegistryPrefix, 3*hb)
 
 	gen := &worker.MockGenerator{
 		MinTokens:  cfg.minTokens,
@@ -108,124 +119,16 @@ func main() {
 		FirstDelay: time.Duration(cfg.firstDelayMs) * time.Millisecond,
 	}
 
-	var mu sync.Mutex
-	cancels := make(map[string]context.CancelFunc)
-
-	sub := client.PSubscribe(ctx, cfg.abandonPrefix+"*")
-	go func() {
-		for msg := range sub.Channel() {
-			jobID := strings.TrimPrefix(msg.Channel, cfg.abandonPrefix)
-			mu.Lock()
-			if cancel, ok := cancels[jobID]; ok {
-				cancel()
-				delete(cancels, jobID)
-			}
-			mu.Unlock()
-			logger.Info("job abandoned", "job_id", jobID)
-		}
-	}()
-
-	var wg sync.WaitGroup
-	logger.Info("mock worker started", "worker_id", cfg.workerID, "stream", cfg.stream, "group", cfg.group)
-
-	for {
-		res, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    cfg.group,
-			Consumer: cfg.workerID,
-			Streams:  []string{cfg.stream, ">"},
-			Count:    1,
-			Block:    time.Second,
-		}).Result()
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			continue
-		}
-
-		for _, st := range res {
-			for _, msg := range st.Messages {
-				job, ok := jobFromValues(msg.Values)
-				if !ok {
-					logger.Error("skipping malformed job entry", "entry_id", msg.ID)
-					_ = client.XAck(context.Background(), cfg.stream, cfg.group, msg.ID).Err()
-					continue
-				}
-
-				jobCtx, cancel := context.WithCancel(ctx)
-				mu.Lock()
-				cancels[job.ID] = cancel
-				mu.Unlock()
-
-				wg.Add(1)
-				go func(job queue.Job, entryID string) {
-					defer wg.Done()
-					defer func() {
-						mu.Lock()
-						delete(cancels, job.ID)
-						mu.Unlock()
-					}()
-
-					err := gen.Run(jobCtx, job, func(c queue.Chunk) error {
-						values := map[string]any{
-							"job_id":     c.JobID,
-							"text":       c.Text,
-							"done":       strconv.FormatBool(c.Done),
-							"tokens_in":  strconv.FormatInt(c.TokensIn, 10),
-							"tokens_out": strconv.FormatInt(c.TokensOut, 10),
-						}
-						if c.Done {
-							values["queue_wait_ms"] = strconv.FormatInt(c.QueueWaitMs, 10)
-							values["duration_ms"] = strconv.FormatInt(c.DurationMs, 10)
-						}
-						return client.XAdd(jobCtx, &redis.XAddArgs{
-							Stream: cfg.chunksPrefix + job.ID,
-							Values: values,
-							MaxLen: 10000,
-							Approx: true,
-						}).Err()
-					})
-
-					if err != nil && jobCtx.Err() == nil {
-						logger.Error("job generation failed", "job_id", job.ID, "error", err)
-					}
-					_ = client.XAck(context.Background(), cfg.stream, cfg.group, entryID).Err()
-				}(job, msg.ID)
-			}
-		}
+	runner := worker.NewRunner(client, reg, gen, logger, worker.RunnerConfig{
+		ID:                 cfg.workerID,
+		Models:             cfg.models,
+		WorkerStreamPrefix: cfg.workerStreamPrefix,
+		ChunksPrefix:       cfg.chunksPrefix,
+		AbandonPrefix:      cfg.abandonPrefix,
+		HeartbeatInterval:  hb,
+	})
+	if err := runner.Run(ctx); err != nil {
+		logger.Error("worker failed", "error", err)
+		os.Exit(1)
 	}
-
-	wg.Wait()
-	_ = sub.Close()
-	logger.Info("mock worker stopped")
-}
-
-func ensureGroup(ctx context.Context, client *redis.Client, stream, group string) error {
-	err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return err
-	}
-	return nil
-}
-
-func jobFromValues(values map[string]any) (queue.Job, bool) {
-	jobID, _ := values["job_id"].(string)
-	prompt, _ := values["prompt"].(string)
-	model, _ := values["model"].(string)
-	traceID, _ := values["trace_id"].(string)
-	createdAtStr, _ := values["created_at"].(string)
-	if jobID == "" || prompt == "" {
-		return queue.Job{}, false
-	}
-	createdAt, err := time.Parse(time.RFC3339Nano, createdAtStr)
-	if err != nil {
-		createdAt = time.Now().UTC()
-	}
-	return queue.Job{
-		ID:        jobID,
-		TraceID:   traceID,
-		Model:     model,
-		Prompt:    prompt,
-		CreatedAt: createdAt,
-	}, true
 }

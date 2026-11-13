@@ -37,13 +37,7 @@ func NewRedisQueue(addr, stream, chunksPrefix, abandonPrefix string) *RedisQueue
 func (q *RedisQueue) Enqueue(ctx context.Context, job Job) error {
 	return q.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: q.stream,
-		Values: map[string]any{
-			"job_id":     job.ID,
-			"trace_id":   job.TraceID,
-			"model":      job.Model,
-			"prompt":     job.Prompt,
-			"created_at": job.CreatedAt.UTC().Format(time.RFC3339Nano),
-		},
+		Values: JobValues(job),
 		MaxLen: maxStreamLen,
 		Approx: true,
 	}).Err()

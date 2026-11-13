@@ -16,9 +16,21 @@ services:
     depends_on:
       - redis
 
+  scheduler:
+    build: .
+    entrypoint: ["/scheduler"]
+    environment:
+      REDIS_ADDR: redis:6379
+      SCHEDULER_POLICY: round-robin
+      LOG_LEVEL: info
+    depends_on:
+      - redis
+
   mockworker:
     build: .
     entrypoint: ["/mockworker"]
+    deploy:
+      replicas: 2
     environment:
       REDIS_ADDR: redis:6379
       WORKER_MIN_TOKENS: "16"
@@ -27,6 +39,7 @@ services:
       WORKER_FIRST_DELAY_MS: "30"
     depends_on:
       - redis
+      - scheduler
 
   prometheus:
     image: prom/prometheus:v3.2.1

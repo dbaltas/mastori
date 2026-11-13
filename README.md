@@ -44,7 +44,7 @@ All host ports are in the 7000–7999 range.
 make compose-up
 ```
 
-Runs the API (7080), Redis (7079), Prometheus (7090) with mock workers pulling jobs from Redis. Note: the kind cluster also maps API 7080, so only one stack can own it at a time.
+Runs the API (7080), Redis (7079), the scheduler, two mock workers, and Prometheus (7090). Note: the kind cluster also maps API 7080, so only one stack can own it at a time.
 
 ### kind
 
@@ -53,7 +53,28 @@ make cluster-up        # kind create cluster (extraPortMappings: API 7080, Grafa
 make cluster-deploy    # build + load image, apply deploy/kubernetes/
 ```
 
-The cluster runs API (2 replicas), Redis, mock workers, Prometheus, and Grafana in the `mastori` namespace, plus the OTel collector and Grafana Tempo in `observability`. Dashboards and the Tempo datasource are provisioned automatically; open http://localhost:7081 (anonymous admin login).
+The cluster runs API (2 replicas), Redis, the scheduler, mock workers, Prometheus, and Grafana in the `mastori` namespace, plus the OTel collector and Grafana Tempo in `observability`. Dashboards and the Tempo datasource are provisioned automatically; open http://localhost:7081 (anonymous admin login).
+
+### Scheduler
+
+Workers no longer pull from the shared `jobs` stream. The scheduler (`cmd/scheduler`) is its only reader: it picks a live worker with the configured policy and moves the job to that worker's private stream (`jobs:worker:<id>`) in one atomic Redis transaction. Workers read only their own stream and delete an entry when the job finishes.
+
+```
+API --XADD--> jobs --scheduler--> jobs:worker:<id> --> worker --XADD--> jobs:chunks:<job_id> --> API
+```
+
+- **Registry.** Workers heartbeat a hash `workers:<id>` with a 3-heartbeat TTL (`WORKER_HEARTBEAT_MS`, default 1s). A worker that stops heartbeating drops out of scheduling when the key expires. A gracefully stopped worker deregisters immediately. `WORKER_MODELS` (comma-separated) restricts which models a worker serves; empty serves any.
+- **Policies.** `SCHEDULER_POLICY` selects `round-robin` (default) or `least-loaded`. Load is the length of the worker's stream: queued plus running jobs.
+- **No workers.** Jobs stay in `jobs` until a worker is available. Jobs older than `SCHEDULER_JOB_TTL` seconds (default 60, 0 disables) are dropped, since the API has already timed out.
+- **Metrics** (`:8081/metrics`): `mastori_scheduler_dispatched_total{worker}`, `dispatch_errors_total{reason}`, `jobs_dropped_total{reason}`, `scheduling_seconds`, `queue_wait_seconds`, `queue_depth`, `workers_healthy`, `worker_queue_depth{worker}`.
+- **Not yet handled.** Jobs already dispatched to a worker that crashes are not reclaimed or re-dispatched, and a dead worker's stream is not cleaned up. Multiple scheduler replicas are safe (shared consumer group), but each worker-list read is cached for 250ms, so policies see slightly stale membership.
+
+### Tests
+
+```sh
+make test              # unit tests (miniredis, no external services)
+make test-integration  # API -> Redis -> scheduler -> workers against a real Redis (needs Docker)
+```
 
 ### Metrics
 

@@ -23,6 +23,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: mockworker-config
+          env:
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           resources:
             requests:
               cpu: 100m
