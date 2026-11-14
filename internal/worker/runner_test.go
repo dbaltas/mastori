@@ -2,12 +2,19 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/dbaltas/mastori/internal/queue"
 	"github.com/dbaltas/mastori/internal/registry"
@@ -175,4 +182,72 @@ func TestRunnerSkipsMalformedEntries(t *testing.T) {
 		n, _ := h.client.XLen(context.Background(), registry.DefaultStreamPrefix+"w1").Result()
 		return n == 0
 	})
+}
+
+func TestRunnerSpanJoinsJobTrace(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	rec := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
+	h := newRunnerHarness(t)
+	h.start("w1", fastGen(1))
+
+	tid, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	sid, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+	job := queue.Job{
+		ID:          "tracey",
+		Traceparent: fmt.Sprintf("00-%s-%s-01", tid, sid),
+		Model:       "m1",
+		Prompt:      "p",
+		CreatedAt:   time.Now().UTC(),
+	}
+	h.dispatch("w1", job)
+
+	waitFor(t, "job processed", func() bool {
+		n, _ := h.client.XLen(context.Background(), registry.DefaultStreamPrefix+"w1").Result()
+		return n == 0
+	})
+
+	var proc sdktrace.ReadOnlySpan
+	for _, s := range rec.Ended() {
+		if s.Name() == "worker.process" {
+			proc = s
+			break
+		}
+	}
+	if proc == nil {
+		t.Fatal("no worker.process span recorded")
+	}
+	sc := proc.SpanContext()
+	if sc.TraceID() != tid {
+		t.Errorf("worker.process trace ID = %s, want %s (must join the job's trace)", sc.TraceID(), tid)
+	}
+	if proc.Parent().SpanID() != sid {
+		t.Errorf("worker.process parent span ID = %s, want %s", proc.Parent().SpanID(), sid)
+	}
+	attrs := map[string]string{}
+	for _, kv := range proc.Attributes() {
+		attrs[string(kv.Key)] = kv.Value.Emit()
+	}
+	if attrs["worker.id"] != "w1" || attrs["job.id"] != "tracey" || attrs["job.model"] != "m1" {
+		t.Errorf("worker.process attributes = %v, want worker.id=w1 job.id=tracey job.model=m1", attrs)
+	}
+	if _, ok := attributeKey(proc, "job.tokens_out"); !ok {
+		t.Error("worker.process span missing job.tokens_out attribute")
+	}
+}
+
+func attributeKey(s sdktrace.ReadOnlySpan, key string) (attribute.Value, bool) {
+	for _, kv := range s.Attributes() {
+		if string(kv.Key) == key {
+			return kv.Value, true
+		}
+	}
+	return attribute.Value{}, false
 }

@@ -6,11 +6,13 @@ import "time"
 // that carries a job: the API-facing jobs stream and the per-worker streams.
 func JobValues(job Job) map[string]any {
 	return map[string]any{
-		"job_id":     job.ID,
-		"trace_id":   job.TraceID,
-		"model":      job.Model,
-		"prompt":     job.Prompt,
-		"created_at": job.CreatedAt.UTC().Format(time.RFC3339Nano),
+		"job_id":      job.ID,
+		"trace_id":    job.TraceID,
+		"traceparent": job.Traceparent,
+		"tracestate":  job.Tracestate,
+		"model":       job.Model,
+		"prompt":      job.Prompt,
+		"created_at":  job.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}
 }
 
@@ -28,10 +30,12 @@ func JobFromValues(values map[string]any) (Job, bool) {
 		createdAt = time.Now().UTC()
 	}
 	return Job{
-		ID:        jobID,
-		TraceID:   stringValue(values["trace_id"]),
-		Model:     stringValue(values["model"]),
-		Prompt:    prompt,
-		CreatedAt: createdAt,
+		ID:          jobID,
+		TraceID:     stringValue(values["trace_id"]),
+		Traceparent: stringValue(values["traceparent"]),
+		Tracestate:  stringValue(values["tracestate"]),
+		Model:       stringValue(values["model"]),
+		Prompt:      prompt,
+		CreatedAt:   createdAt,
 	}, true
 }

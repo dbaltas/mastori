@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,10 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/dbaltas/mastori/internal/config"
 	"github.com/dbaltas/mastori/internal/metrics"
 	"github.com/dbaltas/mastori/internal/queue"
+	"github.com/prometheus/client_golang/prometheus"
 	"log/slog"
 )
 
@@ -106,6 +113,47 @@ func newTestServer(t *testing.T, q queue.Queue, timeout time.Duration) http.Hand
 		DefaultModel:   "test-model",
 	}, q, m, slog.New(slog.DiscardHandler))
 	return NewRouter(&config.Config{}, m, slog.New(slog.DiscardHandler), q.Ping, h)
+}
+
+// setupTraceRecorder installs a real tracer provider writing to a shared span
+// recorder, plus the W3C propagator. The provider is installed once per test
+// binary: the otel global provider only wires package-level tracers to the
+// first installed SDK, so per-test installs would leak spans across tests.
+// The recorder is reset so each test sees only its own spans.
+var (
+	traceRecorderOnce sync.Once
+	traceRecorder     *tracetest.SpanRecorder
+)
+
+func setupTraceRecorder(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	prevProp := otel.GetTextMapPropagator()
+	traceRecorderOnce.Do(func() {
+		traceRecorder = tracetest.NewSpanRecorder()
+		otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(traceRecorder)))
+	})
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(prevProp) })
+	traceRecorder.Reset()
+	return traceRecorder
+}
+
+func findSpan(spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	for _, s := range spans {
+		if s.Name() == name {
+			return s
+		}
+	}
+	return nil
+}
+
+func spanAttr(span sdktrace.ReadOnlySpan, key string) string {
+	for _, kv := range span.Attributes() {
+		if string(kv.Key) == key {
+			return kv.Value.Emit()
+		}
+	}
+	return ""
 }
 
 func TestInflightCap(t *testing.T) {
@@ -497,4 +545,166 @@ func TestMetricsExposed(t *testing.T) {
 			t.Errorf("metrics output missing %s", want)
 		}
 	}
+}
+
+const testTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+func TestGenerateSpanTreeAndTracePropagation(t *testing.T) {
+	rec := setupTraceRecorder(t)
+	fq := &fakeQueue{}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt": "hi"}`))
+	req.Header.Set("Traceparent", testTraceparent)
+	out := httptest.NewRecorder()
+	srv.ServeHTTP(out, req)
+	if out.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", out.Code, out.Body.String())
+	}
+
+	if len(fq.enqueued) != 1 {
+		t.Fatalf("enqueued jobs = %d, want 1", len(fq.enqueued))
+	}
+	job := fq.enqueued[0]
+	tpTrace, _, ok := parseTraceparent(job.Traceparent)
+	if !ok {
+		t.Fatalf("job traceparent = %q, not a valid traceparent", job.Traceparent)
+	}
+	tid, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	if tpTrace != tid {
+		t.Errorf("job traceparent trace ID = %s, want %s (job must carry the request's trace)", tpTrace, tid)
+	}
+
+	spans := rec.Ended()
+	server := findSpan(spans, "POST /generate")
+	if server == nil {
+		t.Fatalf("no server span named POST /generate; got: %v", spanNames(spans))
+	}
+	if got := spanAttr(server, "http.route"); got != "/generate" {
+		t.Errorf("server span http.route = %q, want /generate", got)
+	}
+	api := findSpan(spans, "api.generate")
+	if api == nil {
+		t.Fatalf("no api.generate span; got: %v", spanNames(spans))
+	}
+	enq := findSpan(spans, "queue.enqueue")
+	if enq == nil {
+		t.Fatalf("no queue.enqueue span; got: %v", spanNames(spans))
+	}
+	wait := findSpan(spans, "queue.wait_result")
+	if wait == nil {
+		t.Fatalf("no queue.wait_result span; got: %v", spanNames(spans))
+	}
+
+	tid, _ = trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	for _, s := range []struct {
+		name string
+		span sdktrace.ReadOnlySpan
+	}{{"server", server}, {"api", api}, {"enqueue", enq}, {"wait", wait}} {
+		if s.span.SpanContext().TraceID() != tid {
+			t.Errorf("%s span trace ID = %s, want %s (all spans must share the incoming trace)", s.name, s.span.SpanContext().TraceID(), tid)
+		}
+	}
+	if api.Parent().SpanID() != server.SpanContext().SpanID() {
+		t.Error("api.generate is not a child of the server span")
+	}
+	if enq.Parent().SpanID() != api.SpanContext().SpanID() {
+		t.Error("queue.enqueue is not a child of api.generate")
+	}
+	if wait.Parent().SpanID() != api.SpanContext().SpanID() {
+		t.Error("queue.wait_result is not a child of api.generate")
+	}
+	if got := spanAttr(enq, "job.id"); got == "" {
+		t.Error("queue.enqueue span missing job.id attribute")
+	}
+}
+
+func TestStreamSpansAndAbandonOnTimeout(t *testing.T) {
+	rec := setupTraceRecorder(t)
+	fq := &fakeQueue{
+		chunkFn: func(ctx context.Context, _ string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk)
+			errCh := make(chan error, 1)
+			go func() {
+				<-ctx.Done()
+				errCh <- ctx.Err()
+				close(chunks)
+			}()
+			return chunks, errCh
+		},
+	}
+	srv := newTestServer(t, fq, 50*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	req.Header.Set("Traceparent", testTraceparent)
+	out := httptest.NewRecorder()
+	srv.ServeHTTP(out, req)
+	if out.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", out.Code)
+	}
+
+	spans := rec.Ended()
+	server := findSpan(spans, "POST /generate/stream")
+	if server == nil {
+		t.Fatalf("no server span named POST /generate/stream; got: %v", spanNames(spans))
+	}
+	if got := spanAttr(server, "http.route"); got != "/generate/stream" {
+		t.Errorf("server span http.route = %q, want /generate/stream", got)
+	}
+
+	api := findSpan(spans, "api.generate_stream")
+	if api == nil {
+		t.Fatalf("no api.generate_stream span; got: %v", spanNames(spans))
+	}
+	consume := findSpan(spans, "queue.consume_chunks")
+	if consume == nil {
+		t.Fatalf("no queue.consume_chunks span; got: %v", spanNames(spans))
+	}
+	if got := spanAttr(consume, "job.timed_out"); got != "true" {
+		t.Errorf("queue.consume_chunks job.timed_out = %q, want true", got)
+	}
+	if got := spanAttr(consume, "stream.chunk_count"); got != "0" {
+		t.Errorf("queue.consume_chunks stream.chunk_count = %q, want 0", got)
+	}
+	abandon := findSpan(spans, "api.abandon")
+	if abandon == nil {
+		t.Fatalf("no api.abandon span; got: %v", spanNames(spans))
+	}
+	if got := spanAttr(abandon, "abandon.reason"); got != "timeout" {
+		t.Errorf("api.abandon reason = %q, want timeout", got)
+	}
+
+	tid, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	for name, s := range map[string]sdktrace.ReadOnlySpan{
+		"server": server, "api": api, "consume": consume, "abandon": abandon,
+	} {
+		if s.SpanContext().TraceID() != tid {
+			t.Errorf("%s span trace ID = %s, want %s", name, s.SpanContext().TraceID(), tid)
+		}
+	}
+}
+
+func spanNames(spans []sdktrace.ReadOnlySpan) []string {
+	names := make([]string, 0, len(spans))
+	for _, s := range spans {
+		names = append(names, fmt.Sprintf("%q", s.Name()))
+	}
+	return names
+}
+
+// parseTraceparent splits a W3C traceparent into its trace ID.
+func parseTraceparent(tp string) (trace.TraceID, trace.SpanID, bool) {
+	parts := strings.Split(tp, "-")
+	if len(parts) != 4 {
+		return trace.TraceID{}, trace.SpanID{}, false
+	}
+	tid, err := trace.TraceIDFromHex(parts[1])
+	if err != nil {
+		return trace.TraceID{}, trace.SpanID{}, false
+	}
+	sid, err := trace.SpanIDFromHex(parts[2])
+	if err != nil {
+		return trace.TraceID{}, trace.SpanID{}, false
+	}
+	return tid, sid, true
 }

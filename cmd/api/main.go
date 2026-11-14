@@ -26,7 +26,7 @@ func main() {
 
 	logger := newLogger(cfg.LogLevel)
 
-	tracerShutdown, err := tracing.Setup(context.Background(), cfg.OTLPEndpoint, cfg.SamplerRatio)
+	tracerShutdown, err := tracing.Setup(context.Background(), "mastori-api", cfg.OTLPEndpoint, cfg.SamplerRatio)
 	if err != nil {
 		logger.Error("tracing setup failed", "error", err)
 		os.Exit(1)

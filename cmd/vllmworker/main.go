@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/dbaltas/mastori/internal/registry"
+	"github.com/dbaltas/mastori/internal/tracing"
 	"github.com/dbaltas/mastori/internal/worker"
 )
 
@@ -103,6 +104,19 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	tracerShutdown, err := tracing.SetupFromEnv(context.Background(), "mastori-worker-vllm")
+	if err != nil {
+		logger.Error("tracing setup failed", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerShutdown(shutdownCtx); err != nil {
+			logger.Warn("tracer shutdown error", "error", err)
+		}
+	}()
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
 	defer func() { _ = client.Close() }()

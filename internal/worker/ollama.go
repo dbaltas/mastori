@@ -11,6 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/dbaltas/mastori/internal/queue"
 )
 
@@ -27,6 +32,8 @@ type OllamaGenerator struct {
 	MaxTokens int
 	// Client is the HTTP client used for generation calls.
 	Client *http.Client
+	// Tracer creates the inference spans; nil uses the worker tracer.
+	Tracer oteltrace.Tracer
 }
 
 type sseEvent struct {
@@ -45,10 +52,17 @@ type sseEvent struct {
 }
 
 func (g *OllamaGenerator) client() *http.Client {
-	if g.Client != nil {
-		return g.Client
+	c := g.Client
+	if c == nil {
+		c = http.DefaultClient
 	}
-	return http.DefaultClient
+	transport := c.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	// Wrap the transport so every inference call becomes a client span under
+	// worker.process and carries the trace context into the backend server.
+	return &http.Client{Transport: otelhttp.NewTransport(transport), Timeout: c.Timeout}
 }
 
 func (g *OllamaGenerator) model(job queue.Job) string {
@@ -56,6 +70,14 @@ func (g *OllamaGenerator) model(job queue.Job) string {
 		return job.Model
 	}
 	return g.Model
+}
+
+// spanTracer returns the tracer used for inference spans.
+func (g *OllamaGenerator) spanTracer() oteltrace.Tracer {
+	if g.Tracer != nil {
+		return g.Tracer
+	}
+	return tracer
 }
 
 func (g *OllamaGenerator) estimateTokens(text string) int64 {
@@ -88,33 +110,58 @@ func (g *OllamaGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 		return fmt.Errorf("inference: encode request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(g.BaseURL, "/")+"/v1/completions", bytes.NewReader(payload))
+	// Child of worker.process: covers the backend call and the whole SSE body
+	// read, so the time spent inside the generator becomes visible in the
+	// trace instead of hiding inside worker.process.
+	reqCtx, reqSpan := g.spanTracer().Start(ctx, "inference.request",
+		oteltrace.WithSpanKind(oteltrace.SpanKindClient),
+		oteltrace.WithAttributes(
+			attribute.String("job.id", job.ID),
+			attribute.String("job.model", g.model(job)),
+			attribute.Int64("job.prompt_len", int64(len(job.Prompt))),
+		))
+	defer reqSpan.End()
+	fail := func(err error) error {
+		reqSpan.RecordError(err)
+		reqSpan.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	// Child of inference.request: ends the moment the first content token
+	// arrives, so its duration is the true time-to-first-token as seen by the
+	// worker (not the chunk-consume time the API records today).
+	_, firstSpan := g.spanTracer().Start(reqCtx, "inference.first_token")
+	defer firstSpan.End()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimSuffix(g.BaseURL, "/")+"/v1/completions", bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("inference: build request: %w", err)
+		return fail(fmt.Errorf("inference: build request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := g.client().Do(req)
 	if err != nil {
-		return fmt.Errorf("inference: request failed: %w", err)
+		return fail(fmt.Errorf("inference: request failed: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
+	reqSpan.SetAttributes(attribute.Int("inference.status_code", resp.StatusCode))
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("inference: backend returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return fail(fmt.Errorf("inference: backend returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b))))
 	}
 
 	var tokensIn, tokensOut int64
 	sawUsage := false
+	sawFirstToken := false
 	var text strings.Builder
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return fail(ctx.Err())
 		}
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -127,18 +174,29 @@ func (g *OllamaGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 
 		var ev sseEvent
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			return fmt.Errorf("inference: malformed SSE payload: %w", err)
+			return fail(fmt.Errorf("inference: malformed SSE payload: %w", err))
 		}
 		if ev.Error != nil {
-			return fmt.Errorf("inference: backend error: %s", ev.Error.Message)
+			return fail(fmt.Errorf("inference: backend error: %s", ev.Error.Message))
 		}
 		for _, c := range ev.Choices {
 			if c.Delta.Content == "" {
 				continue
 			}
+			if !sawFirstToken {
+				sawFirstToken = true
+				ttft := time.Since(start)
+				firstSpan.SetAttributes(
+					attribute.Int64("stream.ttft_ms", ttft.Milliseconds()),
+				)
+				firstSpan.End()
+				reqSpan.AddEvent("inference.first_token", oteltrace.WithAttributes(
+					attribute.Int64("stream.ttft_ms", ttft.Milliseconds()),
+				))
+			}
 			chunk := queue.Chunk{JobID: job.ID, Text: c.Delta.Content}
 			if err := onChunk(chunk); err != nil {
-				return err
+				return fail(err)
 			}
 			tokensOut++
 			text.WriteString(c.Delta.Content)
@@ -150,15 +208,20 @@ func (g *OllamaGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("inference: stream read failed: %w", err)
+		return fail(fmt.Errorf("inference: stream read failed: %w", err))
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return fail(ctx.Err())
 	}
 	if !sawUsage {
 		tokensOut = g.estimateTokens(text.String())
 	}
 
+	reqSpan.SetAttributes(
+		attribute.Int64("job.tokens_in", tokensIn),
+		attribute.Int64("job.tokens_out", tokensOut),
+		attribute.Int64("job.duration_ms", time.Since(start).Milliseconds()),
+	)
 	done := queue.Chunk{
 		JobID:       job.ID,
 		Done:        true,
@@ -169,7 +232,7 @@ func (g *OllamaGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 	}
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return fail(ctx.Err())
 	default:
 	}
 	return onChunk(done)

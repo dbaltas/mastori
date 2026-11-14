@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/dbaltas/mastori/internal/config"
 	"github.com/dbaltas/mastori/internal/metrics"
@@ -16,12 +17,19 @@ import (
 
 type ReadinessChecker func(ctx context.Context) error
 
-const readyzTimeout = 2 * time.Second
+const (
+	readyzTimeout   = 2 * time.Second
+	serverSpanScope = "mastori-api"
+)
 
 func NewRouter(cfg *config.Config, m *metrics.Metrics, logger *slog.Logger, readiness ReadinessChecker, h *Handler) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Recoverer)
+	r.Use(otelhttp.NewMiddleware(serverSpanScope, otelhttp.WithSpanNameFormatter(
+		func(_ string, r *http.Request) string { return r.Method },
+	)))
+	r.Use(ServerRouteSpan())
 	r.Use(RequestMetrics(m))
 	r.Use(RequestLogger(logger))
 

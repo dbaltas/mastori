@@ -6,11 +6,15 @@ import (
 )
 
 type Job struct {
-	ID        string
-	TraceID   string
-	Model     string
-	Prompt    string
-	CreatedAt time.Time
+	ID      string
+	TraceID string
+	// Traceparent/Tracestate carry the W3C trace context so a consumer in
+	// another process (scheduler, worker) can continue the same trace.
+	Traceparent string
+	Tracestate  string
+	Model       string
+	Prompt      string
+	CreatedAt   time.Time
 }
 
 type Result struct {

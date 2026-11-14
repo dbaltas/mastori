@@ -7,17 +7,19 @@ import (
 
 func TestJobValuesRoundTrip(t *testing.T) {
 	in := Job{
-		ID:        "j1",
-		TraceID:   "t1",
-		Model:     "m",
-		Prompt:    "hello there",
-		CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
+		ID:          "j1",
+		TraceID:     "t1",
+		Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		Tracestate:  "vendor=1",
+		Model:       "m",
+		Prompt:      "hello there",
+		CreatedAt:   time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
 	}
 	out, ok := JobFromValues(JobValues(in))
 	if !ok {
 		t.Fatal("round trip reported malformed")
 	}
-	if out.ID != in.ID || out.TraceID != in.TraceID || out.Model != in.Model || out.Prompt != in.Prompt || !out.CreatedAt.Equal(in.CreatedAt) {
+	if out.ID != in.ID || out.TraceID != in.TraceID || out.Traceparent != in.Traceparent || out.Tracestate != in.Tracestate || out.Model != in.Model || out.Prompt != in.Prompt || !out.CreatedAt.Equal(in.CreatedAt) {
 		t.Errorf("round trip = %+v, want %+v", out, in)
 	}
 }

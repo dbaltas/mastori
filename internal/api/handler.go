@@ -19,6 +19,7 @@ import (
 	"github.com/dbaltas/mastori/internal/config"
 	"github.com/dbaltas/mastori/internal/metrics"
 	"github.com/dbaltas/mastori/internal/queue"
+	"github.com/dbaltas/mastori/internal/tracing"
 )
 
 const maxBodyBytes = 1 << 20
@@ -65,18 +66,25 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, h.cfg.RequestTimeout)
+	waitSpanCtx, waitSpan := tracer.Start(ctx, "queue.wait_result", trace.WithAttributes(
+		attribute.String("job.id", job.ID),
+	))
+	defer waitSpan.End()
+
+	waitCtx, cancel := context.WithTimeout(waitSpanCtx, h.cfg.RequestTimeout)
 	defer cancel()
 
 	waitStart := time.Now()
 	res, err := h.queue.WaitResult(waitCtx, job.ID)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
+			waitSpan.SetAttributes(attribute.Bool("job.timed_out", true))
 			span.SetAttributes(attribute.Bool("job.timed_out", true))
 			writeError(w, http.StatusGatewayTimeout, "request timed out waiting for result")
 			return
 		}
 		span.RecordError(err)
+		waitSpan.RecordError(err)
 		h.logger.ErrorContext(ctx, "wait failed", "error", err, "job_id", job.ID)
 		writeError(w, http.StatusServiceUnavailable, "failed to retrieve result")
 		return
@@ -125,7 +133,16 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, h.cfg.RequestTimeout)
+	consumeCtx, consumeSpan := tracer.Start(ctx, "queue.consume_chunks", trace.WithAttributes(
+		attribute.String("job.id", job.ID),
+	))
+	chunkCount := 0
+	defer consumeSpan.End()
+	defer func() {
+		consumeSpan.SetAttributes(attribute.Int("stream.chunk_count", chunkCount))
+	}()
+
+	waitCtx, cancel := context.WithTimeout(consumeCtx, h.cfg.RequestTimeout)
 	defer cancel()
 
 	chunks, errCh := sq.ConsumeChunks(waitCtx, job.ID)
@@ -139,12 +156,16 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 	completed := false
 	firstToken := true
 
-	failStream := func(err error, msg string) {
+	failStream := func(err error, reason string) {
+		abandonSpan(ctx, job.ID, reason)
+		msg := "failed to retrieve result"
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			span.SetAttributes(attribute.Bool("job.timed_out", true))
+			consumeSpan.SetAttributes(attribute.Bool("job.timed_out", true))
 			msg = "request timed out waiting for result"
 		} else {
 			span.RecordError(err)
+			consumeSpan.RecordError(err)
 			h.logger.ErrorContext(ctx, "stream failed", "error", err, "job_id", job.ID)
 		}
 		_ = writeSSE(w, "error", map[string]string{"error": msg})
@@ -159,7 +180,7 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 				select {
 				case err := <-errCh:
 					if err != nil {
-						failStream(err, "failed to retrieve result")
+						failStream(err, "queue_error")
 						return
 					}
 				default:
@@ -167,12 +188,19 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 				completed = true
 				break
 			}
+			chunkCount++
 			if firstToken {
+				ttftMs := time.Since(waitStart).Milliseconds()
 				h.m.TTFTSeconds.Observe(time.Since(waitStart).Seconds())
 				firstToken = false
+				consumeSpan.SetAttributes(attribute.Int64("stream.ttft_ms", ttftMs))
 			}
 			h.m.ChunksStreamed.Inc()
 			if !writeSSE(w, "chunk", chunk) {
+				span.AddEvent("sse.write_failed", trace.WithAttributes(
+					attribute.Int("stream.chunk", chunkCount),
+				))
+				abandonSpan(ctx, job.ID, "client_disconnected")
 				_ = sq.Abandon(context.WithoutCancel(waitCtx), job.ID)
 				return
 			}
@@ -182,13 +210,17 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 					attribute.Int64("job.tokens_out", chunk.TokensOut),
 					attribute.Int64("job.duration_ms", chunk.DurationMs),
 				)
+				consumeSpan.SetAttributes(
+					attribute.Int64("job.tokens_out", chunk.TokensOut),
+					attribute.Int64("job.duration_ms", chunk.DurationMs),
+				)
 				completed = true
 			}
 		case err := <-errCh:
-			failStream(err, "failed to retrieve result")
+			failStream(err, "queue_error")
 			return
 		case <-waitCtx.Done():
-			failStream(waitCtx.Err(), "request timed out waiting for result")
+			failStream(waitCtx.Err(), "timeout")
 			return
 		}
 	}
@@ -244,10 +276,19 @@ func (h *Handler) parseAndEnqueue(w http.ResponseWriter, r *http.Request, ctx co
 		Prompt:    req.Prompt,
 		CreatedAt: time.Now().UTC(),
 	}
+	job.Traceparent, job.Tracestate = tracing.InjectTraceContext(ctx)
 	span.SetAttributes(attribute.String("job.id", job.ID))
 
+	enqCtx, enqSpan := tracer.Start(ctx, "queue.enqueue", trace.WithAttributes(
+		attribute.String("job.id", job.ID),
+	))
 	enqStart := time.Now()
-	if err := h.queue.Enqueue(ctx, job); err != nil {
+	err := h.queue.Enqueue(enqCtx, job)
+	if err != nil {
+		enqSpan.RecordError(err)
+	}
+	enqSpan.End()
+	if err != nil {
 		h.m.EnqueueErrors.Inc()
 		span.RecordError(err)
 		h.logger.ErrorContext(ctx, "enqueue failed", "error", err)
@@ -258,6 +299,16 @@ func (h *Handler) parseAndEnqueue(w http.ResponseWriter, r *http.Request, ctx co
 	h.m.JobsEnqueued.Inc()
 
 	return job, true
+}
+
+// abandonSpan records a short child span marking that the job was abandoned
+// before or during streaming, with the reason why.
+func abandonSpan(ctx context.Context, jobID, reason string) {
+	_, span := tracer.Start(ctx, "api.abandon", trace.WithAttributes(
+		attribute.String("job.id", jobID),
+		attribute.String("abandon.reason", reason),
+	))
+	span.End()
 }
 
 func writeSSE(w http.ResponseWriter, event string, payload any) bool {

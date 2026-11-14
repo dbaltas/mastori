@@ -10,10 +10,16 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/dbaltas/mastori/internal/queue"
 	"github.com/dbaltas/mastori/internal/registry"
+	"github.com/dbaltas/mastori/internal/tracing"
 )
+
+var tracer = otel.Tracer("mastori/worker")
 
 // RunnerConfig configures a Runner.
 type RunnerConfig struct {
@@ -183,7 +189,27 @@ func (r *Runner) process(ctx context.Context, job queue.Job, entryID string) {
 		r.mu.Unlock()
 	}()
 
-	err := r.gen.Run(ctx, job, func(c queue.Chunk) error {
+	// Rejoin the trace the API started: the job carries the serialized W3C
+	// context, so this span lands in the same trace below the API request.
+	// The returned context carries the worker.process span, and is passed to
+	// the generator so its spans nest under this one in the same trace.
+	genCtx, span := tracer.Start(tracing.ExtractTraceContext(ctx, job.Traceparent, job.Tracestate), "worker.process", trace.WithAttributes(
+		attribute.String("worker.id", r.cfg.ID),
+		attribute.String("job.id", job.ID),
+		attribute.String("job.model", job.Model),
+		attribute.Int64("job.queue_wait_ms", time.Since(job.CreatedAt).Milliseconds()),
+	))
+	defer span.End()
+
+	err := r.gen.Run(genCtx, job, func(c queue.Chunk) error {
+		if c.Done {
+			span.SetAttributes(
+				attribute.Int64("job.tokens_in", c.TokensIn),
+				attribute.Int64("job.tokens_out", c.TokensOut),
+				attribute.Int64("job.queue_wait_ms", c.QueueWaitMs),
+				attribute.Int64("job.duration_ms", c.DurationMs),
+			)
+		}
 		values := map[string]any{
 			"job_id":     c.JobID,
 			"text":       c.Text,
@@ -203,6 +229,7 @@ func (r *Runner) process(ctx context.Context, job queue.Job, entryID string) {
 		}).Err()
 	})
 	if err != nil && ctx.Err() == nil {
+		span.RecordError(err)
 		r.logger.Error("job generation failed", "job_id", job.ID, "error", err)
 	}
 	r.finish(entryID)
