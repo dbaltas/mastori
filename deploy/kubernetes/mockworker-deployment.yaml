@@ -6,7 +6,7 @@ metadata:
   labels:
     app: mockworker
 spec:
-  replicas: 2
+  replicas: 0
   selector:
     matchLabels:
       app: mockworker

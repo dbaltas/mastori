@@ -29,4 +29,4 @@ Before jumping into coding, discuss whether integration tests should be implemen
 
 ## Local ports
 
-- All host ports for the local stacks (kind `extraPortMappings` and `docker compose`) must be in the range 7000–7999.
+- All host ports for the local stack (kind `extraPortMappings`) must be in the range 7000–7999.

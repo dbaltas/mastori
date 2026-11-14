@@ -35,6 +35,7 @@ spec:
                 name: inference-config
           ports:
             - containerPort: 8080
+              name: http
           readinessProbe:
             httpGet:
               path: /health
@@ -57,5 +58,6 @@ spec:
   selector:
     app: inference-adapter
   ports:
-    - port: 8080
-      targetPort: 8080
+    - name: http
+      port: 8080
+      targetPort: http

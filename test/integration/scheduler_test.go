@@ -4,8 +4,8 @@
 // against a real Redis. Every test uses its own key prefix, so tests can share
 // one Redis instance and run in parallel.
 //
-// Run with a Redis on INTEGRATION_REDIS_ADDR (default localhost:7079, the
-// docker compose port):
+// Run with a Redis on INTEGRATION_REDIS_ADDR (default localhost:7099, the
+// throwaway Redis that `make test-integration` starts):
 //
 //	go test -tags integration ./test/integration/...
 package integration
@@ -57,7 +57,7 @@ func redisAddr() string {
 	if v := os.Getenv("INTEGRATION_REDIS_ADDR"); v != "" {
 		return v
 	}
-	return "localhost:7079"
+	return "localhost:7099"
 }
 
 func newStack(t *testing.T, policyName string) *stack {

@@ -105,7 +105,7 @@ data:
             regex: Pending|Running
             action: keep
           - source_labels: [__meta_kubernetes_pod_label_app]
-            regex: api|scheduler
+            regex: api|scheduler|inference-adapter
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_name]
             regex: http

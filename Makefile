@@ -1,6 +1,6 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration vet fmt run docker-build compose-up compose-up-inference compose-down cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference
+.PHONY: build test test-integration vet fmt run docker-build cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference
 
 build:
 	go build ./...
@@ -27,16 +27,6 @@ run: build
 
 docker-build:
 	docker build -t mastori/api:latest .
-
-compose-up:
-	docker compose up --build -d
-
-compose-up-inference:
-	docker compose --profile inference up --build -d
-	docker compose exec ollama ollama pull $${INFERENCE_MODEL:-qwen2.5:0.5b}
-
-compose-down:
-	docker compose down -v
 
 cluster-up:
 	kind create cluster --config infra/kind/kind-config.yaml
