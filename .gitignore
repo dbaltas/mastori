@@ -10,8 +10,6 @@ dist/
 *.test
 *.out
 
-# Dataset cache (fetched at run time, never committed)
-benchmark/workloads/cache/
-
-# Traffic run artifacts (results JSONL, run metadata)
-benchmark/results/
+# Dataset cache and run artifacts live in the benchmark submodule
+# (Hugging Face: dbaltas/inference-api-benchmark-mastori). The submodule's own
+# .gitignore excludes its fetch cache.
