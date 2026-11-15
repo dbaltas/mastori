@@ -10,6 +10,9 @@ dist/
 *.test
 *.out
 
+# Generated static site (sitegen / GitHub Pages)
+site/
+
 # Dataset cache and run artifacts live in the benchmark submodule
 # (Hugging Face: dbaltas/inference-api-benchmark-mastori). The submodule's own
 # .gitignore excludes its fetch cache.

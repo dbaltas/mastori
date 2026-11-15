@@ -1,6 +1,6 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration vet fmt run docker-build cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference
+.PHONY: build test test-integration vet fmt site run docker-build cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference
 
 build:
 	go build ./...
@@ -18,6 +18,10 @@ test-integration:
 
 vet:
 	go vet ./...
+
+# Renders the static benchmark-stories site from the benchmark submodule into site/.
+site:
+	go run ./cmd/sitegen -benchmark benchmark -out site
 
 fmt:
 	gofmt -l .
