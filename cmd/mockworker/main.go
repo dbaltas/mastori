@@ -32,6 +32,9 @@ type mockConfig struct {
 	maxTokens            int
 	tokenDelayMs         int
 	firstDelayMs         int
+	tokenCountJitter     float64
+	tokenDelayJitter     float64
+	firstDelayJitter     float64
 	heartbeatMs          int
 }
 
@@ -47,6 +50,9 @@ func loadMockConfig() (*mockConfig, error) {
 		maxTokens:            96,
 		tokenDelayMs:         20,
 		firstDelayMs:         50,
+		tokenCountJitter:     0.25,
+		tokenDelayJitter:     0.30,
+		firstDelayJitter:     0.30,
 		heartbeatMs:          1000,
 	}
 	if v := os.Getenv("WORKER_MODELS"); v != "" {
@@ -70,6 +76,25 @@ func loadMockConfig() (*mockConfig, error) {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 0 {
 				return nil, fmt.Errorf("invalid %s %q: must be a non-negative integer", f.key, v)
+			}
+			*f.target = n
+		}
+	}
+	for _, f := range []struct {
+		key    string
+		target *float64
+	}{
+		{"WORKER_TOKEN_COUNT_JITTER", &cfg.tokenCountJitter},
+		{"WORKER_TOKEN_DELAY_JITTER", &cfg.tokenDelayJitter},
+		{"WORKER_FIRST_DELAY_JITTER", &cfg.firstDelayJitter},
+	} {
+		if v := os.Getenv(f.key); v != "" {
+			n, err := strconv.ParseFloat(v, 64)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("invalid %s %q: must be a non-negative number (fraction of the base value)", f.key, v)
+			}
+			if n > 1 {
+				return nil, fmt.Errorf("invalid %s %q: must be <= 1", f.key, v)
 			}
 			*f.target = n
 		}
@@ -127,10 +152,13 @@ func main() {
 	reg := registry.New(client, cfg.workerRegistryPrefix, 3*hb)
 
 	gen := &worker.MockGenerator{
-		MinTokens:  cfg.minTokens,
-		MaxTokens:  cfg.maxTokens,
-		TokenDelay: time.Duration(cfg.tokenDelayMs) * time.Millisecond,
-		FirstDelay: time.Duration(cfg.firstDelayMs) * time.Millisecond,
+		MinTokens:        cfg.minTokens,
+		MaxTokens:        cfg.maxTokens,
+		TokenDelay:       time.Duration(cfg.tokenDelayMs) * time.Millisecond,
+		FirstDelay:       time.Duration(cfg.firstDelayMs) * time.Millisecond,
+		TokenCountJitter: cfg.tokenCountJitter,
+		TokenDelayJitter: cfg.tokenDelayJitter,
+		FirstDelayJitter: cfg.firstDelayJitter,
 	}
 
 	runner := worker.NewRunner(client, reg, gen, logger, worker.RunnerConfig{

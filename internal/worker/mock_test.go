@@ -72,6 +72,93 @@ func TestTokenCountDeterministicFromPrompt(t *testing.T) {
 	}
 }
 
+func TestJitterFactorWithinBounds(t *testing.T) {
+	for _, j := range []float64{0, 0.25, 0.5, 1} {
+		for i := 0; i < 1000; i++ {
+			f := jitterFactor(j)
+			if j == 0 && f != 1 {
+				t.Fatalf("jitterFactor(0) = %f, want 1", f)
+			}
+			if f < 1-j || f > 1+j {
+				t.Fatalf("jitterFactor(%f) = %f outside [1-j, 1+j]", j, f)
+			}
+		}
+	}
+}
+
+func TestJitterDelayWithinBounds(t *testing.T) {
+	base := 10 * time.Millisecond
+	for _, j := range []float64{0, 0.3, 0.5, 1} {
+		for i := 0; i < 1000; i++ {
+			d := jitterDelay(base, j)
+			if j == 0 && d != base {
+				t.Fatalf("jitterDelay(base, 0) = %v, want base", d)
+			}
+			if d < time.Duration(float64(base)*(1-j)) || d > time.Duration(float64(base)*(1+j))+time.Nanosecond {
+				t.Fatalf("jitterDelay(%v, %f) = %v outside bounds", base, j, d)
+			}
+			if d < 0 {
+				t.Fatalf("jitterDelay(%v, %f) = %v, want >= 0", base, j, d)
+			}
+		}
+	}
+	if got := jitterDelay(0, 0.5); got != 0 {
+		t.Errorf("jitterDelay(0, 0.5) = %v, want 0", got)
+	}
+}
+
+func TestRunJitteredTokenCountStaysWithinBounds(t *testing.T) {
+	base := 50
+	g := &MockGenerator{
+		MinTokens:        base,
+		MaxTokens:        base,
+		TokenDelay:       time.Microsecond,
+		FirstDelay:       time.Microsecond,
+		TokenCountJitter: 0.5,
+	}
+	for i := 0; i < 50; i++ {
+		chunks := collectChunks(t, g, "p")
+		n := int(chunks[len(chunks)-1].TokensOut)
+		if n < base/2 || n > base+base/2 {
+			t.Fatalf("tokens_out = %d, outside jittered [25, 75]", n)
+		}
+	}
+}
+
+func TestRunJitteredDelaysStayWithinBounds(t *testing.T) {
+	base := 2 * time.Millisecond
+	g := &MockGenerator{
+		MinTokens:        5,
+		MaxTokens:        5,
+		TokenDelay:       base,
+		FirstDelay:       base,
+		TokenDelayJitter: 1,
+		FirstDelayJitter: 1,
+	}
+	start := time.Now()
+	collectChunks(t, g, "p")
+	elapsed := time.Since(start)
+	if elapsed > 5*base*(1+1)+10*time.Millisecond {
+		t.Fatalf("elapsed = %v, want <= 5 * base * (1+j) + scheduling slack", elapsed)
+	}
+}
+
+func TestRunWithoutJitterPreservesCount(t *testing.T) {
+	g := &MockGenerator{
+		MinTokens:        7,
+		MaxTokens:        7,
+		TokenDelay:       time.Microsecond,
+		FirstDelay:       time.Microsecond,
+		TokenCountJitter: 0,
+		TokenDelayJitter: 0,
+		FirstDelayJitter: 0,
+	}
+	chunks := collectChunks(t, g, "p")
+	if len(chunks) != 8 {
+		t.Fatalf("chunks = %d, want 7 text + 1 done", len(chunks))
+	}
+}
+
 func TestRunRespectsContextCancel(t *testing.T) {
 	g := &MockGenerator{
 		MinTokens:  1000,

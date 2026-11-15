@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"hash/fnv"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -14,6 +15,30 @@ type MockGenerator struct {
 	MaxTokens  int
 	TokenDelay time.Duration
 	FirstDelay time.Duration
+	TokenCountJitter float64
+	TokenDelayJitter float64
+	FirstDelayJitter float64
+}
+
+func jitterFactor(j float64) float64 {
+	if j <= 0 {
+		return 1
+	}
+	if j > 1 {
+		j = 1
+	}
+	return 1 + (2*rand.Float64()-1)*j
+}
+
+func jitterDelay(d time.Duration, j float64) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	f := jitterFactor(j)
+	if f < 0 {
+		f = 0
+	}
+	return time.Duration(float64(d) * f)
 }
 
 func (g *MockGenerator) tokenCount(prompt string) int {
@@ -38,20 +63,23 @@ func (g *MockGenerator) Run(ctx context.Context, job queue.Job, onChunk func(que
 	start := time.Now()
 	queueWaitMs := time.Since(job.CreatedAt).Milliseconds()
 
-	tokensOut := g.tokenCount(job.Prompt)
+	tokensOut := int(float64(g.tokenCount(job.Prompt)) * jitterFactor(g.TokenCountJitter))
+	if tokensOut < 1 {
+		tokensOut = 1
+	}
 	tokensIn := int64(len(strings.Fields(job.Prompt)))
 	if tokensIn == 0 {
 		tokensIn = 1
 	}
 
-	first := g.FirstDelay
+	first := jitterDelay(g.FirstDelay, g.FirstDelayJitter)
 	for i := 0; i < tokensOut; i++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(first):
 		}
-		first = g.TokenDelay
+		first = jitterDelay(g.TokenDelay, g.TokenDelayJitter)
 
 		chunk := queue.Chunk{JobID: job.ID, Text: tokenText(i)}
 		if err := onChunk(chunk); err != nil {
