@@ -1,0 +1,99 @@
+# Applied by `make cluster-run-traffic` (kind, raw: the local image tag is
+# loaded into the node) and `make aws-run-traffic` (EKS, via the sibling
+# kustomization that rewrites the image to GHCR). Both first generate the
+# datasets-manifest ConfigMap from the benchmark submodule
+# (benchmark/workloads/datasets.yaml) and regenerate the traffic-config
+# ConfigMap from their TRAFFIC_* overrides. Deliberately not part of the base
+# kustomization: `cluster-deploy` should not start a traffic run as a side
+# effect.
+#
+# Data flow: the datasets initContainers fetch the dataset cache into a
+# shared emptyDir and validate it against the manifest, then /traffic replays
+# it against the in-cluster API. Records are also streamed to stdout
+# (TRAFFIC_RECORDS_STDOUT), because the distroless image has no shell or tar
+# for `kubectl cp`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: traffic
+  namespace: mastori
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: traffic
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        mastori/pool: cpu
+      initContainers:
+        - name: datasets
+          image: mastori/api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /datasets
+            - fetch
+            - --manifest
+            - /etc/mastori/datasets.yaml
+            - --cache
+            - /data/cache
+          volumeMounts:
+            - name: manifest
+              mountPath: /etc/mastori
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+        # Fail the Job before any traffic if the fetched cache does not match
+        # the manifest's row count, required fields, and spot checks.
+        - name: datasets-validate
+          image: mastori/api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /datasets
+            - validate
+            - --manifest
+            - /etc/mastori/datasets.yaml
+            - --cache
+            - /data/cache
+          volumeMounts:
+            - name: manifest
+              mountPath: /etc/mastori
+              readOnly: true
+            - name: data
+              mountPath: /data
+      containers:
+        - name: traffic
+          image: mastori/api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/traffic"]
+          envFrom:
+            - configMapRef:
+                name: traffic-config
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: manifest
+              mountPath: /etc/mastori
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: manifest
+          configMap:
+            name: datasets-manifest

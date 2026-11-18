@@ -12,6 +12,7 @@ resources:
   - prometheus.yaml
   - redis.yaml
   - scheduler-deployment.yaml
+  - traffic-config.yaml
 configMapGenerator:
   - name: grafana-dashboards
     namespace: mastori # generated resources have no namespace field; without this kubectl applies it to the current context namespace

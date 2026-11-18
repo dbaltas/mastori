@@ -111,7 +111,16 @@ Published experiment results and stories are rendered by `cmd/sitegen` and deplo
 
 ### Traffic generation
 
-`cmd/traffic` replays dataset prompts against the API at a controlled rate and writes per-request results as JSONL plus a run summary:
+The traffic generator runs inside the cluster as a Kubernetes Job (same image, `mastori/api:latest`, `command: ["/traffic"]`), replaying dataset prompts against the in-cluster API:
+
+```sh
+make cluster-run-traffic TRAFFIC_WORKLOAD=short TRAFFIC_RATE=5 TRAFFIC_DURATION=5s
+make cluster-traffic-results   # recover the records + summary from the pod logs
+```
+
+The run is a Job in the `mastori` namespace: `datasets` initContainers fetch the dataset cache from Hugging Face into an `emptyDir` and validate it, then `/traffic` replays it against `api.mastori.svc.cluster.local:80`. The manifest comes from the benchmark submodule — `cluster-run-traffic` generates the `datasets-manifest` ConfigMap straight from `benchmark/workloads/datasets.yaml`, so the submodule stays the single source of truth for seed data, and the run summary records its SHA-256 (`dataset_manifest_sha256`) as provenance. Run parameters are `TRAFFIC_*` make variables (`TRAFFIC_WORKLOAD`, `TRAFFIC_RATE`, `TRAFFIC_ARRIVAL`, `TRAFFIC_DURATION`, `TRAFFIC_STEPS`, `TRAFFIC_CONCURRENCY`, `TRAFFIC_WARMUP`, `TRAFFIC_SHORT_PERCENTAGE`, `TRAFFIC_SEED`, `TRAFFIC_WAIT_TIMEOUT`), written into the `traffic-config` ConfigMap. Records are streamed to the container stdout (the distroless image has no shell for `kubectl cp`), so `cluster-traffic-results` recovers `benchmark/results/cluster/<run-id>.jsonl` and the run summary from the pod logs. The scheduler-side interruption flag invalidates runs that overlap infrastructure changes, exactly as for host runs.
+
+For host-side runs (`go run ./cmd/traffic`) the same flags are available on the command line; `TRAFFIC_*` environment variables configure the run without flags, and flags win over the environment:
 
 ```sh
 go run ./cmd/traffic --workload short --rate 10 --duration 5m
@@ -119,7 +128,7 @@ go run ./cmd/traffic --workload mixed --short-percentage 80 --rate 50 --duration
 go run ./cmd/traffic --workload mixed --steps "10:60s,50:60s,10:60s"
 ```
 
-Open loop (`--rate`, constant or poisson arrivals, optional `--ramp-end-rate` or `--steps` patterns) or closed loop (`--concurrency`), streaming SSE by default (`--stream=false` for blocking requests), with warmup, seed, and per-request timeout controls.
+Open loop (`--rate`, constant or poisson arrivals, optional `--ramp-end-rate` or `--steps` patterns) or closed loop (`--concurrency`), streaming SSE by default (`--stream=false` for blocking requests), with warmup, seed, and per-request timeout controls. `--manifest` points at the dataset manifest so the run summary records its SHA-256 as seed-data provenance (set automatically by the in-cluster flow).
 
 ## License
 

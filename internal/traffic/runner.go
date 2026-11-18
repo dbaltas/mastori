@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -37,6 +38,13 @@ type Config struct {
 	// warmup requests to finish (default Timeout + 10s).
 	DrainGrace time.Duration
 	OutputPath string
+	// RecordsStdout also streams every record as a JSON line to stdout, so
+	// a run executed inside the cluster is recoverable from the pod logs
+	// (distroless images have no shell, so results cannot be copied out).
+	RecordsStdout bool
+	// ManifestSHA256 identifies the seed data: the SHA-256 of the dataset
+	// manifest that produced the cache rows, empty when unknown.
+	ManifestSHA256 string
 	// RedisAddr enables the interruption-flag check at finalize time
 	// (REDIS_ADDR, like the other components); empty disables it.
 	RedisAddr string
@@ -139,6 +147,9 @@ type Summary struct {
 	OutputPath        string         `json:"output_path"`
 	Mode              string         `json:"mode"`
 	Datasets          map[string]int `json:"datasets"`
+	// DatasetManifestSHA256 identifies the seed data the run replayed
+	// (SHA-256 of the dataset manifest), empty when unknown.
+	DatasetManifestSHA256 string `json:"dataset_manifest_sha256,omitempty"`
 }
 
 // accumulator collects counters from concurrent send goroutines.
@@ -265,11 +276,17 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		return nil, err
 	}
 
-	writer, err := NewResultWriter(cfg.OutputPath)
+	fileWriter, err := NewResultWriter(cfg.OutputPath)
 	if err != nil {
 		return nil, err
 	}
-	defer writer.Close()
+	defer fileWriter.Close()
+	var writer *ResultWriter
+	if cfg.RecordsStdout {
+		writer = NewResultWriterTo(io.MultiWriter(fileWriter.f, os.Stdout))
+	} else {
+		writer = fileWriter
+	}
 
 	sender := NewSender(cfg.URL, cfg.Model, cfg.Stream, cfg.Timeout)
 	selector := NewWeightedRowSource(cfg.Rows, cfg.Weights, cfg.Seed)
@@ -534,6 +551,7 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		s.AchievedSendRate = float64(a.requests) / cfg.Duration.Seconds()
 		s.Throughput = float64(a.successes) / cfg.Duration.Seconds()
 	}
+	s.DatasetManifestSHA256 = cfg.ManifestSHA256
 	s.Mode = modeLabel(cfg)
 	if a.latency.Count() > 0 {
 		s.LatencyMsP50 = a.latency.Percentile(50)

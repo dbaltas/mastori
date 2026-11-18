@@ -2,7 +2,7 @@ CLUSTER_NAME := mastori
 
 AWS_DIR := infra/aws
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig
 
 build:
 	go build ./...
@@ -96,3 +96,77 @@ aws-destroy:
 
 aws-kubeconfig:
 	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region eu-north-1
+
+# Traffic run parameters for cluster-run-traffic; override on the command line,
+# e.g. `make cluster-run-traffic TRAFFIC_WORKLOAD=short TRAFFIC_RATE=5 TRAFFIC_DURATION=5s`
+# or `make cluster-run-traffic TRAFFIC_STEPS="10:60s,50:60s"`. Empty variables are
+# placeholders that keep the in-code defaults (steps, concurrency, warmup,
+# short-percentage).
+TRAFFIC_WORKLOAD ?= mixed
+TRAFFIC_RATE ?= 10
+TRAFFIC_ARRIVAL ?= constant
+TRAFFIC_DURATION ?= 5m
+TRAFFIC_STEPS ?=
+TRAFFIC_CONCURRENCY ?=
+TRAFFIC_WARMUP ?=
+TRAFFIC_SHORT_PERCENTAGE ?=
+TRAFFIC_SEED ?= 42
+TRAFFIC_WAIT_TIMEOUT ?= 30m
+# Path to the dataset manifest (the benchmark submodule). The traffic Job
+# fetches its in-cluster cache from this file, so changing datasets.yaml is
+# enough to change what a run replays.
+DATASETS_MANIFEST ?= benchmark/workloads/datasets.yaml
+
+# Runs the traffic generator inside the kind cluster as a Job: rebuilds the
+# image, replaces the traffic-config ConfigMap, applies the Job template, and
+# waits for completion. Records are streamed to stdout by the container
+# (TRAFFIC_RECORDS_STDOUT) and recovered from the pod logs with
+# cluster-traffic-results — the distroless image has no shell or tar.
+cluster-run-traffic: docker-build
+	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
+	@envfile=$$(mktemp) && trap 'rm -f "$$envfile"' EXIT && \
+	{ echo 'TRAFFIC_URL=http://api.mastori.svc.cluster.local:80'; \
+	  echo 'REDIS_ADDR=redis.mastori.svc.cluster.local:6379'; \
+	  echo 'TRAFFIC_CACHE=/data/cache'; \
+	  echo 'TRAFFIC_OUTPUT=/data/results/run.jsonl'; \
+	  echo 'TRAFFIC_RECORDS_STDOUT=true'; \
+	  echo 'TRAFFIC_MANIFEST=/etc/mastori/datasets.yaml'; } > $$envfile && \
+	for kv in \
+	  'TRAFFIC_WORKLOAD=$(TRAFFIC_WORKLOAD)' \
+	  'TRAFFIC_RATE=$(TRAFFIC_RATE)' \
+	  'TRAFFIC_ARRIVAL=$(TRAFFIC_ARRIVAL)' \
+	  'TRAFFIC_DURATION=$(TRAFFIC_DURATION)' \
+	  'TRAFFIC_STEPS=$(TRAFFIC_STEPS)' \
+	  'TRAFFIC_CONCURRENCY=$(TRAFFIC_CONCURRENCY)' \
+	  'TRAFFIC_WARMUP=$(TRAFFIC_WARMUP)' \
+	  'TRAFFIC_SHORT_PERCENTAGE=$(TRAFFIC_SHORT_PERCENTAGE)' \
+	  'TRAFFIC_SEED=$(TRAFFIC_SEED)'; \
+	do echo "$$kv" >> $$envfile; done && \
+	kubectl -n mastori apply -f deploy/kubernetes/base/traffic-config.yaml && \
+	if test ! -f "$(DATASETS_MANIFEST)"; then \
+	  echo "dataset manifest missing at $(DATASETS_MANIFEST): run git submodule update --init --recursive" >&2; exit 1; fi && \
+	kubectl -n mastori create configmap datasets-manifest --from-file=datasets.yaml=$(DATASETS_MANIFEST) --dry-run=client -o yaml | kubectl apply -f - -n mastori && \
+	kubectl -n mastori create configmap traffic-config --from-env-file=$$envfile --dry-run=client -o yaml | kubectl apply -f - -n mastori && \
+	kubectl -n mastori delete job traffic --ignore-not-found && \
+	kubectl -n mastori apply -f deploy/kubernetes/traffic-job.yaml && \
+	echo "waiting for the traffic job (timeout $(TRAFFIC_WAIT_TIMEOUT))..." && \
+	if ! kubectl -n mastori wait --for=condition=complete --timeout=$(TRAFFIC_WAIT_TIMEOUT) job/traffic; then \
+	  echo "traffic job did not complete:" && \
+	  kubectl -n mastori get pods -l app=traffic && \
+	  kubectl -n mastori logs job/traffic --tail=50; exit 1; fi && \
+	log=$$(mktemp) && trap 'rm -f "$$envfile" "$$log"' EXIT && \
+	kubectl -n mastori logs job/traffic > $$log && \
+	grep '^run ' $$log && awk '/^\{$$/,/^\}$$/' $$log && \
+	echo "(records saved to the pod logs; run make cluster-traffic-results to write the JSONL files)"
+
+# Recovers the records and summary of the last traffic job from the pod logs
+# into benchmark/results/cluster/.
+cluster-traffic-results:
+	@log=$$(mktemp) && trap 'rm -f "$$log"' EXIT && \
+	kubectl -n mastori logs job/traffic > $$log && \
+	runid=$$(sed -n 's/^run \([0-9A-Za-z-]*\):.*/\1/p' $$log | head -1) && \
+	if test -z "$$runid"; then echo "no completed traffic run found in job/traffic logs" >&2; exit 1; fi && \
+	mkdir -p benchmark/results/cluster && \
+	grep -F '"schema_version":"' $$log > benchmark/results/cluster/$$runid.jsonl && \
+	awk '/^\{$$/,/^\}$$/' $$log > benchmark/results/cluster/$$runid.summary.json && \
+	echo "wrote benchmark/results/cluster/$$runid.jsonl and benchmark/results/cluster/$$runid.summary.json"

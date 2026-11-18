@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-config
+  namespace: mastori
+data:
+  TRAFFIC_URL: "http://api.mastori.svc.cluster.local:80"
+  REDIS_ADDR: "redis.mastori.svc.cluster.local:6379"
+  TRAFFIC_CACHE: "/data/cache"
+  TRAFFIC_OUTPUT: "/data/results/run.jsonl"
+  TRAFFIC_RECORDS_STDOUT: "true"
+  # Run parameters: `make cluster-run-traffic` regenerates this ConfigMap
+  # from TRAFFIC_* overrides; these are the defaults.
+  TRAFFIC_WORKLOAD: "mixed"
+  TRAFFIC_RATE: "10"
+  TRAFFIC_ARRIVAL: "constant"
+  TRAFFIC_DURATION: "5m"
+  TRAFFIC_SEED: "42"
+  # The dataset manifest, mounted into the pod from the datasets-manifest
+  # ConfigMap. `make cluster-run-traffic` generates that ConfigMap directly
+  # from the benchmark submodule (benchmark/workloads/datasets.yaml), so the
+  # submodule stays the single source of truth for seed data.
+  TRAFFIC_MANIFEST: "/etc/mastori/datasets.yaml"

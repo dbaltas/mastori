@@ -7,6 +7,10 @@ on:
       - "internal/traffic/**"
       - "go.mod"
       - "go.sum"
+      - "Dockerfile"
+      - "deploy/kubernetes/overlays/aws/traffic/**"
+      - "deploy/kubernetes/base/traffic-config.yaml"
+      - "Makefile"
       - ".github/workflows/traffic-tests.yml"
 
 permissions:

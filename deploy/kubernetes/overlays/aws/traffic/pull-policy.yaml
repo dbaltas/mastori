@@ -1,0 +1,16 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: traffic
+  namespace: mastori
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: datasets
+          imagePullPolicy: Always
+        - name: datasets-validate
+          imagePullPolicy: Always
+      containers:
+        - name: traffic
+          imagePullPolicy: Always

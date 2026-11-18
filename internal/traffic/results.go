@@ -3,6 +3,7 @@ package traffic
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,13 +55,24 @@ func NewResultWriter(path string) (*ResultWriter, error) {
 	return &ResultWriter{f: f, enc: enc}, nil
 }
 
+// NewResultWriterTo writes records to an arbitrary writer, such as an
+// io.MultiWriter combining the results file with stdout.
+func NewResultWriterTo(w io.Writer) *ResultWriter {
+	return &ResultWriter{enc: json.NewEncoder(w)}
+}
+
 func (w *ResultWriter) Write(r Record) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.enc.Encode(r)
 }
 
-func (w *ResultWriter) Close() error { return w.f.Close() }
+func (w *ResultWriter) Close() error {
+	if w.f == nil {
+		return nil
+	}
+	return w.f.Close()
+}
 
 // SummaryPath returns the summary file path for a results path: the results
 // path with its extension replaced by .summary.json.

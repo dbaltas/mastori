@@ -38,88 +38,82 @@ func main() {
 	fs := flag.NewFlagSet("mastori-traffic", flag.ExitOnError)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 
-	url := fs.String("url", "http://localhost:8080", "API base URL")
-	model := fs.String("model", "", "model name passed to the API (empty = API default)")
-	workload := fs.String("workload", "mixed", "workload profile: short, long, or mixed")
-	shortPct := fs.Int("short-percentage", 80, "percentage of short prompts in the mixed workload")
-	shortDataset := fs.String("short-dataset", "mmlu-short", "dataset used for short prompts")
-	longDataset := fs.String("long-dataset", "sharegpt-long", "dataset used for long prompts")
-	cacheDir := fs.String("cache", "benchmark/workloads/cache", "dataset cache directory")
+	opts := registerTrafficFlags(fs)
 
-	rate := fs.Float64("rate", 10, "target request rate per second (open loop)")
-	arrival := fs.String("arrival", "constant", "arrival process: constant or poisson")
-	rampEnd := fs.Float64("ramp-end-rate", 0, "if > 0, ramp the rate from --rate to this value over the run")
-	stepsSpec := fs.String("steps", "", "step pattern as rate:duration pairs, e.g. \"10:60s,50:60s\" (overrides rate/arrival/ramp)")
-	concurrency := fs.Int("concurrency", 0, "closed-loop worker count (0 = open loop)")
-	maxInflight := fs.Int("max-inflight", 0, "cap on in-flight requests (open loop, default 4x rate)")
-	duration := fs.Duration("duration", 0, "measured run duration (default: sum of --steps durations, else 5m)")
-	warmup := fs.Duration("warmup", 0, "warmup duration, excluded from the summary")
-	drainGrace := fs.Duration("warmup-drain-grace", 0, "max wait for in-flight warmup requests to finish before measured traffic starts (default timeout+10s)")
-	timeout := fs.Duration("timeout", 65*time.Second, "per-request timeout")
-
-	seed := fs.Int64("seed", 42, "seed for dataset sampling and arrival jitter")
-	stream := fs.Bool("stream", true, "use the SSE streaming endpoint /generate/stream (false = blocking /generate)")
-	output := fs.String("output", "", "results JSONL path (default benchmark/results/<run-id>.jsonl)")
-
+	if err := applyEnv(fs, os.Getenv); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
 
-	rows, weights, err := resolveWorkload(*workload, *shortDataset, *longDataset, *shortPct, *cacheDir)
+	rows, weights, err := resolveWorkload(*opts.workload, *opts.shortDataset, *opts.longDataset, *opts.shortPct, *opts.cacheDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
 	var steps []traffic.StepSeg
-	if *stepsSpec != "" {
-		steps, err = traffic.ParseSteps(*stepsSpec)
+	if *opts.stepsSpec != "" {
+		steps, err = traffic.ParseSteps(*opts.stepsSpec)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	runDuration, err := resolveDuration(steps, *duration)
+	runDuration, err := resolveDuration(steps, *opts.duration)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
 	runID := time.Now().UTC().Format("20060102T150405Z") + fmt.Sprintf("-%d", time.Now().UnixNano()%1000)
-	outPath := *output
+	outPath := *opts.output
 	if outPath == "" {
 		outPath = "benchmark/results/" + runID + ".jsonl"
 	}
 
+	var manifestSHA string
+	if *opts.manifest != "" {
+		manifestSHA, err = manifestHash(*opts.manifest)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	cfg := &traffic.Config{
-		RunID:       runID,
-		URL:         *url,
-		Model:       *model,
-		Rows:        rows,
-		Weights:     weights,
-		Seed:        *seed,
-		Warmup:      *warmup,
-		DrainGrace:  *drainGrace,
-		Duration:    runDuration,
-		Concurrency: *concurrency,
-		Rate:        *rate,
-		Arrival:     *arrival,
-		RampEndRate: *rampEnd,
-		Steps:       steps,
-		MaxInflight: *maxInflight,
-		Stream:      *stream,
-		Timeout:     *timeout,
-		OutputPath:  outPath,
-		RedisAddr:   os.Getenv("REDIS_ADDR"),
+		RunID:          runID,
+		URL:            *opts.url,
+		Model:          *opts.model,
+		Rows:           rows,
+		Weights:        weights,
+		Seed:           *opts.seed,
+		Warmup:         *opts.warmup,
+		DrainGrace:     *opts.drainGrace,
+		Duration:       runDuration,
+		Concurrency:    *opts.concurrency,
+		Rate:           *opts.rate,
+		Arrival:        *opts.arrival,
+		RampEndRate:    *opts.rampEnd,
+		Steps:          steps,
+		MaxInflight:    *opts.maxInflight,
+		Stream:         *opts.stream,
+		Timeout:        *opts.timeout,
+		OutputPath:     outPath,
+		RecordsStdout:  *opts.recordsStdout,
+		ManifestSHA256: manifestSHA,
+		RedisAddr:      os.Getenv("REDIS_ADDR"),
 	}
 
 	ctx, stop := traffic.RunSignalContext(context.Background())
 	defer stop()
 
 	fmt.Printf("run %s: workload=%s rate=%.1f duration=%s warmup=%s seed=%d -> %s\n",
-		runID, *workload, *rate, runDuration, *warmup, *seed, outPath)
+		runID, *opts.workload, *opts.rate, runDuration, *opts.warmup, *opts.seed, outPath)
 	summary, err := traffic.Run(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
