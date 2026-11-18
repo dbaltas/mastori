@@ -36,6 +36,7 @@ type mockConfig struct {
 	tokenDelayJitter     float64
 	firstDelayJitter     float64
 	heartbeatMs          int
+	chunksTTLSec         int
 }
 
 func loadMockConfig() (*mockConfig, error) {
@@ -101,6 +102,13 @@ func loadMockConfig() (*mockConfig, error) {
 	}
 	if cfg.heartbeatMs == 0 {
 		return nil, fmt.Errorf("invalid WORKER_HEARTBEAT_MS: must be positive")
+	}
+	if v := os.Getenv("WORKER_CHUNKS_TTL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid WORKER_CHUNKS_TTL_SECONDS %q: must be a non-negative integer", v)
+		}
+		cfg.chunksTTLSec = n
 	}
 	return cfg, nil
 }
@@ -168,6 +176,7 @@ func main() {
 		ChunksPrefix:       cfg.chunksPrefix,
 		AbandonPrefix:      cfg.abandonPrefix,
 		HeartbeatInterval:  hb,
+		ChunksTTL:          time.Duration(cfg.chunksTTLSec) * time.Second,
 	})
 	if err := runner.Run(ctx); err != nil {
 		logger.Error("worker failed", "error", err)

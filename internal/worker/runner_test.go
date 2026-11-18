@@ -73,6 +73,15 @@ func fastGen(tokens int) *MockGenerator {
 	return &MockGenerator{MinTokens: tokens, MaxTokens: tokens, TokenDelay: time.Millisecond, FirstDelay: time.Millisecond}
 }
 
+func chunkTTL(t *testing.T, h *runnerHarness, jobID string) time.Duration {
+	t.Helper()
+	d, err := h.client.TTL(context.Background(), "jobs:chunks:"+jobID).Result()
+	if err != nil {
+		t.Fatalf("ttl: %v", err)
+	}
+	return d
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -240,6 +249,114 @@ func TestRunnerSpanJoinsJobTrace(t *testing.T) {
 	}
 	if _, ok := attributeKey(proc, "job.tokens_out"); !ok {
 		t.Error("worker.process span missing job.tokens_out attribute")
+	}
+}
+
+func TestRunnerSetsChunksTTLAfterDoneChunk(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.start("w1", fastGen(3))
+	h.dispatch("w1", queue.Job{ID: "job-ttl", Prompt: "hello world", CreatedAt: time.Now().UTC()})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := h.q.WaitResult(ctx, "job-ttl"); err != nil {
+		t.Fatalf("wait result: %v", err)
+	}
+
+	waitFor(t, "chunk stream TTL", func() bool { return chunkTTL(t, h, "job-ttl") > 0 })
+	ttl := chunkTTL(t, h, "job-ttl")
+	if ttl > 10*time.Minute {
+		t.Errorf("chunk stream TTL = %v, want <= default 10m", ttl)
+	}
+}
+
+func TestRunnerChunksTTLOnlyAfterDone(t *testing.T) {
+	h := newRunnerHarness(t)
+	slow := &MockGenerator{MinTokens: 10000, MaxTokens: 10000, TokenDelay: 5 * time.Millisecond, FirstDelay: time.Millisecond}
+	h.start("w1", slow)
+	h.dispatch("w1", queue.Job{ID: "job-slow", Prompt: "p", CreatedAt: time.Now().UTC()})
+
+	waitFor(t, "chunk stream created", func() bool { return h.mr.Exists("jobs:chunks:job-slow") })
+	if ttl := chunkTTL(t, h, "job-slow"); ttl != -1 {
+		t.Fatalf("chunk stream TTL before done = %v, want -1 (no expiry)", ttl)
+	}
+}
+
+func TestRunnerChunksTTLCustomValue(t *testing.T) {
+	h := newRunnerHarness(t)
+	r := NewRunner(h.client, h.reg, fastGen(1), slog.New(slog.DiscardHandler), RunnerConfig{
+		ID: "w1", ReadBlock: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, ChunksTTL: 5 * time.Minute,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	h.dispatch("w1", queue.Job{ID: "job-custom", Prompt: "p", CreatedAt: time.Now().UTC()})
+
+	waitFor(t, "chunk stream TTL", func() bool { return chunkTTL(t, h, "job-custom") > 0 })
+	ttl := chunkTTL(t, h, "job-custom")
+	if ttl > 5*time.Minute {
+		t.Errorf("chunk stream TTL = %v, want <= 5m", ttl)
+	}
+}
+
+func TestRunnerChunksTTLEmptyStreamAfterTTL(t *testing.T) {
+	h := newRunnerHarness(t)
+	mr := h.mr
+	mr.SetTime(time.Unix(0, 0))
+	r := NewRunner(h.client, h.reg, fastGen(1), slog.New(slog.DiscardHandler), RunnerConfig{
+		ID: "w1", ReadBlock: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, ChunksTTL: 10 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	h.dispatch("w1", queue.Job{ID: "job-expire", Prompt: "p", CreatedAt: time.Now().UTC()})
+	waitFor(t, "chunk stream TTL", func() bool { return chunkTTL(t, h, "job-expire") > 0 })
+
+	mr.FastForward(11 * time.Second)
+	if mr.Exists("jobs:chunks:job-expire") {
+		t.Error("chunk stream still exists after TTL elapsed")
+	}
+}
+
+func TestRunnerChunksTTLEntryIDAndChunks(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.start("w1", fastGen(2))
+	h.dispatch("w1", queue.Job{ID: "job-chunks", Prompt: "p", CreatedAt: time.Now().UTC()})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := h.q.WaitResult(ctx, "job-chunks"); err != nil {
+		t.Fatalf("wait result: %v", err)
+	}
+	n, _ := h.client.XLen(context.Background(), "jobs:chunks:job-chunks").Result()
+	if n == 0 {
+		t.Error("no chunks retained in finished stream")
+	}
+}
+
+func TestRunnerChunksTTLDisabledWithNegativeConfig(t *testing.T) {
+	h := newRunnerHarness(t)
+	r := NewRunner(h.client, h.reg, fastGen(1), slog.New(slog.DiscardHandler), RunnerConfig{
+		ID: "w1", ReadBlock: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, ChunksTTL: -time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	h.dispatch("w1", queue.Job{ID: "job-nottl", Prompt: "p", CreatedAt: time.Now().UTC()})
+
+	ctx, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	if _, err := h.q.WaitResult(ctx, "job-nottl"); err != nil {
+		t.Fatalf("wait result: %v", err)
+	}
+	if ttl := chunkTTL(t, h, "job-nottl"); ttl != -1 {
+		t.Errorf("chunk stream TTL with disabled config = %v, want -1 (no expiry)", ttl)
 	}
 }
 
