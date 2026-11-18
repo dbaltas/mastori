@@ -34,6 +34,7 @@ type inferConfig struct {
 	maxTokens            int
 	httpTimeout          time.Duration
 	heartbeatMs          int
+	chunksTTLSec         int
 }
 
 func loadInferConfig() (*inferConfig, error) {
@@ -77,6 +78,13 @@ func loadInferConfig() (*inferConfig, error) {
 			return nil, fmt.Errorf("invalid WORKER_HEARTBEAT_MS %q: must be a positive integer", v)
 		}
 		cfg.heartbeatMs = n
+	}
+	if v := os.Getenv("WORKER_CHUNKS_TTL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid WORKER_CHUNKS_TTL_SECONDS %q: must be a non-negative integer", v)
+		}
+		cfg.chunksTTLSec = n
 	}
 	return cfg, nil
 }
@@ -143,6 +151,7 @@ func main() {
 		ChunksPrefix:       cfg.chunksPrefix,
 		AbandonPrefix:      cfg.abandonPrefix,
 		HeartbeatInterval:  hb,
+		ChunksTTL:          time.Duration(cfg.chunksTTLSec) * time.Second,
 	})
 	if err := runner.Run(ctx); err != nil {
 		logger.Error("worker failed", "error", err)

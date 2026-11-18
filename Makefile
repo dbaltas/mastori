@@ -1,6 +1,6 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify
 
 build:
 	go build ./...
@@ -15,6 +15,11 @@ test-integration:
 	@sleep 1
 	INTEGRATION_REDIS_ADDR=localhost:7099 go test -tags integration -race -count=1 ./test/integration/...; \
 	status=$$?; docker rm -f mastori-it-redis >/dev/null; exit $$status
+
+# FLUSHDB against the Redis pod in the kind cluster. Only run between
+# experiments: it kills in-flight jobs and consumer groups.
+redis-flush:
+	kubectl -n mastori exec deploy/redis -- redis-cli FLUSHDB
 
 vet:
 	go vet ./...

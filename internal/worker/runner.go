@@ -30,6 +30,9 @@ type RunnerConfig struct {
 	AbandonPrefix      string
 	HeartbeatInterval  time.Duration
 	ReadBlock          time.Duration
+	// ChunksTTL expires a job's chunk stream after the done chunk is
+	// published; zero uses the default, negative disables the TTL.
+	ChunksTTL time.Duration
 }
 
 func (c RunnerConfig) withDefaults() RunnerConfig {
@@ -47,6 +50,9 @@ func (c RunnerConfig) withDefaults() RunnerConfig {
 	}
 	if c.ReadBlock <= 0 {
 		c.ReadBlock = time.Second
+	}
+	if c.ChunksTTL == 0 {
+		c.ChunksTTL = 10 * time.Minute
 	}
 	return c
 }
@@ -221,12 +227,18 @@ func (r *Runner) process(ctx context.Context, job queue.Job, entryID string) {
 			values["queue_wait_ms"] = strconv.FormatInt(c.QueueWaitMs, 10)
 			values["duration_ms"] = strconv.FormatInt(c.DurationMs, 10)
 		}
-		return r.client.XAdd(ctx, &redis.XAddArgs{
+		if err := r.client.XAdd(ctx, &redis.XAddArgs{
 			Stream: r.cfg.ChunksPrefix + job.ID,
 			Values: values,
 			MaxLen: 10000,
 			Approx: true,
-		}).Err()
+		}).Err(); err != nil {
+			return err
+		}
+		if c.Done && r.cfg.ChunksTTL > 0 {
+			r.expireChunks(job.ID)
+		}
+		return nil
 	})
 	if err != nil && ctx.Err() == nil {
 		span.RecordError(err)
@@ -244,5 +256,16 @@ func (r *Runner) finish(entryID string) {
 	defer cancel()
 	if err := r.client.XDel(ctx, r.Stream(), entryID).Err(); err != nil {
 		r.logger.Warn("release job entry failed", "entry_id", entryID, "error", err)
+	}
+}
+
+// expireChunks sets the TTL on a finished job's chunk stream so Redis cleans
+// it up. It uses a fresh context so the TTL is not skipped by a canceled job
+// context right after the final chunk was published.
+func (r *Runner) expireChunks(jobID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := r.client.Expire(ctx, r.cfg.ChunksPrefix+jobID, r.cfg.ChunksTTL).Err(); err != nil {
+		r.logger.Warn("expire chunk stream failed", "job_id", jobID, "error", err)
 	}
 }
