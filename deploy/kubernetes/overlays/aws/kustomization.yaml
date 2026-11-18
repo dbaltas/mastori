@@ -1,0 +1,22 @@
+# EKS (Milestone 1, CPU/mock-worker). Adapts the cloud-neutral base to the
+# EKS cluster; see infra/aws/README.md and docs/cloud-k8s-prep.md.
+#
+# Only two deltas from base:
+#  - images: kind loads mastori/api:latest into the node's local store, but
+#    EKS nodes pull from a registry. Rewrite to the published GHCR image.
+#    TODO(digest pinning): pin by digest once CI publishes; `latest` is a
+#    knowingly mutable tag kept until the digest-pinning item lands.
+#  - imagePullPolicy: Always (see pull-policy.yaml).
+#
+# Nothing else: no NodePort (access is port-forward only), no tolerations on
+# the CPU pool, no IRSA (nothing in Milestone 1 calls AWS APIs).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: mastori/api
+    newName: ghcr.io/dbaltas/mastori
+    newTag: latest
+patches:
+  - path: pull-policy.yaml

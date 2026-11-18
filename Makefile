@@ -2,7 +2,7 @@ CLUSTER_NAME := mastori
 
 AWS_DIR := infra/aws
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-status
 
 build:
 	go build ./...
@@ -79,6 +79,8 @@ cluster-deploy-inference: docker-build
 kustomize-verify:
 	kubectl kustomize deploy/kubernetes/overlays/local >/dev/null
 	kubectl kustomize deploy/kubernetes/overlays/inference >/dev/null
+	kubectl kustomize deploy/kubernetes/overlays/aws >/dev/null
+	kubectl kustomize deploy/kubernetes/overlays/aws/traffic >/dev/null
 
 # AWS EKS (Milestone 1, eu-north-1). Applies run from infra/aws with local state;
 # see infra/aws/README.md for access steps and cost guardrails.
@@ -97,6 +99,19 @@ aws-destroy:
 aws-kubeconfig:
 	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region eu-north-1
 
+# Applies the aws overlay (base workloads, GHCR images) to the current
+# kubectl context. Requires the node label fix in infra/aws/eks.tf (already
+# in the module): every workload node-selects mastori/pool: cpu.
+aws-deploy:
+	kubectl apply -k deploy/kubernetes/overlays/aws
+
+# Rollout + pod state for the Milestone 1 acceptance check (all pods healthy
+# before the first traffic run).
+aws-status:
+	kubectl -n mastori rollout status deployment/api --timeout=5m
+	kubectl -n mastori rollout status deployment/scheduler --timeout=5m
+	kubectl -n mastori rollout status deployment/mockworker --timeout=5m
+	kubectl -n mastori get pods -o wide
 # Traffic run parameters for cluster-run-traffic; override on the command line,
 # e.g. `make cluster-run-traffic TRAFFIC_WORKLOAD=short TRAFFIC_RATE=5 TRAFFIC_DURATION=5s`
 # or `make cluster-run-traffic TRAFFIC_STEPS="10:60s,50:60s"`. Empty variables are
@@ -117,13 +132,12 @@ TRAFFIC_WAIT_TIMEOUT ?= 30m
 # enough to change what a run replays.
 DATASETS_MANIFEST ?= benchmark/workloads/datasets.yaml
 
-# Runs the traffic generator inside the kind cluster as a Job: rebuilds the
-# image, replaces the traffic-config ConfigMap, applies the Job template, and
-# waits for completion. Records are streamed to stdout by the container
-# (TRAFFIC_RECORDS_STDOUT) and recovered from the pod logs with
-# cluster-traffic-results — the distroless image has no shell or tar.
-cluster-run-traffic: docker-build
-	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
+# (Re)creates the datasets-manifest and traffic-config ConfigMaps from the
+# benchmark submodule and the TRAFFIC_* variables above. Shared by
+# cluster-run-traffic (kind) and aws-run-traffic (EKS).
+traffic-configmaps:
+	@test -f "$(DATASETS_MANIFEST)" || { \
+	  echo "dataset manifest missing at $(DATASETS_MANIFEST): run git submodule update --init --recursive" >&2; exit 1; }
 	@envfile=$$(mktemp) && trap 'rm -f "$$envfile"' EXIT && \
 	{ echo 'TRAFFIC_URL=http://api.mastori.svc.cluster.local:80'; \
 	  echo 'REDIS_ADDR=redis.mastori.svc.cluster.local:6379'; \
@@ -143,21 +157,46 @@ cluster-run-traffic: docker-build
 	  'TRAFFIC_SEED=$(TRAFFIC_SEED)'; \
 	do echo "$$kv" >> $$envfile; done && \
 	kubectl -n mastori apply -f deploy/kubernetes/base/traffic-config.yaml && \
-	if test ! -f "$(DATASETS_MANIFEST)"; then \
-	  echo "dataset manifest missing at $(DATASETS_MANIFEST): run git submodule update --init --recursive" >&2; exit 1; fi && \
 	kubectl -n mastori create configmap datasets-manifest --from-file=datasets.yaml=$(DATASETS_MANIFEST) --dry-run=client -o yaml | kubectl apply -f - -n mastori && \
-	kubectl -n mastori create configmap traffic-config --from-env-file=$$envfile --dry-run=client -o yaml | kubectl apply -f - -n mastori && \
-	kubectl -n mastori delete job traffic --ignore-not-found && \
-	kubectl -n mastori apply -f deploy/kubernetes/traffic-job.yaml && \
-	echo "waiting for the traffic job (timeout $(TRAFFIC_WAIT_TIMEOUT))..." && \
+	kubectl -n mastori create configmap traffic-config --from-env-file=$$envfile --dry-run=client -o yaml | kubectl apply -f - -n mastori
+
+# Waits for the traffic Job to complete, prints the summary, and points at
+# the results-recovery target. Shared by cluster-run-traffic and
+# aws-run-traffic; cluster-traffic-results works on either cluster because it
+# only talks to the current kubectl context.
+traffic-wait:
+	@echo "waiting for the traffic job (timeout $(TRAFFIC_WAIT_TIMEOUT))..." && \
 	if ! kubectl -n mastori wait --for=condition=complete --timeout=$(TRAFFIC_WAIT_TIMEOUT) job/traffic; then \
 	  echo "traffic job did not complete:" && \
 	  kubectl -n mastori get pods -l app=traffic && \
 	  kubectl -n mastori logs job/traffic --tail=50; exit 1; fi && \
-	log=$$(mktemp) && trap 'rm -f "$$envfile" "$$log"' EXIT && \
+	log=$$(mktemp) && trap 'rm -f "$$log"' EXIT && \
 	kubectl -n mastori logs job/traffic > $$log && \
 	grep '^run ' $$log && awk '/^\{$$/,/^\}$$/' $$log && \
 	echo "(records saved to the pod logs; run make cluster-traffic-results to write the JSONL files)"
+
+# Runs the traffic generator inside the kind cluster as a Job: rebuilds the
+# image, replaces the traffic-config ConfigMap, applies the Job template, and
+# waits for completion. Records are streamed to stdout by the container
+# (TRAFFIC_RECORDS_STDOUT) and recovered from the pod logs with
+# cluster-traffic-results — the distroless image has no shell or tar.
+cluster-run-traffic: docker-build
+	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
+	$(MAKE) traffic-configmaps
+	kubectl -n mastori delete job traffic --ignore-not-found
+	kubectl -n mastori apply -f deploy/kubernetes/overlays/aws/traffic/traffic-job.yaml
+	$(MAKE) traffic-wait
+
+# Runs the traffic generator inside the EKS cluster: the Job is applied
+# through the aws/traffic overlay, which rewrites the image to the GHCR
+# digest the nodes can pull (no kind load step). Results recovery is the
+# same cluster-traffic-results target — it only uses the current kubectl
+# context.
+aws-run-traffic:
+	$(MAKE) traffic-configmaps
+	kubectl -n mastori delete job traffic --ignore-not-found
+	kubectl -n mastori apply -k deploy/kubernetes/overlays/aws/traffic
+	$(MAKE) traffic-wait
 
 # Recovers the records and summary of the last traffic job from the pod logs
 # into benchmark/results/cluster/.

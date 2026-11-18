@@ -1,0 +1,47 @@
+# Fast manifests/infra CI: renders every kustomize overlay (fails on
+# malformed manifests) and validates the Terraform module. Part of the
+# Milestone 0 "Fast CI" tier (todos.md); no cluster or cloud spend needed.
+name: Manifests and Terraform
+
+on:
+  push:
+    paths:
+      - "deploy/kubernetes/**"
+      - "infra/aws/**"
+      - "Makefile"
+      - ".github/workflows/manifests-tests.yml"
+    branches: [main]
+  pull_request:
+    paths:
+      - "deploy/kubernetes/**"
+      - "infra/aws/**"
+      - "Makefile"
+      - ".github/workflows/manifests-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  kustomize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render every overlay
+        run: make kustomize-verify
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/aws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Init (no backend)
+        run: terraform init -backend=false
+      - name: Format
+        run: terraform fmt -check
+      - name: Validate
+        run: terraform validate

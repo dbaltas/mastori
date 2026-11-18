@@ -39,13 +39,41 @@ terraform plan
 terraform apply
 ```
 
+## Deploy and run (from the repo root)
+
+After `make aws-kubeconfig` (current kubectl context = the EKS cluster):
+
+```
+make aws-deploy          # apply deploy/kubernetes/overlays/aws (GHCR images)
+make aws-status          # rollout status + pods; all healthy before traffic
+make aws-run-traffic     # datasets initContainer + traffic Job vs API ClusterIP
+make cluster-traffic-results   # recover JSONL + summary from the Job logs
+```
+
+`aws-run-traffic` takes the same `TRAFFIC_*` overrides as
+`cluster-run-traffic` (e.g. `make aws-run-traffic TRAFFIC_WORKLOAD=short
+TRAFFIC_RATE=5 TRAFFIC_DURATION=2m`). The traffic Job pins no image tag: the
+`aws` overlay rewrites `mastori/api:latest` to `ghcr.io/dbaltas/mastori:latest`
+with `imagePullPolicy: Always`; digest pinning is a Milestone 1 item.
+
+Observability and API access stay private (port-forward):
+
+```
+kubectl -n mastori port-forward svc/api 8080:8080
+kubectl -n mastori port-forward svc/grafana 7030:3000
+```
+
+The node group is labeled `mastori/pool=cpu` in Terraform (`eks.tf`) — every
+workload node-selects that label; without it nothing schedules.
+
 Destroy before walking away — a forgotten node bills continuously:
 
 ```
 terraform destroy
 ```
 
-Export results first: JSONL results, run manifest, Prometheus snapshot, and
+Export results first: JSONL results (`make cluster-traffic-results` writes
+them to `benchmark/results/cluster/`), run manifest, Prometheus snapshot, and
 traces go to the git results repo (decision 7); the export make targets land
 with the overlay glue work.
 

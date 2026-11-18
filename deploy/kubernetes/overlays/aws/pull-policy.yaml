@@ -1,0 +1,40 @@
+# On EKS images come from GHCR, not the node's local store (kind load).
+# The base pins imagePullPolicy: IfNotPresent, which is wrong for mutable
+# registry tags: a node that already pulled the tag keeps its stale copy
+# across rollouts. Digest pinning (todos.md Milestone 1) makes this patch
+# unnecessary; until then, always pull.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: mastori
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          imagePullPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: mastori
+spec:
+  template:
+    spec:
+      containers:
+        - name: scheduler
+          imagePullPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mockworker
+  namespace: mastori
+spec:
+  template:
+    spec:
+      containers:
+        - name: mockworker
+          imagePullPolicy: Always

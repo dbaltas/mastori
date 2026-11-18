@@ -101,26 +101,42 @@ error/edge cases.
 
 - [ ] **Verify claims before committing spend:** EKS free-tier terms, GPU
   instance availability and pricing in eu-north-1, with dated calculator links.
-- [ ] **Terraform (one module, no provider abstraction):** VPC (2 AZ subnets,
+- [x] **Terraform (one module, no provider abstraction):** VPC (2 AZ subnets,
   workloads in one AZ), NAT + EIP, EKS control plane, one **on-demand**
   Graviton managed node group (private subnet, no public IPs), security
   groups, IAM roles (cluster, nodes, IRSA). No load balancer — private
   access via port-forward/tunnel, access steps documented in the run checklist.
+  Done 2026-11-18 in `2606353`; node group carries the `mastori/pool=cpu`
+  label every workload selects (`eks.tf`, 2026-11-18). `terraform plan/apply`
+  still to be exercised against a real account.
 - [ ] **ECR + CI:** multi-arch image builds (`buildx`), push to ECR,
   deployments pin images by digest; provenance recorded in the run manifest.
-- [ ] **`aws` overlay:** IRSA annotations, node sizes, region. Nothing
-  app-specific in the overlay.
-- [ ] **In-cluster traffic Job:** `cmd/traffic` as a Job on the CPU pool
-  calling the API ClusterIP; limits **1 CPU / 500 Mi**.
-- [ ] **Datasets in-cluster:** fetch dataset prompts inside the cluster
+  Partial 2026-11-18: multi-arch buildx images publish to **GHCR**
+  (`3ab82c7`) — the ECR move (to bound NAT cost, with VPC endpoints) and
+  digest pinning are still open; the `aws` overlay meanwhile rewrites to
+  `ghcr.io/dbaltas/mastori:latest` with `imagePullPolicy: Always`.
+- [x] **`aws` overlay:** IRSA annotations, node sizes, region. Nothing
+  app-specific in the overlay. Done 2026-11-18:
+  `deploy/kubernetes/overlays/aws` — image rewrite + `Always` pull policy
+  only; IRSA deferred (nothing in Milestone 1 calls AWS APIs), node sizes
+  stay in Terraform tfvars. The traffic Job lives in
+  `overlays/aws/traffic/traffic-job.yaml` and is applied by
+  `make aws-run-traffic`; kind still applies the same file raw.
+- [x] **In-cluster traffic Job:** `cmd/traffic` as a Job on the CPU pool
+  calling the API ClusterIP; limits 1 CPU / 500 Mi. Done 2026-11-18 in
+  `bd4aa68` (TRAFFIC_* env config, stdout records, summary provenance SHA).
+- [x] **Datasets in-cluster:** fetch dataset prompts inside the cluster
   (fetcher Job on the CPU pool or preloaded), so no data lands on nodes and
-  the traffic Job has prompts to replay.
+  the traffic Job has prompts to replay. Done 2026-11-18: datasets
+  fetch + validate initContainers inside the traffic Job (`bd4aa68`).
 - [ ] **Cost guardrails:** AWS Budgets alert, documented `make destroy`
   teardown target.
 - [ ] **Acceptance:** EKS up, one CPU node, API + Redis + scheduler + mock
   workers healthy, one benchmark run via the in-cluster traffic Job, results
   + manifest + metrics snapshot pushed to the results repo, cluster destroyed,
-  results intact.
+  results intact. 2026-11-18: `make aws-deploy` / `aws-status` /
+  `aws-run-traffic` targets and the fast manifests+terraform CI workflow
+  landed; everything else above still needs a real EKS run.
 
 ## Milestone 2 — GPU / vLLM on EKS (gated: quota + capacity confirmed)
 
