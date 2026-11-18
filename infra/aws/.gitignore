@@ -1,0 +1,9 @@
+# Local state. Move to an S3 backend with locking before shared use.
+# .terraform.lock.hcl is committed so provider versions are pinned.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+tfplan
+tfplan.json
+terraform.tfvars

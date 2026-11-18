@@ -1,6 +1,8 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify
+AWS_DIR := infra/aws
+
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig
 
 build:
 	go build ./...
@@ -77,3 +79,20 @@ cluster-deploy-inference: docker-build
 kustomize-verify:
 	kubectl kustomize deploy/kubernetes/overlays/local >/dev/null
 	kubectl kustomize deploy/kubernetes/overlays/inference >/dev/null
+
+# AWS EKS (Milestone 1, eu-north-1). Applies run from infra/aws with local state;
+# see infra/aws/README.md for access steps and cost guardrails.
+aws-init:
+	cd $(AWS_DIR) && terraform init
+
+aws-plan:
+	cd $(AWS_DIR) && terraform plan
+
+aws-apply:
+	cd $(AWS_DIR) && terraform apply
+
+aws-destroy:
+	cd $(AWS_DIR) && terraform destroy
+
+aws-kubeconfig:
+	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region eu-north-1

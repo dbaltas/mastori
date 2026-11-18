@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and fill in.
+# With no admin_cidrs the cluster has no public endpoint: access requires a
+# tunnel from inside the VPC. Add your public IP as /32 to use the public
+# endpoint (still no in-cluster load balancer; benchmark traffic stays private).
+
+# admin_cidrs = ["203.0.113.5/32"]
+
+# node_instance_type = "m6g.xlarge"
+# node_count         = 1
