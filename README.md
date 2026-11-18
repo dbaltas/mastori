@@ -4,7 +4,7 @@ A benchmarking platform for LLM inference on GPU infrastructure.
 
 Run the same LLM workload on identical GPU resources across different providers — AWS, Azure, Nebius, Verda, or any other — and compare throughput, latency, utilization, and cost.
 
-> **Status: early implementation.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployed on a local kind cluster. An optional inference layer adds real local generation: a vLLM-compatible adapter (`cmd/adapter`) backed by host Ollama plus a real inference worker (`cmd/vllmworker`) that speaks the same API surface a cloud vLLM server will. Scheduling policies and cloud providers are still ahead. See the [design document](gpu-inference-benchmarking-platform.md) for the full plan.
+> **Status: early implementation.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployed on a local kind cluster. An optional inference layer adds real local generation: a vLLM-compatible adapter (`cmd/adapter`) backed by host Ollama plus a real inference worker (`cmd/vllmworker`) that speaks the same API surface a cloud vLLM server will. Scheduling policies and cloud providers are still ahead. See the [design document](gpu-inference-benchmarking-platform.md) for the full plan. Benchmark results are published to [the GitHub Pages site](https://dbaltas.github.io/mastori/).
 
 ![Grafana dashboard](docs/grafana-overview.png)
 
@@ -31,8 +31,9 @@ Run the same LLM workload on identical GPU resources across different providers 
 2. ~~Kubernetes with Prometheus and Grafana~~
 3. ~~Traffic generator and workload profiles~~
 4. ~~Real local inference workers (Ollama behind a vLLM-compatible adapter)~~
-5. Cloud deployment (CPU + GPU pools) with IaC
-6. Cross-provider experiments
+5. Cloud deployment with mock workers (CPU pool, IaC)
+6. Cloud deployment with GPU inference (GPU pool, vLLM)
+7. Cross-provider experiments
 
 ## Running locally
 
@@ -97,12 +98,16 @@ The API emits OpenTelemetry traces to the OTel collector (`deploy/otel/collector
 
 ### Datasets
 
-Benchmark prompts live in `benchmark/workloads/datasets.yaml`. Fetch and validate them with:
+Benchmark prompts live in `benchmark/workloads/datasets.yaml`. The `benchmark/` directory is a git submodule of the [Hugging Face dataset repo](https://huggingface.co/datasets/dbaltas/inference-api-benchmark-mastori), which holds the dataset definitions, experiment configs, and results. Clone with submodules (or run `git submodule update --init --recursive`) before fetching:
 
 ```sh
 go run ./cmd/datasets fetch
 go run ./cmd/datasets validate
 ```
+
+### Results site
+
+Published experiment results and stories are rendered by `cmd/sitegen` and deployed to GitHub Pages on every push to `main` (see `.github/workflows/pages.yml`): **https://dbaltas.github.io/mastori/**
 
 ### Traffic generation
 
