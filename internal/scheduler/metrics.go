@@ -9,6 +9,7 @@ type Metrics struct {
 	Dispatched        *prometheus.CounterVec // by worker
 	DispatchErrors    *prometheus.CounterVec // by reason: no_worker, redis, nogroup
 	JobsDropped       *prometheus.CounterVec // by reason: expired, malformed
+	Reclaims          prometheus.Counter     // dead worker streams reclaimed
 	SchedulingSeconds prometheus.Histogram   // read from queue -> dispatched
 	QueueWaitSeconds  prometheus.Histogram   // job created_at -> dispatched
 	QueueDepth        prometheus.Gauge       // jobs waiting for a worker
@@ -33,6 +34,10 @@ func NewMetrics() *Metrics {
 			Namespace: "mastori", Subsystem: "scheduler", Name: "jobs_dropped_total",
 			Help: "Jobs removed from the queue without being dispatched, by reason.",
 		}, []string{"reason"}),
+		Reclaims: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "mastori", Subsystem: "scheduler", Name: "reclaims_total",
+			Help: "Dead worker streams reclaimed: stranded jobs re-dispatched or dropped.",
+		}),
 		SchedulingSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: "mastori", Subsystem: "scheduler", Name: "scheduling_seconds",
 			Help:    "Time from the scheduler reading a job to dispatching it to a worker.",
@@ -57,7 +62,7 @@ func NewMetrics() *Metrics {
 		}, []string{"worker"}),
 	}
 	m.Registry.MustRegister(
-		m.Dispatched, m.DispatchErrors, m.JobsDropped,
+		m.Dispatched, m.DispatchErrors, m.JobsDropped, m.Reclaims,
 		m.SchedulingSeconds, m.QueueWaitSeconds,
 		m.QueueDepth, m.WorkersHealthy, m.WorkerQueueDepth,
 	)

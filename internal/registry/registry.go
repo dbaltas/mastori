@@ -76,6 +76,12 @@ func (r *Registry) Deregister(ctx context.Context, id string) error {
 	return r.client.Del(ctx, r.prefix+id).Err()
 }
 
+// Alive reports whether the worker's heartbeat key currently exists.
+func (r *Registry) Alive(ctx context.Context, id string) (bool, error) {
+	n, err := r.client.Exists(ctx, r.prefix+id).Result()
+	return n > 0, err
+}
+
 // List returns all live workers sorted by ID, so policies see a stable order.
 func (r *Registry) List(ctx context.Context) ([]Worker, error) {
 	var (

@@ -112,6 +112,7 @@ func main() {
 		Stream:      *stream,
 		Timeout:     *timeout,
 		OutputPath:  outPath,
+		RedisAddr:   os.Getenv("REDIS_ADDR"),
 	}
 
 	ctx, stop := traffic.RunSignalContext(context.Background())

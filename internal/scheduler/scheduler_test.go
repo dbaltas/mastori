@@ -57,6 +57,7 @@ func (h *harness) start(policy Policy, cfg Config) *Scheduler {
 	cfg.NoWorkerBackoff = 10 * time.Millisecond
 	cfg.WorkerRefresh = time.Millisecond
 	cfg.StatsInterval = 10 * time.Millisecond
+	cfg.ReclaimInterval = 10 * time.Millisecond
 	s := New(h.client, h.reg, policy, h.m, slog.New(slog.DiscardHandler), cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -360,5 +361,132 @@ func TestResumesPendingEntriesNotLost(t *testing.T) {
 			t.Errorf("job %s dispatched twice", id)
 		}
 		seen[id] = true
+	}
+}
+
+func TestReclaimsStrandedJobsFromDeadWorker(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	h.enqueue("j1", "m")
+	h.enqueue("j2", "m")
+
+	h.start(&RoundRobin{}, Config{})
+	eventually(t, "jobs dispatched to w1", func() bool { return h.streamLen("jobs:worker:w1") == 2 })
+
+	// w1 crashes: heartbeat key gone, but its stream keeps the unfinished
+	// entries. w2 comes up and must inherit the stranded work.
+	if err := h.client.Del(context.Background(), "workers:w1").Err(); err != nil {
+		t.Fatal(err)
+	}
+	h.worker("w2")
+
+	eventually(t, "stranded jobs re-dispatched to w2", func() bool { return h.streamLen("jobs:worker:w2") == 2 })
+	if got := h.jobsOn("w2"); got[0] != "j1" || got[1] != "j2" {
+		t.Errorf("re-dispatched = %v, want [j1 j2]", got)
+	}
+	eventually(t, "dead worker stream deleted", func() bool {
+		n, _ := h.client.Exists(context.Background(), "jobs:worker:w1").Result()
+		return n == 0
+	})
+
+	if got := testutil.ToFloat64(h.m.Reclaims); got != 1 {
+		t.Errorf("reclaims_total = %v, want 1", got)
+	}
+	val, err := h.client.Get(context.Background(), "run:interrupted").Result()
+	if err != nil {
+		t.Fatalf("interruption flag not set: %v", err)
+	}
+	if val != "1" {
+		t.Errorf("interruption flag value = %q, want 1", val)
+	}
+	if ttl := h.mr.TTL("run:interrupted"); ttl <= 0 {
+		t.Errorf("interruption flag TTL = %v, want positive", ttl)
+	}
+}
+
+func TestReclaimNeverTouchesLiveWorkerStream(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	// A live worker's stream holds queued/running work: it must never be
+	// reclaimed, even though entries exist.
+	h.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "jobs:worker:w1",
+		Values: queue.JobValues(queue.Job{ID: "j1", Prompt: "p"}),
+	})
+
+	h.start(&RoundRobin{}, Config{})
+	time.Sleep(100 * time.Millisecond)
+
+	if got := h.streamLen("jobs:worker:w1"); got != 1 {
+		t.Errorf("live worker stream length = %d, want 1 (untouched)", got)
+	}
+	if got := testutil.ToFloat64(h.m.Reclaims); got != 0 {
+		t.Errorf("reclaims_total = %v, want 0", got)
+	}
+	if _, err := h.client.Get(context.Background(), "run:interrupted").Result(); err == nil {
+		t.Error("interruption flag must not be set without a reclaim")
+	}
+}
+
+func TestReclaimRetainsJobsWhenNoLiveWorker(t *testing.T) {
+	h := newHarness(t)
+	for _, id := range []string{"j1", "j2"} {
+		h.client.XAdd(context.Background(), &redis.XAddArgs{
+			Stream: "jobs:worker:dead",
+			Values: queue.JobValues(queue.Job{ID: id, Model: "m", Prompt: "p " + id}),
+		})
+	}
+
+	h.start(&RoundRobin{}, Config{})
+	time.Sleep(100 * time.Millisecond)
+
+	// No live worker can take the jobs: keep them stranded for the next
+	// pass instead of dropping them.
+	if got := h.streamLen("jobs:worker:dead"); got != 2 {
+		t.Fatalf("stranded jobs = %d, want 2 retained", got)
+	}
+	if got := testutil.ToFloat64(h.m.Reclaims); got != 0 {
+		t.Errorf("reclaims_total = %v, want 0", got)
+	}
+
+	h.worker("w1")
+	eventually(t, "stranded jobs re-dispatched once a worker appears", func() bool {
+		return h.streamLen("jobs:worker:w1") == 2
+	})
+	n, _ := h.client.Exists(context.Background(), "jobs:worker:dead").Result()
+	if n != 0 {
+		t.Error("dead worker stream not deleted after reclaim")
+	}
+	if got := testutil.ToFloat64(h.m.Reclaims); got != 1 {
+		t.Errorf("reclaims_total = %v, want 1", got)
+	}
+}
+
+func TestReclaimDropsMalformedEntries(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	h.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "jobs:worker:dead", Values: map[string]any{"junk": "x"},
+	})
+	h.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "jobs:worker:dead",
+		Values: queue.JobValues(queue.Job{ID: "j1", Model: "m", Prompt: "p"}),
+	})
+
+	h.start(&RoundRobin{}, Config{})
+
+	eventually(t, "valid entry re-dispatched", func() bool { return h.streamLen("jobs:worker:w1") == 1 })
+	if got := h.jobsOn("w1"); len(got) != 1 || got[0] != "j1" {
+		t.Errorf("dispatched = %v, want [j1]", got)
+	}
+	if got := testutil.ToFloat64(h.m.JobsDropped.WithLabelValues("malformed")); got != 1 {
+		t.Errorf("malformed drops = %v, want 1", got)
+	}
+	eventually(t, "dead stream deleted after reclaim", func() bool {
+		n, _ := h.client.Exists(context.Background(), "jobs:worker:dead").Result()
+		return n == 0
+	})
+	if got := testutil.ToFloat64(h.m.Reclaims); got != 1 {
+		t.Errorf("reclaims_total = %v, want 1", got)
 	}
 }
