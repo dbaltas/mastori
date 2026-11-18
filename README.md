@@ -43,20 +43,20 @@ All host ports are in the 7000–7999 range.
 
 ```sh
 make cluster-up        # kind create cluster (extraPortMappings: API 7080, Grafana 7081)
-make cluster-deploy    # build + load image, apply deploy/kubernetes/
+make cluster-deploy    # build + load image, apply the kustomize local overlay (deploy/kubernetes/overlays/local)
 ```
 
-The cluster runs API (2 replicas), Redis, the scheduler, mock workers, Prometheus, and Grafana in the `mastori` namespace, plus the OTel collector and Grafana Tempo in `observability`. Dashboards and the Tempo datasource are provisioned automatically; open http://localhost:7081 (anonymous admin login).
+The cluster runs API (2 replicas), Redis, the scheduler, mock workers, Prometheus, and Grafana in the `mastori` namespace, plus the OTel collector and Grafana Tempo in `observability`. Workloads are placed by `mastori/pool` node labels: everything non-GPU targets the `cpu` pool, and the two `gpu` workers carry the `mastori/gpu=true:NoSchedule` taint that only the inference overlay workloads tolerate. Dashboards and the Tempo datasource are provisioned automatically; open http://localhost:7081 (anonymous admin login).
 
 ### Real local inference (Ollama)
 
 Run Ollama on the host first (`ollama pull qwen2.5:0.5b`), then deploy the inference layer into the cluster:
 
 ```sh
-make cluster-deploy-inference   # apply deploy/inference/ (adapter + vllmworker)
+make cluster-deploy-inference   # apply the inference overlay (deploy/kubernetes/overlays/inference: adapter + vllmworker)
 ```
 
-The adapter reaches host Ollama via `host.docker.internal` (see `deploy/inference/adapter.yaml`) so generation runs on the host's Metal GPU; scheduling, queueing, and metrics all stay in-cluster. The adapter serves `POST /v1/completions`, `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, and a `/metrics` endpoint with synthesized `vllm:*` Prometheus metrics (TTFT, TPOT, e2e latency, token counters), so anything written against a vLLM OpenAI server works unchanged. Set `INFERENCE_MODEL=<model>` to pick the model (default `qwen2.5:0.5b`). Mock and inference workers can run side by side; the scheduler routes jobs to both like any other registered worker.
+The adapter reaches host Ollama via `host.docker.internal` (see `deploy/kubernetes/overlays/inference/adapter.yaml`) so generation runs on the host's Metal GPU; scheduling, queueing, and metrics all stay in-cluster. The adapter serves `POST /v1/completions`, `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, and a `/metrics` endpoint with synthesized `vllm:*` Prometheus metrics (TTFT, TPOT, e2e latency, token counters), so anything written against a vLLM OpenAI server works unchanged. Set `INFERENCE_MODEL=<model>` to pick the model (default `qwen2.5:0.5b`). Mock and inference workers can run side by side; the scheduler routes jobs to both like any other registered worker.
 
 Port-forward the adapter to try it directly:
 
@@ -94,7 +94,7 @@ The API exposes Prometheus metrics on `/metrics`: request rate and latency by ro
 
 ### Traces
 
-The API emits OpenTelemetry traces to the OTel collector (`deploy/otel/collector-config.yaml`), which forwards them to Grafana Tempo (`deploy/tempo/tempo.yaml`, local storage). In the kind cluster both run in the `observability` namespace (`deploy/kubernetes/observability.yaml`); the cluster Grafana has a provisioned Tempo datasource: open http://localhost:7081 → Explore → Tempo and search for traces from `mastori-api` (e.g. the `api.generate` root span), or paste a `trace_id` from the API logs.
+The API emits OpenTelemetry traces to the OTel collector (`deploy/otel/collector-config.yaml`), which forwards them to Grafana Tempo (`deploy/tempo/tempo.yaml`, local storage). In the kind cluster both run in the `observability` namespace (`deploy/kubernetes/base/observability.yaml`); the cluster Grafana has a provisioned Tempo datasource: open http://localhost:7081 → Explore → Tempo and search for traces from `mastori-api` (e.g. the `api.generate` root span), or paste a `trace_id` from the API logs.
 
 ### Datasets
 

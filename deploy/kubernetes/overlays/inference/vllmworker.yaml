@@ -15,6 +15,20 @@ spec:
       labels:
         app: vllmworker
     spec:
+      nodeSelector:
+        mastori/pool: gpu
+      tolerations:
+        - key: mastori/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: vllmworker
       containers:
         - name: vllmworker
           image: mastori/api:latest

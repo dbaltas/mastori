@@ -16,6 +16,8 @@ spec:
         app: prometheus
     spec:
       serviceAccountName: prometheus
+      nodeSelector:
+        mastori/pool: cpu
       containers:
         - name: prometheus
           image: prom/prometheus:v3.2.1

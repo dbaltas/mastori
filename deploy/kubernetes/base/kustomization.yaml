@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - api-configmap.yaml
+  - api-deployment.yaml
+  - api-pdb.yaml
+  - api-service.yaml
+  - grafana.yaml
+  - mockworker-deployment.yaml
+  - observability.yaml
+  - prometheus.yaml
+  - redis.yaml
+  - scheduler-deployment.yaml
+configMapGenerator:
+  - name: grafana-dashboards
+    namespace: mastori # generated resources have no namespace field; without this kubectl applies it to the current context namespace
+    options:
+      disableNameSuffixHash: true
+    files:
+      - mastori-overview.json=grafana-dashboards/mastori-overview.json

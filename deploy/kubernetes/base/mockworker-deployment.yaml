@@ -15,6 +15,15 @@ spec:
       labels:
         app: mockworker
     spec:
+      nodeSelector:
+        mastori/pool: cpu
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: mockworker
       containers:
         - name: mockworker
           image: mastori/api:latest

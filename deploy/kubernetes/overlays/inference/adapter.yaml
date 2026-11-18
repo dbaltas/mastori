@@ -27,6 +27,13 @@ spec:
       labels:
         app: inference-adapter
     spec:
+      nodeSelector:
+        mastori/pool: gpu
+      tolerations:
+        - key: mastori/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
       containers:
         - name: adapter
           image: mastori/api:latest

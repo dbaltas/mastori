@@ -1,8 +1,10 @@
 # Local kind cluster for Mastori development.
 #
 # Topology mirrors the cloud design: a control-plane plus a CPU pool
-# (API, scheduler, Redis, Prometheus, Grafana) and a GPU pool
-# (vLLM workers; labeled now, backed by fake NVIDIA devices later).
+# (API, scheduler, Redis, Prometheus, Grafana, mock workers, traffic
+# generator) and a GPU pool (vLLM workers and the inference adapter;
+# labeled now, backed by fake NVIDIA devices later). GPU workers carry
+# the mastori/gpu taint so only inference workloads tolerate them.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: mastori
@@ -20,6 +22,9 @@ nodes:
   - role: worker
     labels:
       mastori/pool: cpu
+  # GPU-pool workers are tainted with mastori/gpu=true:NoSchedule after
+  # cluster creation (make cluster-up); kind's v1alpha4 schema has no
+  # taints field.
   - role: worker
     labels:
       mastori/pool: gpu

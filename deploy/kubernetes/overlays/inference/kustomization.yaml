@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - adapter.yaml
+  - vllmworker.yaml
+# Keep the host port mappings (7080/7081) that the local overlay provides;
+# applying this overlay must not revert them. kustomize cannot load files
+# outside this directory, so the patches are duplicated from overlays/local.
+patches:
+  - path: api-service-nodeport.yaml
+  - path: grafana-nodeport.yaml

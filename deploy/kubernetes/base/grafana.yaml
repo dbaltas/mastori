@@ -63,6 +63,8 @@ spec:
       labels:
         app: grafana
     spec:
+      nodeSelector:
+        mastori/pool: cpu
       containers:
         - name: grafana
           image: grafana/grafana:11.6.0
@@ -115,11 +117,10 @@ metadata:
   labels:
     app: grafana
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: grafana
   ports:
     - name: http
       port: 3000
       targetPort: http
-      nodePort: 30081

@@ -1,6 +1,6 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration vet fmt site run docker-build cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference
+.PHONY: build test test-integration vet fmt site run docker-build cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify
 
 build:
 	go build ./...
@@ -34,6 +34,9 @@ docker-build:
 
 cluster-up:
 	kind create cluster --config infra/kind/kind-config.yaml
+	@# kind cannot set taints in its config; taint the gpu-pool workers here.
+	@nodes=$$(kubectl get nodes -l mastori/pool=gpu -o name) && \
+		for n in $$nodes; do kubectl taint node $$n mastori/gpu=true:NoSchedule; done
 
 cluster-down:
 	kind delete cluster --name $(CLUSTER_NAME)
@@ -43,8 +46,7 @@ cluster-status:
 
 cluster-deploy: docker-build
 	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
-	kubectl apply -f deploy/kubernetes/
-	kubectl -n mastori create configmap grafana-dashboards --from-file=deploy/grafana/dashboards/ --dry-run=client -o yaml | kubectl apply -f -
+	kubectl apply -k deploy/kubernetes/overlays/local
 
 cluster-redeploy-api: docker-build
 	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
@@ -53,5 +55,10 @@ cluster-redeploy-api: docker-build
 
 cluster-deploy-inference: docker-build
 	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
-	kubectl apply -f deploy/inference/
+	kubectl apply -k deploy/kubernetes/overlays/inference
 	kubectl -n mastori rollout restart deployment/inference-adapter deployment/vllmworker
+
+# Renders every overlay; fails on malformed kustomizations or templates.
+kustomize-verify:
+	kubectl kustomize deploy/kubernetes/overlays/local >/dev/null
+	kubectl kustomize deploy/kubernetes/overlays/inference >/dev/null

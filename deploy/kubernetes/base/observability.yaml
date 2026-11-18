@@ -85,6 +85,8 @@ spec:
       labels:
         app: otel-collector
     spec:
+      nodeSelector:
+        mastori/pool: cpu
       containers:
         - name: otel-collector
           image: otel/opentelemetry-collector:0.120.0
@@ -145,6 +147,8 @@ spec:
       labels:
         app: tempo
     spec:
+      nodeSelector:
+        mastori/pool: cpu
       containers:
         - name: tempo
           image: grafana/tempo:2.7.0
