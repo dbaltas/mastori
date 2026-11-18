@@ -7,7 +7,7 @@ type Metrics struct {
 	Registry *prometheus.Registry
 
 	Dispatched        *prometheus.CounterVec // by worker
-	DispatchErrors    *prometheus.CounterVec // by reason: no_worker, redis
+	DispatchErrors    *prometheus.CounterVec // by reason: no_worker, redis, nogroup
 	JobsDropped       *prometheus.CounterVec // by reason: expired, malformed
 	SchedulingSeconds prometheus.Histogram   // read from queue -> dispatched
 	QueueWaitSeconds  prometheus.Histogram   // job created_at -> dispatched
