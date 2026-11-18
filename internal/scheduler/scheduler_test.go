@@ -280,6 +280,63 @@ func TestMetricsRecorded(t *testing.T) {
 	}
 }
 
+func TestRecreatesGroupAfterRedisFlush(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	h.enqueue("j1", "m")
+
+	h.start(&RoundRobin{}, Config{})
+	eventually(t, "first job dispatched", func() bool { return h.streamLen("jobs:worker:w1") == 1 })
+
+	// Simulate a Redis FLUSHDB: stream and consumer group are gone while
+	// the scheduler keeps running.
+	h.mr.FlushAll()
+	h.worker("w1")
+	h.enqueue("j2", "m")
+
+	eventually(t, "group recreated and job dispatched after flush", func() bool {
+		return h.streamLen("jobs:worker:w1") == 1
+	})
+	if got := h.jobsOn("w1"); len(got) != 1 || got[0] != "j2" {
+		t.Errorf("dispatched after flush = %v, want [j2]", got)
+	}
+	if got := testutil.ToFloat64(h.m.DispatchErrors.WithLabelValues("nogroup")); got < 1 {
+		t.Errorf("nogroup dispatch errors = %v, want >= 1", got)
+	}
+}
+
+func TestRecreatesGroupAfterStreamDeleted(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	h.enqueue("j1", "m")
+
+	h.start(&RoundRobin{}, Config{})
+	eventually(t, "first job dispatched", func() bool { return h.streamLen("jobs:worker:w1") == 1 })
+
+	h.client.Del(context.Background(), "jobs")
+	h.worker("w1")
+	h.enqueue("j2", "m")
+
+	eventually(t, "group recreated and job dispatched", func() bool { return h.streamLen("jobs:worker:w1") == 2 })
+	if got := h.jobsOn("w1"); len(got) != 2 || got[0] != "j1" || got[1] != "j2" {
+		t.Errorf("dispatched = %v, want [j1 j2]", got)
+	}
+}
+
+func TestStartupWithExistingGroupTolerated(t *testing.T) {
+	h := newHarness(t)
+	err := h.client.XGroupCreateMkStream(context.Background(), "jobs", "mastori-scheduler", "0").Err()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.worker("w1")
+	h.enqueue("j1", "m")
+
+	h.start(&RoundRobin{}, Config{})
+
+	eventually(t, "dispatched despite BUSYGROUP", func() bool { return h.streamLen("jobs:worker:w1") == 1 })
+}
+
 func TestResumesPendingEntriesNotLost(t *testing.T) {
 	// A second scheduler instance in the same group must not lose or
 	// duplicate jobs: every job lands on exactly one worker stream.

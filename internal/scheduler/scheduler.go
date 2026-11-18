@@ -96,9 +96,8 @@ func New(client *redis.Client, reg *registry.Registry, policy Policy, m *Metrics
 
 // Run reads and dispatches jobs until ctx is canceled.
 func (s *Scheduler) Run(ctx context.Context) error {
-	err := s.client.XGroupCreateMkStream(ctx, s.cfg.Stream, s.cfg.Group, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return fmt.Errorf("scheduler: create consumer group: %w", err)
+	if err := s.ensureGroup(ctx); err != nil {
+		return err
 	}
 
 	go s.statsLoop(ctx)
@@ -119,6 +118,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			if errors.Is(err, redis.Nil) || ctx.Err() != nil {
 				continue
 			}
+			if strings.Contains(err.Error(), "NOGROUP") {
+				s.logger.Warn("consumer group missing, recreating", "stream", s.cfg.Stream, "group", s.cfg.Group)
+				s.dispatchError("nogroup")
+				if gerr := s.ensureGroup(ctx); gerr != nil {
+					s.logger.Error("recreate consumer group failed", "error", gerr)
+				}
+				continue
+			}
 			s.logger.Error("read jobs failed", "error", err)
 			s.dispatchError("redis")
 			sleep(ctx, s.cfg.NoWorkerBackoff)
@@ -131,6 +138,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func (s *Scheduler) ensureGroup(ctx context.Context) error {
+	err := s.client.XGroupCreateMkStream(ctx, s.cfg.Stream, s.cfg.Group, "0").Err()
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		return fmt.Errorf("scheduler: create consumer group: %w", err)
 	}
 	return nil
 }
