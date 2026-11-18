@@ -2,7 +2,7 @@ CLUSTER_NAME := mastori
 
 AWS_DIR := infra/aws
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-status
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
@@ -112,20 +112,33 @@ aws-status:
 	kubectl -n mastori rollout status deployment/scheduler --timeout=5m
 	kubectl -n mastori rollout status deployment/mockworker --timeout=5m
 	kubectl -n mastori get pods -o wide
-# Traffic run parameters for cluster-run-traffic; override on the command line,
-# e.g. `make cluster-run-traffic TRAFFIC_WORKLOAD=short TRAFFIC_RATE=5 TRAFFIC_DURATION=5s`
-# or `make cluster-run-traffic TRAFFIC_STEPS="10:60s,50:60s"`. Empty variables are
-# placeholders that keep the in-code defaults (steps, concurrency, warmup,
-# short-percentage).
+# Traffic run parameters for cluster-run-traffic and aws-run-traffic; override
+# on the command line, e.g. `make cluster-run-traffic TRAFFIC_WORKLOAD=short
+# TRAFFIC_RATE=5 TRAFFIC_DURATION=5s` or
+# `make cluster-run-traffic TRAFFIC_STEPS="10:60s,50:60s"`.
+#
+# Empty variables are skipped by the /traffic env loader (cmd/traffic/config.go
+# skips empty values), so the in-code defaults apply (steps, concurrency,
+# warmup, short-percentage, and rate/duration when no steps are given).
+#
+# Steps decide the total duration themselves (sum of segment durations);
+# setting TRAFFIC_DURATION together with TRAFFIC_STEPS is rejected here because
+# an explicit duration silently extends the run past the last segment (it held
+# the final segment's rate for 5m on 2026-11-18, invalidating a 9-run
+# experiment). The runner still supports the combination via local flags.
 TRAFFIC_WORKLOAD ?= mixed
-TRAFFIC_RATE ?= 10
+TRAFFIC_RATE ?=
 TRAFFIC_ARRIVAL ?= constant
-TRAFFIC_DURATION ?= 5m
+TRAFFIC_DURATION ?=
 TRAFFIC_STEPS ?=
 TRAFFIC_CONCURRENCY ?=
 TRAFFIC_WARMUP ?=
 TRAFFIC_SHORT_PERCENTAGE ?=
 TRAFFIC_SEED ?= 42
+# Inflight ceiling for open-loop runs. The in-code default is 4x --rate, which
+# throttles burst step profiles (a 500 rps segment with ~0.6s latency needs
+# ~300 in flight). 1000 matches the published 2026-11-15 methodology.
+TRAFFIC_MAX_INFLIGHT ?= 1000
 TRAFFIC_WAIT_TIMEOUT ?= 30m
 # Path to the dataset manifest (the benchmark submodule). The traffic Job
 # fetches its in-cluster cache from this file, so changing datasets.yaml is
@@ -138,6 +151,10 @@ DATASETS_MANIFEST ?= benchmark/workloads/datasets.yaml
 traffic-configmaps:
 	@test -f "$(DATASETS_MANIFEST)" || { \
 	  echo "dataset manifest missing at $(DATASETS_MANIFEST): run git submodule update --init --recursive" >&2; exit 1; }
+	@test -z "$(TRAFFIC_STEPS)" -o -z "$(TRAFFIC_DURATION)" || { \
+	  echo "ERROR: TRAFFIC_STEPS and TRAFFIC_DURATION are both set." >&2; \
+	  echo "The steps' durations already define the total run; an explicit duration would extend the run past the last segment (it holds the final rate)." >&2; \
+	  echo "Leave TRAFFIC_DURATION empty, or drop the steps for a fixed-rate run." >&2; exit 1; }
 	@envfile=$$(mktemp) && trap 'rm -f "$$envfile"' EXIT && \
 	{ echo 'TRAFFIC_URL=http://api.mastori.svc.cluster.local:80'; \
 	  echo 'REDIS_ADDR=redis.mastori.svc.cluster.local:6379'; \
@@ -154,7 +171,8 @@ traffic-configmaps:
 	  'TRAFFIC_CONCURRENCY=$(TRAFFIC_CONCURRENCY)' \
 	  'TRAFFIC_WARMUP=$(TRAFFIC_WARMUP)' \
 	  'TRAFFIC_SHORT_PERCENTAGE=$(TRAFFIC_SHORT_PERCENTAGE)' \
-	  'TRAFFIC_SEED=$(TRAFFIC_SEED)'; \
+	  'TRAFFIC_SEED=$(TRAFFIC_SEED)' \
+	  'TRAFFIC_MAX_INFLIGHT=$(TRAFFIC_MAX_INFLIGHT)'; \
 	do echo "$$kv" >> $$envfile; done && \
 	kubectl -n mastori apply -f deploy/kubernetes/base/traffic-config.yaml && \
 	kubectl -n mastori create configmap datasets-manifest --from-file=datasets.yaml=$(DATASETS_MANIFEST) --dry-run=client -o yaml | kubectl apply -f - -n mastori && \
