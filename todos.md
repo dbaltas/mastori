@@ -11,37 +11,50 @@ error/edge cases.
 
 ### Redis hygiene (from the 2026-11-15 experiment)
 
-- [ ] **Expire finished chunk streams.** `internal/worker/runner.go` writes
+- [x] **Expire finished chunk streams.** `internal/worker/runner.go` writes
   `jobs:chunks:<job_id>` with only `MaxLen: 10000`; nothing ever deletes or
   expires the stream. ~80MB/run accumulated; 1.74GB / 238K keys invalidated
   afternoon measurements and OOMKilled Redis mid-run. Fix: `EXPIRE
   jobs:chunks:<job_id>` (5–10 min) when the worker publishes the final `done`
   chunk (or when the API finishes streaming). Per-key TTL, safe during
   concurrent runs. Optional: a `make redis-flush` escape hatch (manual, between
-  runs only — kills in-flight jobs and consumer groups).
-- [ ] **Scheduler recreates its consumer group.** `scheduler.go` calls
+  runs only — kills in-flight jobs and consumer groups). Done 2026-11-18:
+  `ChunksTTL` on the runner (default 10m, `WORKER_CHUNKS_TTL_SECONDS`, 0 →
+  default, negative disables), `make redis-flush` target added.
+- [x] **Scheduler recreates its consumer group.** `scheduler.go` calls
   `XGroupCreateMkStream` once at startup; after a FLUSHDB the scheduler keeps
   erroring on `read jobs` until restarted. Detect `NOGROUP` on the read loop
   and recreate the group (or recreate on every iteration — MkStream is idempotent).
+  Done 2026-11-18: `ensureGroup` helper, `NOGROUP` detection recreates the
+  group, `dispatch_error{nogroup}` metric.
 
 ### Dead-worker reclaim
 
-- [ ] Jobs dispatched to a worker that crashes are never reclaimed or
+- [x] Jobs dispatched to a worker that crashes are never reclaimed or
   re-dispatched (`jobs:worker:<id>` streams accumulate; clients hang until
   timeout). Look at `XAUTOCLAIM`/pending inspection on worker streams, driven
-  by registry liveness. Not yet handled per README and still true in code.
+  by registry liveness. Done 2026-11-18: minimal reclaim — scheduler pass
+  (1s ticker) finds `jobs:worker:*` streams whose registry heartbeat is gone,
+  re-dispatches stranded entries via the shared MULTI `place()`, deletes the
+  dead stream, `mastori_scheduler_reclaims_total` metric, sets `run:interrupted`.
+  Failure behavior still to be covered by the Failure CI kind tests below.
 
 ### Run status + results schema v0.1 (decided 2026-11-18)
 
-- [ ] Add `status: running|valid|invalid` to the run/result format. A mid-run
+- [x] Add `status: running|valid|invalid` to the run/result format. A mid-run
   Redis restart, scheduler crash, or unreclaimed worker loss ends the
   experiment with status `invalid`. No Redis PVC on cloud; restart voids the
-  run by design.
-- [ ] Add `schema_version: 0.1` to every exported result and run manifest.
-- [ ] Update the HF results repo writer (benchmark submodule) to carry
-  version `0.1` in the same change.
-- [ ] Unit tests: happy path → `valid`, each interruption path → `invalid`,
-  version field present in all exports.
+  run by design. Done 2026-11-18: summary written as `running` at run start,
+  rewritten at finalize; `invalid` on any measured-request failure or the
+  scheduler's `run:interrupted` flag (warmup-only failures keep the run valid).
+- [x] Add `schema_version: 0.1` to every exported result and run manifest.
+  Done 2026-11-18: on both JSONL records and the run summary.
+- [x] Update the HF results repo writer (benchmark submodule) to carry
+  version `0.1` in the same change. Done 2026-11-18: benchmark submodule
+  pointer moved to `423ae0f` (schema v0.1 doc on the HF repo, pushed).
+- [x] Unit tests: happy path → `valid`, each interruption path → `invalid`,
+  version field present in all exports. Done 2026-11-18:
+  `internal/traffic/status_test.go`, reclaim tests in `internal/scheduler`.
 
 ### Kustomize refactor + pool placement
 
