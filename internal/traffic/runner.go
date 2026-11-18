@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Config describes a full traffic run.
@@ -34,6 +37,14 @@ type Config struct {
 	// warmup requests to finish (default Timeout + 10s).
 	DrainGrace time.Duration
 	OutputPath string
+	// RedisAddr enables the interruption-flag check at finalize time
+	// (REDIS_ADDR, like the other components); empty disables it.
+	RedisAddr string
+	// InterruptKey is the Redis key whose presence marks an infra-level
+	// interruption that invalidates the run. A single global flag: the
+	// scheduler sets it when it reclaims a dead worker's stranded jobs.
+	// Concurrent benchmark runs are not a supported scenario.
+	InterruptKey string
 }
 
 func (c *Config) Validate() error {
@@ -54,6 +65,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RunID == "" {
 		c.RunID = time.Now().UTC().Format("20060102T150405")
+	}
+	if c.InterruptKey == "" {
+		c.InterruptKey = "run:interrupted"
 	}
 	if c.Concurrency > 0 {
 		return nil
@@ -86,7 +100,18 @@ func (c *Config) inflightLimit() int {
 	return int(math.Max(1, math.Ceil(4*c.Rate)))
 }
 
+// Run statuses. The summary file is written with StatusRunning at run start
+// and rewritten with the final status at the end, so a driver that dies
+// mid-run leaves a summary that is observable as running.
+const (
+	StatusRunning = "running"
+	StatusValid   = "valid"
+	StatusInvalid = "invalid"
+)
+
 type Summary struct {
+	SchemaVersion     string         `json:"schema_version"`
+	Status            string         `json:"status"`
 	RunID             string         `json:"run_id"`
 	StartedAt         time.Time      `json:"started_at"`
 	MeasuredStartedAt time.Time      `json:"measured_started_at"`
@@ -258,6 +283,19 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	}
 	barrier := newWarmupBarrier(warmupEnd, drainGrace)
 
+	summaryPath := SummaryPath(cfg.OutputPath)
+	startSummary := &Summary{
+		SchemaVersion: SchemaVersion,
+		Status:        StatusRunning,
+		RunID:         cfg.RunID,
+		StartedAt:     started,
+		Mode:          modeLabel(cfg),
+		OutputPath:    cfg.OutputPath,
+	}
+	if err := WriteSummary(summaryPath, startSummary); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: write start summary: %v\n", err)
+	}
+
 	var seq atomic.Int64
 	acc := newAccumulator()
 
@@ -379,6 +417,7 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	finished := time.Now()
 
 	s := acc.snapshot(cfg)
+	s.SchemaVersion = SchemaVersion
 	s.RunID = cfg.RunID
 	s.StartedAt = started
 	s.MeasuredStartedAt = barrier.start
@@ -388,7 +427,40 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	s.WarmupDrainMs = barrier.drainWall.Milliseconds()
 	s.FinishedAt = finished
 	s.OutputPath = cfg.OutputPath
+	interrupted := checkInterrupted(cfg)
+	if interrupted {
+		s.Errors["interrupted"]++
+	}
+	if s.Failures > 0 || interrupted {
+		s.Status = StatusInvalid
+	} else {
+		s.Status = StatusValid
+	}
+	if err := WriteSummary(summaryPath, s); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: write final summary: %v\n", err)
+	}
 	return s, nil
+}
+
+// checkInterrupted reports whether the infra-level interruption flag is set
+// in Redis. Without a Redis address (or if the check fails) the run is not
+// considered interrupted: request failures remain the observable signal.
+func checkInterrupted(cfg *Config) bool {
+	if cfg.RedisAddr == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	defer func() { _ = client.Close() }()
+	_, err := client.Get(ctx, cfg.InterruptKey).Result()
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, redis.Nil) {
+		fmt.Fprintf(os.Stderr, "warning: read interruption flag: %v\n", err)
+	}
+	return false
 }
 
 func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, writer *ResultWriter, acc *accumulator, seq *atomic.Int64, cfg *Config, warmup bool, barrier *warmupBarrier, tracked bool) {
@@ -409,20 +481,21 @@ func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, w
 		errMsg = err.Error()
 	}
 	rec := Record{
-		RunID:      cfg.RunID,
-		Seq:        seq.Add(1),
-		Dataset:    row.Dataset,
-		RowIndex:   row.Index,
-		Warmup:     warmup,
-		SendAt:     sendAt,
-		Status:     res.Status,
-		LatencyMs:  latency.Milliseconds(),
-		TTFTMs:     res.TTFT.Milliseconds(),
-		Chunks:     res.Chunks,
-		TokensIn:   res.APIResp.TokensIn,
-		TokensOut:  res.APIResp.TokensOut,
-		APITotalMs: res.APIResp.TotalMs,
-		Error:      errMsg,
+		SchemaVersion: SchemaVersion,
+		RunID:         cfg.RunID,
+		Seq:           seq.Add(1),
+		Dataset:       row.Dataset,
+		RowIndex:      row.Index,
+		Warmup:        warmup,
+		SendAt:        sendAt,
+		Status:        res.Status,
+		LatencyMs:     latency.Milliseconds(),
+		TTFTMs:        res.TTFT.Milliseconds(),
+		Chunks:        res.Chunks,
+		TokensIn:      res.APIResp.TokensIn,
+		TokensOut:     res.APIResp.TokensOut,
+		APITotalMs:    res.APIResp.TotalMs,
+		Error:         errMsg,
 	}
 	if werr := writer.Write(rec); werr != nil {
 		fmt.Fprintf(os.Stderr, "warning: write result: %v\n", werr)
@@ -461,6 +534,7 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		s.AchievedSendRate = float64(a.requests) / cfg.Duration.Seconds()
 		s.Throughput = float64(a.successes) / cfg.Duration.Seconds()
 	}
+	s.Mode = modeLabel(cfg)
 	if a.latency.Count() > 0 {
 		s.LatencyMsP50 = a.latency.Percentile(50)
 		s.LatencyMsP95 = a.latency.Percentile(95)
@@ -469,11 +543,7 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		s.LatencyMsMin = a.latency.Min()
 		s.LatencyMsMax = a.latency.Max()
 	}
-	if cfg.Concurrency > 0 {
-		s.Mode = fmt.Sprintf("closed-loop:%d", cfg.Concurrency)
-	} else {
-		s.Mode = "open-loop"
-	}
+	s.Mode = modeLabel(cfg)
 	if cfg.Stream {
 		s.Mode += "+stream"
 		s.TTFTMsP50 = a.ttft.Percentile(50)
@@ -481,6 +551,13 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		s.TTFTMsMean = a.ttft.Mean()
 	}
 	return s
+}
+
+func modeLabel(cfg *Config) string {
+	if cfg.Concurrency > 0 {
+		return fmt.Sprintf("closed-loop:%d", cfg.Concurrency)
+	}
+	return "open-loop"
 }
 
 // RunSignalContext wraps ctx with SIGINT/SIGTERM cancellation for graceful

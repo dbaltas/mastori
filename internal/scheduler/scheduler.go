@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -36,6 +37,9 @@ type Config struct {
 	WorkerRefresh      time.Duration // max age of the cached worker list
 	NoWorkerBackoff    time.Duration // wait between attempts when no worker is eligible
 	StatsInterval      time.Duration // gauge refresh interval
+	ReclaimInterval    time.Duration // dead-worker reclaim pass interval
+	InterruptKey       string        // Redis key set when a reclaim invalidates a run
+	InterruptTTL       time.Duration // TTL of the interruption flag
 }
 
 func (c Config) withDefaults() Config {
@@ -66,6 +70,15 @@ func (c Config) withDefaults() Config {
 	if c.StatsInterval <= 0 {
 		c.StatsInterval = time.Second
 	}
+	if c.ReclaimInterval <= 0 {
+		c.ReclaimInterval = time.Second
+	}
+	if c.InterruptKey == "" {
+		c.InterruptKey = "run:interrupted"
+	}
+	if c.InterruptTTL <= 0 {
+		c.InterruptTTL = 6 * time.Hour
+	}
 	return c
 }
 
@@ -78,19 +91,26 @@ type Scheduler struct {
 	logger *slog.Logger
 	cfg    Config
 
-	// Cached worker list. Only touched from the dispatch goroutine.
+	// Cached worker list, guarded by cacheMu (the dispatch goroutine and
+	// the reclaim pass both consult it).
+	cacheMu  sync.Mutex
 	cached   []registry.Worker
 	cachedAt time.Time
+
+	// Workers already warned about for having stranded jobs. Only touched
+	// from the reclaim goroutine.
+	reclaimWarned map[string]bool
 }
 
 func New(client *redis.Client, reg *registry.Registry, policy Policy, m *Metrics, logger *slog.Logger, cfg Config) *Scheduler {
 	return &Scheduler{
-		client: client,
-		reg:    reg,
-		policy: policy,
-		m:      m,
-		logger: logger,
-		cfg:    cfg.withDefaults(),
+		client:        client,
+		reg:           reg,
+		policy:        policy,
+		m:             m,
+		logger:        logger,
+		cfg:           cfg.withDefaults(),
+		reclaimWarned: make(map[string]bool),
 	}
 }
 
@@ -101,6 +121,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 
 	go s.statsLoop(ctx)
+	go s.reclaimLoop(ctx)
 
 	s.logger.Info("scheduler started",
 		"policy", s.policy.Name(), "stream", s.cfg.Stream,
@@ -174,7 +195,7 @@ func (s *Scheduler) handle(ctx context.Context, msg redis.XMessage) error {
 			return nil
 		}
 
-		err := s.dispatch(ctx, msg.ID, job, readAt)
+		err := s.place(ctx, s.cfg.Stream, s.cfg.Group, msg.ID, job, readAt)
 		if err == nil {
 			return nil
 		}
@@ -193,41 +214,26 @@ func (s *Scheduler) handle(ctx context.Context, msg redis.XMessage) error {
 	}
 }
 
-func (s *Scheduler) dispatch(ctx context.Context, entryID string, job queue.Job, readAt time.Time) error {
-	workers, err := s.liveWorkers(ctx)
+// place picks an eligible worker for the job and atomically moves the entry
+// there: XAdd to the worker's stream, XDel from the source stream, and XAck
+// when the source is the group-owned jobs stream (group != ""). The whole
+// move is one MULTI/EXEC transaction, so the entry is never in both streams
+// and never in neither.
+func (s *Scheduler) place(ctx context.Context, src, group, entryID string, job queue.Job, readAt time.Time) error {
+	target, err := s.pickWorker(ctx, job)
 	if err != nil {
 		return err
 	}
-
-	candidates := make([]Candidate, 0, len(workers))
-	for _, w := range workers {
-		if w.Supports(job.Model) {
-			candidates = append(candidates, Candidate{Worker: w})
-		}
-	}
-	if len(candidates) == 0 {
-		return errNoWorker
-	}
-
-	if s.policy.NeedsLoad() {
-		if err := s.fillLoads(ctx, candidates); err != nil {
-			return err
-		}
-	}
-
-	idx := s.policy.Select(job, candidates)
-	if idx < 0 || idx >= len(candidates) {
-		return errNoWorker
-	}
-	target := candidates[idx].ID
 
 	pipe := s.client.TxPipeline()
 	pipe.XAdd(ctx, &redis.XAddArgs{
 		Stream: s.cfg.WorkerStreamPrefix + target,
 		Values: queue.JobValues(job),
 	})
-	pipe.XAck(ctx, s.cfg.Stream, s.cfg.Group, entryID)
-	pipe.XDel(ctx, s.cfg.Stream, entryID)
+	if group != "" {
+		pipe.XAck(ctx, src, group, entryID)
+	}
+	pipe.XDel(ctx, src, entryID)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
@@ -237,6 +243,36 @@ func (s *Scheduler) dispatch(ctx context.Context, entryID string, job queue.Job,
 	s.m.QueueWaitSeconds.Observe(time.Since(job.CreatedAt).Seconds())
 	s.logger.Debug("job dispatched", "job_id", job.ID, "worker", target, "policy", s.policy.Name())
 	return nil
+}
+
+// pickWorker asks the policy to select a live worker able to serve the job.
+func (s *Scheduler) pickWorker(ctx context.Context, job queue.Job) (string, error) {
+	workers, err := s.liveWorkers(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	candidates := make([]Candidate, 0, len(workers))
+	for _, w := range workers {
+		if w.Supports(job.Model) {
+			candidates = append(candidates, Candidate{Worker: w})
+		}
+	}
+	if len(candidates) == 0 {
+		return "", errNoWorker
+	}
+
+	if s.policy.NeedsLoad() {
+		if err := s.fillLoads(ctx, candidates); err != nil {
+			return "", err
+		}
+	}
+
+	idx := s.policy.Select(job, candidates)
+	if idx < 0 || idx >= len(candidates) {
+		return "", errNoWorker
+	}
+	return candidates[idx].ID, nil
 }
 
 // drop removes an entry from the jobs stream without dispatching it.
@@ -252,6 +288,8 @@ func (s *Scheduler) drop(ctx context.Context, entryID, reason string) {
 }
 
 func (s *Scheduler) liveWorkers(ctx context.Context) ([]registry.Worker, error) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
 	if s.cached != nil && time.Since(s.cachedAt) < s.cfg.WorkerRefresh {
 		return s.cached, nil
 	}
@@ -327,6 +365,126 @@ func (s *Scheduler) collect(ctx context.Context) {
 	for i, w := range workers {
 		s.m.WorkerQueueDepth.WithLabelValues(w.ID).Set(float64(cmds[i].Val()))
 	}
+}
+
+// reclaimLoop periodically looks for stranded jobs on dead workers' streams.
+// Workers consume with plain XRead and delete each entry after the job
+// finishes, so a crashed worker leaves entries on its stream forever; the
+// reclaim pass re-dispatches them to live workers and signals that an
+// inference slot was lost mid-run.
+func (s *Scheduler) reclaimLoop(ctx context.Context) {
+	t := time.NewTicker(s.cfg.ReclaimInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.reclaimOnce(ctx)
+		}
+	}
+}
+
+func (s *Scheduler) reclaimOnce(ctx context.Context) {
+	streams, err := s.workerStreams(ctx)
+	if err != nil {
+		s.logger.Warn("reclaim scan failed", "error", err)
+		return
+	}
+	for _, key := range streams {
+		id := strings.TrimPrefix(key, s.cfg.WorkerStreamPrefix)
+		if id == "" {
+			continue
+		}
+		alive, err := s.reg.Alive(ctx, id)
+		if err != nil {
+			s.logger.Warn("reclaim liveness check failed", "worker", id, "error", err)
+			continue
+		}
+		if alive {
+			continue // live worker: its stream holds queued/running work
+		}
+		if err := s.reclaimStream(ctx, key, id); err != nil {
+			s.logger.Warn("reclaim failed", "worker", id, "error", err)
+		}
+	}
+}
+
+// workerStreams lists all per-worker stream keys with SCAN.
+func (s *Scheduler) workerStreams(ctx context.Context) ([]string, error) {
+	var (
+		cursor uint64
+		keys   []string
+	)
+	for {
+		batch, next, err := s.client.Scan(ctx, cursor, s.cfg.WorkerStreamPrefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return keys, nil
+}
+
+// reclaimStream re-dispatches the stranded entries of one dead worker's
+// stream and deletes the stream key once every entry has been moved or
+// dropped. Entries that no live worker can serve stay in place and are
+// retried on the next pass.
+func (s *Scheduler) reclaimStream(ctx context.Context, key, workerID string) error {
+	entries, err := s.client.XRange(ctx, key, "-", "+").Result()
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var moved, dropped, stranded int
+	for _, e := range entries {
+		job, ok := queue.JobFromValues(e.Values)
+		if !ok {
+			if err := s.client.XDel(ctx, key, e.ID).Err(); err != nil {
+				return err
+			}
+			s.m.JobsDropped.WithLabelValues("malformed").Inc()
+			dropped++
+			continue
+		}
+		switch err := s.place(ctx, key, "", e.ID, job, time.Now()); {
+		case err == nil:
+			moved++
+			delete(s.reclaimWarned, workerID)
+		case errors.Is(err, errNoWorker):
+			stranded++
+			if !s.reclaimWarned[workerID] {
+				s.reclaimWarned[workerID] = true
+				s.logger.Warn("stranded jobs on dead worker, no live worker to take them", "worker", workerID)
+			}
+		default:
+			return err
+		}
+	}
+	if stranded > 0 {
+		return nil
+	}
+	if err := s.client.Del(ctx, key).Err(); err != nil {
+		return err
+	}
+	delete(s.reclaimWarned, workerID)
+
+	// A reclaim means an inference slot was lost mid-run: mark any in
+	// progress benchmark run invalid so the traffic driver fails the run
+	// instead of reporting numbers spanning a reclaimed slot.
+	if err := s.client.Set(ctx, s.cfg.InterruptKey, "1", s.cfg.InterruptTTL).Err(); err != nil {
+		s.logger.Warn("set interruption flag failed", "error", err)
+	}
+	s.m.Reclaims.Inc()
+	s.logger.Info("reclaimed dead worker stream", "worker", workerID, "moved", moved, "dropped", dropped)
+	return nil
 }
 
 // sleep waits for d or until ctx is canceled. It reports whether the full
