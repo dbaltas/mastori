@@ -1,13 +1,14 @@
-FROM golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /api ./cmd/api
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /mockworker ./cmd/mockworker
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /scheduler ./cmd/scheduler
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /adapter ./cmd/adapter
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /vllmworker ./cmd/vllmworker
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /api ./cmd/api
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /mockworker ./cmd/mockworker
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /scheduler ./cmd/scheduler
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /adapter ./cmd/adapter
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /vllmworker ./cmd/vllmworker
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /api /api
