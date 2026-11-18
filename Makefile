@@ -1,6 +1,6 @@
 CLUSTER_NAME := mastori
 
-.PHONY: build test test-integration vet fmt site run docker-build cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify
+.PHONY: build test test-integration vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference kustomize-verify
 
 build:
 	go build ./...
@@ -31,6 +31,16 @@ run: build
 
 docker-build:
 	docker build -t mastori/api:latest .
+
+GHCR_IMAGE := ghcr.io/dbaltas/mastori
+GIT_SHA := $(shell git rev-parse --short=7 HEAD)
+
+docker-ghcr-build:
+	docker build -t $(GHCR_IMAGE):$(GIT_SHA) -t $(GHCR_IMAGE):latest .
+
+docker-ghcr-push: docker-ghcr-build
+	docker push $(GHCR_IMAGE):$(GIT_SHA)
+	docker push $(GHCR_IMAGE):latest
 
 cluster-up:
 	kind create cluster --config infra/kind/kind-config.yaml
