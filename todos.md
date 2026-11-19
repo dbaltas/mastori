@@ -82,6 +82,32 @@ error/edge cases.
 - [ ] **Failure CI:** restart Redis, scheduler, and workers; assert defined
   recovery behavior and `invalid` statuses.
 
+### Datasets in-cluster cache reuse
+
+- [ ] The traffic Job's `datasets` initContainer re-fetches the full dataset
+  cache from Hugging Face on **every run** (~15–25s of per-run overhead over
+  the NAT) into a fresh `emptyDir`. Add cache reuse across runs: either a
+  small read-only PVC seeded once (a fetcher Job with `if-not-exists`
+  semantics), or a S3-backed warm cache, or a built-in image layer refresh
+  when the manifest SHA changes. Keyed on the `datasets.yaml` manifest SHA so
+  a manifest change invalidates the cache; keep the no-data-on-nodes rule
+  (nothing persistent lands on the node filesystem).
+
+### Structured environment capture
+
+- [ ] **Automate provenance capture at experiment start.** The 2026-11-19
+  EKS environment snapshot was a manual scrape under time pressure (image
+  digest, api-configmap, deployments, node type/capacity grabbed from the
+  live cluster right before destroy — the failed-NAT lesson made the window
+  unpredictable). Add a `make cluster-env-capture`-style step to the run
+  workflow that runs **before the first run of an experiment** and writes
+  `results/<experiment>/environment/`: image digests per workload,
+  deployment/configmap manifests, node instance types + capacity + labels,
+  cluster version/topology, dataset manifest SHA. Generate `PROVENANCE.md`
+  from that instead of hand-writing it, so every experiment starts with
+  complete provenance by construction (GPU driver/CUDA info joins in
+  Milestone 2).
+
 ### Local quality (pre-cloud, not blocking)
 
 - [ ] 3 workers regressed vs 2 at 20K requests (dispatch/Redis contention);
@@ -90,6 +116,13 @@ error/edge cases.
   add dispatch-rate metrics if needed.
 - [ ] Queue-aware (V2) policy: least-loaded uses stream length only; consider
   queue depth + in-flight-aware dispatch before cloud experiments.
+- [ ] **CPU-capped local knee check.** The first EKS run showed the knee
+  arriving earlier than on the host (p95 2163ms at 10K/30s vs 1243ms on
+  kind; everything shares one m6g.xlarge vs a spread-out M4 Pro). Test the
+  contention hypothesis: cap the kind node to m6g.xlarge shape
+  (`docker update --cpus 4 --memory 16g kind-control-plane`) and rerun the
+  1K/5K/10K loop. If p95 at 10K moves from ~1.2s toward ~2.2s, CPU
+  contention is confirmed as the cause; revert with `--cpus 0 --memory 0g`.
 - [ ] Rerun the knee sweep with the vllmworker/Ollama inference layer
   (it was 0 replicas in the 2026-11-15 run) so mock findings have a
   real-inference comparison. Same experiment config shape.
