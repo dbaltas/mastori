@@ -2,7 +2,7 @@ CLUSTER_NAME := mastori
 
 AWS_DIR := infra/aws
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-status traffic-configmaps traffic-wait
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
@@ -193,12 +193,68 @@ traffic-wait:
 	grep '^run ' $$log && awk '/^\{$$/,/^\}$$/' $$log && \
 	echo "(records saved to the pod logs; run make cluster-traffic-results to write the JSONL files)"
 
+# Captures the live cluster environment into
+# benchmark/results/<experiment>/environment/ before the first traffic run of
+# an experiment: node dump (instance type, allocatable, labels, taints,
+# kubelet/containerd versions), all mastori pods (images, image digests, env,
+# resources), configmaps (api-config, traffic-config, datasets-manifest),
+# workload list, kubectl version, host info, and a PROVENANCE.md skeleton to
+# hand-finish with context (co-location caveats, Redis state notes, image
+# build source).
+# Usage: make cluster-env-capture EXPERIMENT=20261120-eks-mockworker-knee
+# cluster-run-traffic and aws-run-traffic call this automatically when
+# EXPERIMENT is set and no PROVENANCE.md exists yet (capture once per
+# experiment; re-running the target by hand overwrites the snapshot).
+cluster-env-capture:
+	@test -n "$(EXPERIMENT)" || { echo "ERROR: set EXPERIMENT=<name>, e.g. make cluster-env-capture EXPERIMENT=20261120-eks-mockworker-knee" >&2; exit 1; }
+	@mkdir -p benchmark/results/$(EXPERIMENT)/environment
+	@echo "capturing environment into benchmark/results/$(EXPERIMENT)/environment (context: $$(kubectl config current-context 2>/dev/null))"
+	kubectl version > benchmark/results/$(EXPERIMENT)/environment/kubectl-version.txt
+	kubectl get nodes -o wide > benchmark/results/$(EXPERIMENT)/environment/nodes-wide.txt
+	kubectl get nodes -o yaml > benchmark/results/$(EXPERIMENT)/environment/nodes.yaml
+	kubectl -n mastori get pods -o wide > benchmark/results/$(EXPERIMENT)/environment/pods-wide.txt
+	kubectl -n mastori get pods -o yaml > benchmark/results/$(EXPERIMENT)/environment/pods.yaml
+	kubectl -n mastori get configmap -o yaml > benchmark/results/$(EXPERIMENT)/environment/configmaps.yaml
+	kubectl -n mastori get deploy,statefulset,job -o wide > benchmark/results/$(EXPERIMENT)/environment/workloads-wide.txt
+	kubectl -n mastori get pods -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{range .status.containerStatuses[*]}{.image}{"  "}{.imageID}{"\n"}{end}{end}' | sort > benchmark/results/$(EXPERIMENT)/environment/image-digests.txt
+	shasum -a 256 $(DATASETS_MANIFEST) | cut -d' ' -f1 > benchmark/results/$(EXPERIMENT)/environment/dataset-manifest.sha256
+	@{ uname -a; docker info 2>/dev/null | grep -E '^(Server Version|CPUs|Total Memory):'; true; } > benchmark/results/$(EXPERIMENT)/environment/host.txt
+	@{ \
+	  echo '# Environment provenance — $(EXPERIMENT)'; \
+	  echo; \
+	  echo "- Captured: $$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; \
+	  echo "- kubectl context: $$(kubectl config current-context 2>/dev/null)"; \
+	  echo "- mastori commit: $$(git rev-parse --short=7 HEAD)"; \
+	  echo "- benchmark submodule: $$(git -C benchmark rev-parse --short=7 HEAD)"; \
+	  echo "- dataset manifest SHA-256: $$(cat benchmark/results/$(EXPERIMENT)/environment/dataset-manifest.sha256)"; \
+	  echo; \
+	  echo 'Node summary (name, instance type, allocatable CPU/mem):'; \
+	  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.metadata.labels.node\.kubernetes\.io/instance-type}{"  "}{.status.allocatable.cpu}{"  "}{.status.allocatable.memory}{"\n"}{end}' 2>/dev/null | sed 's/^/  /'; \
+	  echo; \
+	  echo 'Workloads in the mastori namespace (deploy/statefulset/job):'; \
+	  kubectl -n mastori get deploy,statefulset,job -o wide 2>/dev/null | sed 's/^/  /'; \
+	  echo; \
+	  echo 'Raw captures in this folder:'; \
+	  echo '  - nodes.yaml / nodes-wide.txt (instance type, capacity/allocatable, labels, taints, kubelet + containerd versions, kernel, AMI)'; \
+	  echo '  - pods.yaml / pods-wide.txt (per-pod images, image digests, env, resources, initContainers)'; \
+	  echo '  - configmaps.yaml (api-config, traffic-config, datasets-manifest)'; \
+	  echo '  - workloads-wide.txt, image-digests.txt, kubectl-version.txt, host.txt, dataset-manifest.sha256'; \
+	  echo; \
+	  echo '<!-- Hand-finish with context: co-location/caveats, Redis state notes, image -->'; \
+	  echo '<!-- build source (commit the image was built from), workload config rationale. -->'; \
+	} > benchmark/results/$(EXPERIMENT)/environment/PROVENANCE.md
+	@echo "PROVENANCE.md skeleton written; hand-finish the context notes before publishing"
+
 # Runs the traffic generator inside the kind cluster as a Job: rebuilds the
 # image, replaces the traffic-config ConfigMap, applies the Job template, and
 # waits for completion. Records are streamed to stdout by the container
 # (TRAFFIC_RECORDS_STDOUT) and recovered from the pod logs with
 # cluster-traffic-results — the distroless image has no shell or tar.
+# Set EXPERIMENT=<name> to auto-capture the environment snapshot before the
+# first run (skipped once benchmark/results/<name>/environment/PROVENANCE.md
+# exists).
 cluster-run-traffic: docker-build
+	@if [ -n "$(EXPERIMENT)" ] && [ ! -f benchmark/results/$(EXPERIMENT)/environment/PROVENANCE.md ]; then $(MAKE) cluster-env-capture EXPERIMENT=$(EXPERIMENT); fi
 	kind load docker-image mastori/api:latest --name $(CLUSTER_NAME)
 	$(MAKE) traffic-configmaps
 	kubectl -n mastori delete job traffic --ignore-not-found
@@ -209,8 +265,10 @@ cluster-run-traffic: docker-build
 # through the aws/traffic overlay, which rewrites the image to the GHCR
 # digest the nodes can pull (no kind load step). Results recovery is the
 # same cluster-traffic-results target — it only uses the current kubectl
-# context.
+# context. Set EXPERIMENT=<name> for the same auto-capture hook as
+# cluster-run-traffic.
 aws-run-traffic:
+	@if [ -n "$(EXPERIMENT)" ] && [ ! -f benchmark/results/$(EXPERIMENT)/environment/PROVENANCE.md ]; then $(MAKE) cluster-env-capture EXPERIMENT=$(EXPERIMENT); fi
 	$(MAKE) traffic-configmaps
 	kubectl -n mastori delete job traffic --ignore-not-found
 	kubectl -n mastori apply -k deploy/kubernetes/overlays/aws/traffic

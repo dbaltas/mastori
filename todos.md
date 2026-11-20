@@ -104,18 +104,18 @@ error/edge cases.
 
 ### Structured environment capture
 
-- [ ] **Automate provenance capture at experiment start.** The 2026-11-19
+- [x] **Automate provenance capture at experiment start.** The 2026-11-19
   EKS environment snapshot was a manual scrape under time pressure (image
   digest, api-configmap, deployments, node type/capacity grabbed from the
   live cluster right before destroy — the failed-NAT lesson made the window
-  unpredictable). Add a `make cluster-env-capture`-style step to the run
-  workflow that runs **before the first run of an experiment** and writes
-  `results/<experiment>/environment/`: image digests per workload,
-  deployment/configmap manifests, node instance types + capacity + labels,
-  cluster version/topology, dataset manifest SHA. Generate `PROVENANCE.md`
-  from that instead of hand-writing it, so every experiment starts with
-  complete provenance by construction (GPU driver/CUDA info joins in
-  Milestone 2).
+  unpredictable). Done as `make cluster-env-capture EXPERIMENT=<name>`:
+  raw kubectl dumps (nodes, pods, configmaps, image digests, kubectl
+  version, host info, dataset manifest SHA) into
+  `benchmark/results/<experiment>/environment/`, plus a generated
+  `PROVENANCE.md` skeleton. `cluster-run-traffic`/`aws-run-traffic` call it
+  automatically when `EXPERIMENT` is set and no `PROVENANCE.md` exists yet.
+  Still hand-finished: the context notes (co-location caveats, Redis state,
+  image build source). GPU driver/CUDA info joins in Milestone 2.
 
 ### Local quality (pre-cloud, not blocking)
 
