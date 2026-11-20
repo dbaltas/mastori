@@ -2,7 +2,7 @@ CLUSTER_NAME := mastori
 
 AWS_DIR := infra/aws
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-status traffic-configmaps traffic-wait
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
@@ -81,6 +81,8 @@ kustomize-verify:
 	kubectl kustomize deploy/kubernetes/overlays/inference >/dev/null
 	kubectl kustomize deploy/kubernetes/overlays/aws >/dev/null
 	kubectl kustomize deploy/kubernetes/overlays/aws/traffic >/dev/null
+	kubectl kustomize deploy/kubernetes/overlays/aws-inference >/dev/null
+	kubectl kustomize deploy/kubernetes/overlays/aws-nvidia >/dev/null
 
 # AWS EKS (Milestone 1, eu-north-1). Applies run from infra/aws with local state;
 # see infra/aws/README.md for access steps and cost guardrails.
@@ -104,6 +106,43 @@ aws-kubeconfig:
 # in the module): every workload node-selects mastori/pool: cpu.
 aws-deploy:
 	kubectl apply -k deploy/kubernetes/overlays/aws
+
+# NVIDIA stack for the GPU node group (Milestone 2 prep): Prometheus RBAC
+# glue, then the NVIDIA device plugin (advertises nvidia.com/gpu, enables
+# GPU Feature Discovery labels) and dcgm-exporter (Prometheus telemetry)
+# via Helm charts. Helm tolerations include the mastori/gpu node taint from
+# Terraform; nodeSelector keeps the DaemonSets on the GPU pool. Requires
+# aws-kubeconfig + aws-deploy (prometheus SA) first. The DaemonSets show 0
+# desired pods while the GPU node group is scaled to zero (normal).
+NVIDIA_TOLERATIONS := [{"key":"mastori/gpu","operator":"Exists","effect":"NoSchedule"},{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]
+aws-nvidia:
+	kubectl apply -k deploy/kubernetes/overlays/aws-nvidia
+	helm repo add nvdp https://nvidia.github.io/k8s-device-plugin 2>/dev/null || true
+	helm repo add nvidia-dcgm https://nvidia.github.io/dcgm-exporter/helm-charts 2>/dev/null || true
+	helm repo update >/dev/null
+	helm upgrade --install nvdp nvdp/nvidia-device-plugin -n nvidia \
+	  --set gfd.enabled=true \
+	  --set-json 'tolerations=$(NVIDIA_TOLERATIONS)' \
+	  --set-json 'nodeSelector={"mastori/pool":"gpu"}'
+	helm upgrade --install dcgm-exporter nvidia-dcgm/dcgm-exporter -n nvidia \
+	  --set-json 'tolerations=$(NVIDIA_TOLERATIONS)' \
+	  --set-json 'nodeSelector={"mastori/pool":"gpu"}'
+	kubectl -n nvidia get ds
+
+# Applies the GPU inference workloads (adapter + vllmworker, GHCR images) to
+# the current kubectl context. vllmworker stays Pending until the GPU node
+# group is scaled up (aws-gpu-scale) and the device plugin advertises GPUs.
+aws-deploy-inference:
+	kubectl apply -k deploy/kubernetes/overlays/aws-inference
+	kubectl -n mastori get pods -l app=inference-adapter -l app=vllmworker
+
+# Scale the GPU node group for a run (and back to 0 after). Scale to zero is
+# the cost guardrail (decision 8): `make aws-gpu-scale GPU_NODES=0` when done.
+GPU_NODES ?= 1
+aws-gpu-scale:
+	aws eks update-nodegroup-config --cluster-name $(CLUSTER_NAME) --region eu-north-1 \
+	  --nodegroup-name $(CLUSTER_NAME)-gpu \
+	  --scaling-config minSize=$(GPU_NODES),maxSize=$(GPU_NODES),desiredSize=$(GPU_NODES)
 
 # Rollout + pod state for the Milestone 1 acceptance check (all pods healthy
 # before the first traffic run).

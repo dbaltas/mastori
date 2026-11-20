@@ -85,9 +85,9 @@ Datasets: fetch dataset prompts inside the cluster (fetcher Job on the CPU pool 
 
 Only starts when: GPU quota approved, instance availability verified in eu-north-1, pricing re-checked with dated sources.
 
-1. **NVIDIA stack:** GPU Operator (or device plugin), pinned driver/CUDA versions, `dcgm-exporter` metrics, DCGM pre-run diagnostics before a GPU enters a comparison.
+1. **NVIDIA stack:** GPU Operator (or device plugin), pinned driver/CUDA versions, `dcgm-exporter` metrics, DCGM pre-run diagnostics before a GPU enters a comparison. Partial 2026-11-20 (groundwork, no cloud spend yet): GPU node group in Terraform (`infra/aws/eks.tf`, `AL2023_x86_64_NVIDIA` AMI — driver/CUDA/container toolkit ship in the AMI, scale-to-zero), NVIDIA device plugin + `dcgm-exporter` via Helm (`make aws-nvidia`), Prometheus scrape job for dcgm telemetry, `aws-inference` overlay (`overlays/aws-inference`) scheduling the adapter + vllmworker on the GPU pool. Not done: pinned driver/CUDA verification on a live node, DCGM pre-run diagnostics.
 2. **Real vLLM server Deployment:** model weights, `nvidia.com/gpu` requests, HF token secret, model cache on a PVC or object storage (not re-downloaded per pod), GPU startup/readiness probes. `cmd/vllmworker` stays a CPU-pool bridge (or sidecar) in front of it.
-3. **GPU node group** scales to zero; Budgets alert on; spot allowed with the interrupted-run-is-invalid rule.
+3. **GPU node group** scales to zero; Budgets alert on; spot allowed with the interrupted-run-is-invalid rule. Node group done 2026-11-20 (`desired=min=0`, `make aws-gpu-scale` for runs; spot available via `gpu_capacity_type`); Budgets alert still open.
 4. **Traffic generator unchanged:** same in-cluster Job calling the API ClusterIP; per-provider comparison stays network-neutral.
 5. Run the knee sweep end to end; verify GPU metrics are scraped and the run manifest records GPU model, driver, CUDA, and instance type.
 

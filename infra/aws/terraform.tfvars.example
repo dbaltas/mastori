@@ -7,3 +7,9 @@
 
 # node_instance_type = "m6g.xlarge"
 # node_count         = 1
+
+# GPU pool (Milestone 2): scales to zero by default; change max/min only when
+# quota is approved and eu-north-1 capacity is confirmed.
+# gpu_instance_types = ["g5.xlarge"]
+# gpu_node_max_count = 1
+# gpu_capacity_type  = "ON_DEMAND"  # SPOT allowed: interrupted run -> invalid

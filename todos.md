@@ -157,6 +157,16 @@ error/edge cases.
   (`3ab82c7`) — the ECR move (to bound NAT cost, with VPC endpoints) and
   digest pinning are still open; the `aws` overlay meanwhile rewrites to
   `ghcr.io/dbaltas/mastori:latest` with `imagePullPolicy: Always`.
+- [ ] **Introduce ECR (with VPC endpoints) to control image-download costs.**
+  Motivated by the 2026-11-20 g5.xlarge smoke test: `vllm/vllm-openai` is
+  ~25GB uncompressed (~10–12GB compressed over the wire from Docker Hub
+  through the NAT), plus 3.5–16GB model weights per model. Every GPU node
+  pull pays NAT data processing + egress from Docker Hub; a same-region ECR
+  pull with VPC gateway endpoints is free of NAT processing charges.
+  Scope: ECR repo(s) mirroring `ghcr.io/dbaltas/mastori/*` and the vLLM
+  base image, `ecr` VPC endpoint in the Terraform module, `aws` overlay
+  image rewrite switching to the ECR refs. Digest pinning (above) stays a
+  separate item.
 - [x] **`aws` overlay:** IRSA annotations, node sizes, region. Nothing
   app-specific in the overlay. Done 2026-11-18:
   `deploy/kubernetes/overlays/aws` — image rewrite + `Always` pull policy
@@ -184,15 +194,29 @@ error/edge cases.
 
 - [ ] **NVIDIA stack:** GPU Operator (or device plugin), pinned driver/CUDA
   versions, `dcgm-exporter` metrics, DCGM pre-run diagnostics before a GPU
-  enters a comparison.
+  enters a comparison. Partial 2026-11-20 (groundwork): GPU node group
+  Terraform-side (`infra/aws/eks.tf`, `AL2023_x86_64_NVIDIA` AMI, scale-to-
+  zero, `mastori/pool=gpu` label + `mastori/gpu` taint); NVIDIA device
+  plugin + dcgm-exporter via Helm (`make aws-nvidia`, tolerations for the
+  mastori/gpu taint, GFD labels on); Prometheus scrapes dcgm on port 9400
+  (RBAC glue in `overlays/aws-nvidia`). Still open: verify driver/CUDA on a
+  live node, pin versions, DCGM pre-run diagnostics.
 - [ ] **Real vLLM server Deployment:** model weights, `nvidia.com/gpu`
   requests, HF token secret, model cache on PVC or object storage (not
   re-downloaded per pod), GPU startup/readiness probes. `cmd/vllmworker`
-  stays a CPU-pool bridge (or sidecar) in front of it.
+  stays a CPU-pool bridge (or sidecar) in front of it. Partial 2026-11-20:
+  `overlays/aws-inference` deploys adapter + vllmworker with
+  `nvidia.com/gpu: 1` on the GPU pool (GHCR images); vllmworker stays
+  Pending until the GPU pool is scaled (`make aws-gpu-scale`). The adapter
+  backend URL still points at the kind-local Ollama endpoint.
 - [ ] **GPU node group** scales to zero; Budgets alert on; spot allowed only
-  with the interrupted-run-is-invalid rule.
+  with the interrupted-run-is-invalid rule. Node group done 2026-11-20
+  (`desired=min=0` default, ON_DEMAND; spot via `gpu_capacity_type`).
+  Budgets alert + `make destroy` teardown doc still open (Milestone 1 item).
 - [ ] Run the knee sweep end to end; verify GPU metrics are scraped and the
   run manifest records GPU model, driver, CUDA, instance type.
+- [ ] Day-1 gates before first GPU run: request GPU quota, verify g5.xlarge
+  availability in eu-north-1, dated pricing/calculator check.
 
 ## Milestone 3 — Azure, concrete
 

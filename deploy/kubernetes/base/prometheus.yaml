@@ -122,6 +122,30 @@ data:
       - job_name: prometheus
         static_configs:
           - targets: ["localhost:9090"]
+
+      # GPU telemetry (Milestone 2): dcgm-exporter pods (Helm chart) in the
+      # nvidia namespace, created by overlays/aws-nvidia on EKS. No such pods
+      # on kind; SD simply finds no targets.
+      - job_name: nvidia-dcgm
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [nvidia]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Pending|Running
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            regex: "9400"
+            action: keep
+          - target_label: job
+            replacement: nvidia-dcgm
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: instance
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
 ---
 apiVersion: v1
 kind: Service

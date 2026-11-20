@@ -63,3 +63,21 @@ variable "node_max_count" {
   type        = number
   default     = 2
 }
+
+variable "gpu_instance_types" {
+  description = "Instance types for the GPU node group. More than one when gpu_capacity_type is SPOT (AWS recommends several types for spot)."
+  type        = list(string)
+  default     = ["g5.xlarge"]
+}
+
+variable "gpu_node_max_count" {
+  description = "Maximum node count for the GPU node group. The pool scales to zero (desired=min=0) per the cost guardrails (docs/cloud-k8s-prep.md, decision 8); raise min/desired manually for a run."
+  type        = number
+  default     = 1
+}
+
+variable "gpu_capacity_type" {
+  description = "Capacity type for the GPU node group: ON_DEMAND or SPOT. Spot is allowed only under the interrupted-run-is-invalid rule (decision 9)."
+  type        = string
+  default     = "ON_DEMAND"
+}

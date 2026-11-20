@@ -1,0 +1,26 @@
+# On EKS images come from GHCR, not the node's local store (kind load).
+# Same rationale as overlays/aws/pull-policy.yaml, applied to the inference
+# deployments; digest pinning makes this patch unnecessary eventually.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-adapter
+  namespace: mastori
+spec:
+  template:
+    spec:
+      containers:
+        - name: adapter
+          imagePullPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllmworker
+  namespace: mastori
+spec:
+  template:
+    spec:
+      containers:
+        - name: vllmworker
+          imagePullPolicy: Always

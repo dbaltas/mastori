@@ -1,0 +1,28 @@
+# EKS GPU inference (Milestone 2 prep). Same inference workloads as the kind
+# inference overlay, without the fakegpu component: on EKS the AL2023 NVIDIA
+# AMI + NVIDIA device plugin (helm, make aws-nvidia) advertise the real
+# nvidia.com/gpu extended resource, and fakegpu would fight it.
+#
+# Deltas from base + components/inference:
+#  - images: EKS pulls from GHCR, not the node's local store (same rewrite
+#    as overlays/aws; digest pinning TODO, see overlays/aws/kustomization.yaml).
+#  - imagePullPolicy: Always for the inference deployments (pull-policy.yaml).
+#
+# Nothing here bills by itself: vllmworker requests nvidia.com/gpu and stays
+# Pending until a GPU node is scaled up (make aws-gpu-scale) and the device
+# plugin DaemonSet is running. The inference backend the adapter forwards to
+# is the Milestone 2 "real vLLM server Deployment" (docs/cloud-k8s-prep.md);
+# until it lands, INFERENCE_BASE_URL/OLLAMA_BASE_URL in components/inference
+# still point at the kind-local Ollama endpoint.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+components:
+  - ../../components/inference
+images:
+  - name: mastori/api
+    newName: ghcr.io/dbaltas/mastori
+    newTag: latest
+patches:
+  - path: pull-policy.yaml

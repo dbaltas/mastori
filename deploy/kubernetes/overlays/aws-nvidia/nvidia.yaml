@@ -1,0 +1,41 @@
+# NVIDIA-stack glue for the EKS GPU pool (Milestone 2 prep), applied by
+# `make aws-nvidia` before the Helm installs. The NVIDIA device plugin and
+# dcgm-exporter charts install into the nvidia namespace; Prometheus runs in
+# mastori with a namespaced Role, so it needs pods read access there to
+# discover dcgm-exporter pods (base/prometheus.yaml scrapes namespace nvidia
+# on port 9400). Requires overlays/aws (base, prometheus SA) applied first;
+# kind never applies this overlay.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvidia
+  labels:
+    app.kubernetes.io/part-of: mastori
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus
+  namespace: nvidia
+  labels:
+    app.kubernetes.io/part-of: mastori
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus
+  namespace: nvidia
+  labels:
+    app.kubernetes.io/part-of: mastori
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: mastori

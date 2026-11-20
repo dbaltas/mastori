@@ -13,6 +13,12 @@ Single concrete Terraform module for the CPU/mock-worker EKS cluster in
   internet-facing.
 - One **on-demand** Graviton node group (`m6g.xlarge`), private subnet, no
   public IPs, autoscaling 1–2 nodes.
+- One **GPU** node group (`g5.xlarge` by default), private subnet, labeled
+  `mastori/pool=gpu` and tainted `mastori/gpu=true:NoSchedule`, using the
+  EKS-optimized AL2023 NVIDIA AMI (NVIDIA driver + CUDA user-mode driver +
+  container toolkit preinstalled; `nvidia.com/gpu` is advertised by the
+  NVIDIA device plugin, installed via Helm with `make aws-nvidia`). The pool
+  **scales to zero** (`desired=min=0`): nothing bills while no run is active.
 - IAM roles for cluster and nodes, plus the OIDC provider for IRSA
   (use `irsa_oidc_issuer` output in trust policies; annotate SAs with
   `eks.amazonaws.com/role-arn`).
@@ -50,6 +56,32 @@ make aws-run-traffic     # datasets initContainer + traffic Job vs API ClusterIP
 make cluster-traffic-results   # recover JSONL + summary from the Job logs
 ```
 
+### GPU bring-up (Milestone 2 prep)
+
+The GPU pool exists from the first `terraform apply` but scales to zero, so
+it costs nothing until a run. Sequence for a GPU benchmark run:
+
+```
+make aws-deploy            # base workloads (prometheus SA for the RBAC glue)
+make aws-nvidia            # RBAC glue + NVIDIA device plugin + dcgm-exporter (Helm)
+make aws-gpu-scale         # GPU_NODES=1 (default); bill starts when nodes join
+make aws-deploy-inference  # adapter + vllmworker; vllmworker waits for a GPU
+```
+
+`aws-gpu-scale GPU_NODES=0` when the run is done — a forgotten GPU node
+bills continuously. The device plugin/dcgm-exporter DaemonSets tolerate the
+`mastori/gpu` node taint and run node-selector `mastori/pool: gpu`; with the
+pool at zero they show 0 desired pods (normal). GPU metrics (`nvidia-dcgm`
+job, port 9400) land in the in-cluster Prometheus; the env-capture
+(`make cluster-env-capture EXPERIMENT=<name>`) picks up driver/CUDA info via
+node labels from GPU Feature Discovery.
+
+Still gated before the first real GPU run (docs/cloud-k8s-prep.md):
+GPU quota approval, `g5.xlarge` availability in eu-north-1, dated pricing
+check, and the real vLLM server Deployment (model weights, HF token,
+model cache) — the current `/vllmworker` image is the CPU-pool bridge and
+the adapter config still points at the kind-local Ollama endpoint.
+
 `aws-run-traffic` takes the same `TRAFFIC_*` overrides as
 `cluster-run-traffic` (e.g. `make aws-run-traffic TRAFFIC_WORKLOAD=short
 TRAFFIC_RATE=5 TRAFFIC_DURATION=2m`). The traffic Job pins no image tag: the
@@ -82,4 +114,6 @@ with the overlay glue work.
 Roughly EKS control plane + one `m6g.xlarge` + NAT per month, on the order of
 ~$150–250/mo while running (verify with a dated calculator before relying on
 it). Configure an AWS Budgets alert (guardrail, done outside Terraform for
-now). GPU node groups with scale-to-zero come in Milestone 2.
+now). The GPU node group scales to zero, so it adds nothing while idle; a
+single `g5.xlarge` running is roughly ~$0.30–0.40/h (re-check with a dated
+calculator at Milestone 2; 2026-11-20).

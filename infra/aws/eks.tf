@@ -1,4 +1,5 @@
-# EKS control plane + one on-demand Graviton CPU node group.
+# EKS control plane + one on-demand Graviton CPU node group (Milestone 1)
+# + one scale-to-zero GPU node group (Milestone 2 prep, AL2023 NVIDIA AMI).
 # No load balancer: nothing is internet-facing. Cluster access via the
 # public endpoint restricted to admin_cidrs (or private endpoint + tunnel
 # when admin_cidrs is empty).
@@ -65,6 +66,33 @@ resource "aws_launch_template" "node" {
   }
 }
 
+resource "aws_launch_template" "gpu" {
+  name = "${var.cluster_name}-gpu"
+
+  # The AL2023 NVIDIA AMI's default root volume (~20GB) is far too small for
+  # inference serving: measured on the 2026-11-20 g5.xlarge smoke instance,
+  # the vllm/vllm-openai image alone is ~25GB uncompressed and docker storage
+  # reached 29GB with Qwen3-1.7B weights. 120GB gp3 leaves headroom for an
+  # 8B/14B-AWQ model (~16GB weights) without re-provisioning.
+  block_device_mappings {
+    device_name = "/dev/sda1"
+
+    ebs {
+      volume_size           = 120
+      volume_type           = "gp3"
+      delete_on_termination = true
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "${var.cluster_name}-gpu"
+    }
+  }
+}
+
 resource "aws_eks_node_group" "cpu" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${var.cluster_name}-cpu"
@@ -111,6 +139,66 @@ resource "aws_eks_node_group" "cpu" {
 
   tags = {
     Name = "${var.cluster_name}-cpu"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_worker,
+    aws_iam_role_policy_attachment.node_cni,
+    aws_iam_role_policy_attachment.node_ecr,
+  ]
+}
+
+# Milestone 2 GPU pool (docs/cloud-k8s-prep.md). x86 (the AL2023 NVIDIA AMI
+# has no ARM variant for g5.*), EKS-optimized AL2023 NVIDIA AMI ships the
+# NVIDIA driver, CUDA user-mode driver, and container toolkit; the NVIDIA
+# device plugin (Helm, `make aws-nvidia`) advertises nvidia.com/gpu.
+resource "aws_eks_node_group" "gpu" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.cluster_name}-gpu"
+  node_role_arn   = aws_iam_role.node.arn
+
+  # Workloads select mastori/pool: gpu (overlays/aws-inference/*).
+  labels = {
+    "mastori/pool" = "gpu"
+  }
+
+  # Only inference workloads tolerate this taint (decision: mastori/gpu=true).
+  # The device plugin/dcgm-exporter DaemonSets tolerate it via their Helm
+  # values (make aws-nvidia).
+  taint {
+    key    = "mastori/gpu"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+
+  subnet_ids = [aws_subnet.private[0].id]
+
+  # Scale to zero (decision 8): desired=min=0 so an idle GPU pool bills
+  # nothing; scale up for a run (make aws-gpu-scale) and back down after.
+  capacity_type  = var.gpu_capacity_type
+  instance_types = var.gpu_instance_types
+
+  ami_type = "AL2023_x86_64_NVIDIA"
+
+  timeouts {
+    create = "60m"
+  }
+
+  scaling_config {
+    desired_size = 0
+    min_size     = 0
+    max_size     = var.gpu_node_max_count
+  }
+
+  launch_template {
+    id = aws_launch_template.gpu.id
+    # Same pinning rationale as the CPU group above. Version 2 adds the
+    # 120GB root volume (2026-11-20 smoke-test finding).
+    version = "2"
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-gpu"
   }
 
   depends_on = [
