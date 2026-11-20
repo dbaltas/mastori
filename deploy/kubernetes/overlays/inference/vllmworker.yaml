@@ -6,7 +6,7 @@ metadata:
   labels:
     app: vllmworker
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
       app: vllmworker
@@ -54,6 +54,8 @@ spec:
             requests:
               cpu: 100m
               memory: 64Mi
+              nvidia.com/gpu: 1
             limits:
               cpu: "1"
               memory: 256Mi
+              nvidia.com/gpu: 1

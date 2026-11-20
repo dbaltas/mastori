@@ -58,13 +58,22 @@ error/edge cases.
 
 ### Kustomize refactor + pool placement
 
-- [ ] Split `deploy/kubernetes/` into kustomize base + `local` overlay.
+- [x] Split `deploy/kubernetes/` into kustomize base + `local` overlay.
   NodePort + `extraPortMappings` stay in the `local` overlay only;
   `make cluster-up && make cluster-deploy` must behave identically on kind.
-- [ ] Add `nodeSelector`/tolerations/topology spread to every workload (API,
+  Done 2026-11-19: `deploy/kubernetes/base` + `overlays/{local,inference,aws}`.
+- [x] Add `nodeSelector`/tolerations/topology spread to every workload (API,
   Redis, scheduler, mock workers, observability). GPU nodes get the
   `mastori/gpu: true` taint; only inference workloads tolerate it. Verify
-  placement on kind with the existing labeled nodes.
+  placement on kind with the existing labeled nodes. Done 2026-11-19
+  (kustomize refactor commit); GPU-pool taints applied by `make cluster-up`.
+- [x] Fake NVIDIA devices for the kind GPU pool: `cmd/fakegpu` +
+  `internal/fakegpu` DaemonSet (`overlays/inference/fakegpu.yaml`) patches
+  node status allocatable with `nvidia.com/gpu` and re-asserts it every
+  2s (kubelet rewrites node status ~every 10s and drops extended resources
+  it does not manage); `vllmworker` requests/limits
+  `nvidia.com/gpu: 1`, replicas 1. Unit tests in `internal/fakegpu`;
+  fast CI renders the overlay (`make kustomize-verify`). Done 2026-11-19.
 
 ### Export / teardown loop
 

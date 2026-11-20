@@ -3,8 +3,10 @@
 # Topology mirrors the cloud design: a control-plane plus a CPU pool
 # (API, scheduler, Redis, Prometheus, Grafana, mock workers, traffic
 # generator) and a GPU pool (vLLM workers and the inference adapter;
-# labeled now, backed by fake NVIDIA devices later). GPU workers carry
-# the mastori/gpu taint so only inference workloads tolerate them.
+# backed by the fakegpu DaemonSet, which advertises fake nvidia.com/gpu
+# extended resources since kind nodes have no NVIDIA hardware). GPU
+# workers carry the mastori/gpu taint so only inference workloads
+# tolerate them.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: mastori
