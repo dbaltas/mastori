@@ -3,22 +3,36 @@
 Single concrete Terraform module for the CPU/mock-worker EKS cluster in
 `eu-north-1`. No provider abstraction (see `docs/cloud-k8s-prep.md`, decision 4).
 
+This is the **ephemeral** layer: destroy between experiment series. The image
+registry lives in the separate long-lived module `infra/aws-ecr` (own state)
+and is read here via a data source (`ecr.tf`); `terraform destroy` in this
+directory never touches it.
+
 ## What it creates
 
 - VPC with one private subnet per AZ in `eu-north-1a`/`eu-north-1b`; workloads
   run in `a`, subnet `b` exists to satisfy the EKS 2-AZ requirement.
-- One NAT Gateway + EIP for outbound (image pulls, AWS APIs). Keep images in
-  ECR in-region to bound NAT cost.
+- One NAT Gateway + EIP for outbound (image pulls, AWS APIs). Image pulls from
+  ECR **bypass the NAT gateway** via VPC endpoints (`ecr.api` + `ecr.dkr`
+  interface endpoints in azs[0] only, plus the free S3 gateway endpoint —
+  image layers are stored in S3). Without the endpoints a same-region ECR
+  pull would still bill NAT data processing, defeating the registry's purpose.
 - EKS control plane with API/audit logging. No load balancer, nothing
   internet-facing.
 - One **on-demand** Graviton node group (`m6g.xlarge`), private subnet, no
   public IPs, autoscaling 1–2 nodes.
-- One **GPU** node group (`g5.xlarge` by default), private subnet, labeled
-  `mastori/pool=gpu` and tainted `mastori/gpu=true:NoSchedule`, using the
-  EKS-optimized AL2023 NVIDIA AMI (NVIDIA driver + CUDA user-mode driver +
-  container toolkit preinstalled; `nvidia.com/gpu` is advertised by the
-  NVIDIA device plugin, installed via Helm with `make aws-nvidia`). The pool
-  **scales to zero** (`desired=min=0`): nothing bills while no run is active.
+- One **GPU** node group (`g6.xlarge` by default — **g5.\* is not offered in
+  eu-north-1a**, verified via instance-type offerings 2026-11-21; g6.xlarge
+  is 4 vCPU / 16GB, the same shape as g5.xlarge, do not assume 8/32), private
+  subnet, labeled `mastori/pool=gpu` and tainted `mastori/gpu=true:NoSchedule`,
+  using the EKS-optimized AL2023 NVIDIA AMI (NVIDIA driver + CUDA user-mode
+  driver + container toolkit preinstalled; `nvidia.com/gpu` is advertised by
+  the NVIDIA device plugin, installed via Helm with `make aws-nvidia`). The
+  GPU launch template maps a 120GB gp3 root to **/dev/xvda** — the AL2023 EKS
+  AMI roots there; a /dev/sda1 mapping attaches an unused second disk instead
+  of growing root (observed live 2026-11-21; fixed in LT v2, pin
+  `version = "2"`). The pool **scales to zero** (`desired=min=0`): nothing
+  bills while no run is active.
 - IAM roles for cluster and nodes, plus the OIDC provider for IRSA
   (use `irsa_oidc_issuer` output in trust policies; annotate SAs with
   `eks.amazonaws.com/role-arn`).
@@ -34,6 +48,13 @@ aws eks update-kubeconfig --name mastori --region eu-north-1
 kubectl -n mastori port-forward svc/api 8080:8080
 kubectl -n mastori port-forward svc/grafana 7030:3000
 ```
+
+Gotchas seen live: `admin_cidrs` must hold the *current* public IP
+(`curl https://checkip.amazonaws.com`) — a stale IP looks like timeouts; and
+on DNS64/IPv6-capable local networks kubectl may dial the DNS64-synthesized
+`64:ff9b::` address that `publicAccessCidrs` cannot allow-list (force IPv4
+via hosts entry or another network when `kubectl` stalls but `curl -4` to
+the endpoint works).
 
 ## Apply / destroy
 
@@ -77,10 +98,13 @@ job, port 9400) land in the in-cluster Prometheus; the env-capture
 node labels from GPU Feature Discovery.
 
 Still gated before the first real GPU run (docs/cloud-k8s-prep.md):
-GPU quota approval, `g5.xlarge` availability in eu-north-1, dated pricing
-check, and the real vLLM server Deployment (model weights, HF token,
-model cache) — the current `/vllmworker` image is the CPU-pool bridge and
-the adapter config still points at the kind-local Ollama endpoint.
+GPU quota approval, dated pricing check (g6.xlarge ~$0.80/h, re-verify), and
+an end-to-end verification of the vLLM server Deployment
+(`overlays/aws-inference/vllm-server.yaml` — manifest written 2026-11-21,
+not yet verified serving; see the GPU node learnings checklist in
+todos.md for the bring-up order and known pitfalls). The `/vllmworker`
+bridge calls the vLLM Service directly on EKS (the Ollama adapter from
+components/inference is deployed but unused in the cloud path).
 
 `aws-run-traffic` takes the same `TRAFFIC_*` overrides as
 `cluster-run-traffic` (e.g. `make aws-run-traffic TRAFFIC_WORKLOAD=short
@@ -115,5 +139,5 @@ Roughly EKS control plane + one `m6g.xlarge` + NAT per month, on the order of
 ~$150–250/mo while running (verify with a dated calculator before relying on
 it). Configure an AWS Budgets alert (guardrail, done outside Terraform for
 now). The GPU node group scales to zero, so it adds nothing while idle; a
-single `g5.xlarge` running is roughly ~$0.30–0.40/h (re-check with a dated
-calculator at Milestone 2; 2026-11-20).
+single `g6.xlarge` (L4) running is roughly ~$0.80/h on-demand (re-check with
+a dated calculator at Milestone 2; 2026-11-21).

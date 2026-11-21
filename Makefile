@@ -1,8 +1,9 @@
 CLUSTER_NAME := mastori
 
 AWS_DIR := infra/aws
+AWS_ECR_DIR := infra/aws-ecr
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-kubeconfig aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
@@ -98,6 +99,35 @@ aws-apply:
 aws-destroy:
 	cd $(AWS_DIR) && terraform destroy
 
+# Long-lived ECR layer (infra/aws-ecr, separate state): survives
+# aws-destroy; only torn down deliberately after an experiment series.
+aws-ecr-init:
+	cd $(AWS_ECR_DIR) && terraform init
+
+aws-ecr-plan:
+	cd $(AWS_ECR_DIR) && terraform plan
+
+aws-ecr-apply:
+	cd $(AWS_ECR_DIR) && terraform apply
+
+aws-ecr-destroy:
+	cd $(AWS_ECR_DIR) && terraform destroy
+
+# Refresh the ECR push token (12h) and (re)run the in-cluster mirror jobs
+# (deploy/kubernetes/overlays/aws/mirror-jobs.yaml). Run after the long-lived
+# ECR layer is applied; jobs fetch vllm + weights into mastori/vllm and
+# mastori/weights once — later node pulls go over the VPC endpoints NAT-free.
+aws-mirror-images:
+	aws ecr get-login-password --region eu-north-1 > /tmp/kilo/ecr-token
+	kubectl -n mastori create secret generic ecr-push-creds \
+	  --from-literal=username=AWS \
+	  --from-file=password=/tmp/kilo/ecr-token \
+	  --dry-run=client -o yaml | kubectl apply -f -
+	rm /tmp/kilo/ecr-token
+	kubectl -n mastori delete job mirror-vllm bake-weights --ignore-not-found
+	kubectl apply -f deploy/kubernetes/overlays/aws/mirror-jobs.yaml
+	kubectl -n mastori get pods -l app=mastori-mirror
+
 aws-kubeconfig:
 	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region eu-north-1
 
@@ -123,10 +153,12 @@ aws-nvidia:
 	helm upgrade --install nvdp nvdp/nvidia-device-plugin -n nvidia \
 	  --set gfd.enabled=true \
 	  --set-json 'tolerations=$(NVIDIA_TOLERATIONS)' \
-	  --set-json 'nodeSelector={"mastori/pool":"gpu"}'
+	  --set-json 'nodeSelector={"mastori/pool":"gpu"}' \
+	  --set-json 'nfd.worker.tolerations=[{"key":"mastori/gpu","operator":"Exists","effect":"NoSchedule"},{"operator":"Exists"}]'
 	helm upgrade --install dcgm-exporter nvidia-dcgm/dcgm-exporter -n nvidia \
 	  --set-json 'tolerations=$(NVIDIA_TOLERATIONS)' \
-	  --set-json 'nodeSelector={"mastori/pool":"gpu"}'
+	  --set-json 'nodeSelector={"mastori/pool":"gpu"}' \
+	  --set serviceMonitor.enabled=false
 	kubectl -n nvidia get ds
 
 # Applies the GPU inference workloads (adapter + vllmworker, GHCR images) to

@@ -113,3 +113,60 @@ resource "aws_route_table_association" "private" {
   subnet_id      = aws_subnet.private[count.index].id
   route_table_id = aws_route_table.private.id
 }
+
+# VPC endpoints for ECR pulls: image layers are stored in S3, so the free S3
+# gateway endpoint + the two ECR interface endpoints let nodes pull images
+# (and weights baked into images) without traversing the NAT gateway. This is
+# what makes the long-lived infra/aws-ecr registry actually save NAT cost —
+# a public-endpoint pull would still bill NAT data processing either way.
+# Only azs[0] (the workload AZ) gets the interface endpoints; azs[1] hosts no
+# pods, so paying for a second pair would buy nothing.
+resource "aws_security_group" "endpoints" {
+  name_prefix = "${var.cluster_name}-vpce-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "HTTPS to the endpoints from inside the VPC"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-vpce"
+  }
+}
+
+locals {
+  ecr_endpoint_services = {
+    api = "com.amazonaws.${var.region}.ecr.api"
+    dkr = "com.amazonaws.${var.region}.ecr.dkr"
+  }
+}
+
+resource "aws_vpc_endpoint" "ecr" {
+  for_each = local.ecr_endpoint_services
+
+  vpc_id              = aws_vpc.main.id
+  service_name        = each.value
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private[0].id]
+  security_group_ids  = [aws_security_group.endpoints.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.cluster_name}-ecr-${each.key}"
+  }
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+
+  tags = {
+    Name = "${var.cluster_name}-s3"
+  }
+}

@@ -23,6 +23,11 @@ output "node_role_arn" {
   value       = aws_iam_role.node.arn
 }
 
+output "ecr_repository_url" {
+  description = "URL of the long-lived ECR image repository (infra/aws-ecr)."
+  value       = data.aws_ecr_repository.images.repository_url
+}
+
 output "vpc_id" {
   description = "VPC holding the cluster."
   value       = aws_vpc.main.id

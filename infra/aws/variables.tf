@@ -10,6 +10,12 @@ variable "cluster_name" {
   default     = "mastori"
 }
 
+variable "ecr_repository_name" {
+  description = "Name of the ECR repository managed by infra/aws-ecr (long-lived, separate state)."
+  type        = string
+  default     = "mastori"
+}
+
 variable "cluster_version" {
   description = "EKS Kubernetes version."
   type        = string
@@ -65,9 +71,9 @@ variable "node_max_count" {
 }
 
 variable "gpu_instance_types" {
-  description = "Instance types for the GPU node group. More than one when gpu_capacity_type is SPOT (AWS recommends several types for spot)."
+  description = "Instance types for the GPU node group. More than one when gpu_capacity_type is SPOT (AWS recommends several types for spot). g5.* is NOT offered in eu-north-1a (verified 2026-11-21 via instance-type offerings); the default is g6.xlarge (L4, 24GB, bf16-capable), offered in 1a alongside g4dn.* and g6e.*."
   type        = list(string)
-  default     = ["g5.xlarge"]
+  default     = ["g6.xlarge"]
 }
 
 variable "gpu_node_max_count" {

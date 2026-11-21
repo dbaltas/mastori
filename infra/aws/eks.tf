@@ -74,8 +74,11 @@ resource "aws_launch_template" "gpu" {
   # the vllm/vllm-openai image alone is ~25GB uncompressed and docker storage
   # reached 29GB with Qwen3-1.7B weights. 120GB gp3 leaves headroom for an
   # 8B/14B-AWQ model (~16GB weights) without re-provisioning.
+  # Device name: the AL2023 EKS AMI roots on /dev/xvda. A /dev/sda1 mapping
+  # does not resize root — it attaches a second, unused 120GB disk (observed
+  # live 2026-11-21: node showed 20GB ephemeral with the 120GB idle).
   block_device_mappings {
-    device_name = "/dev/sda1"
+    device_name = "/dev/xvda"
 
     ebs {
       volume_size           = 120
@@ -192,8 +195,9 @@ resource "aws_eks_node_group" "gpu" {
 
   launch_template {
     id = aws_launch_template.gpu.id
-    # Same pinning rationale as the CPU group above. Version 2 adds the
-    # 120GB root volume (2026-11-20 smoke-test finding).
+    # Same pinning rationale as the CPU group above. v2 re-points the 120GB
+    # gp3 root volume at /dev/xvda (the AMI's actual root device; v1 under
+    # /dev/sda1 attached an unused second disk).
     version = "2"
   }
 
