@@ -157,16 +157,27 @@ error/edge cases.
   (`3ab82c7`) — the ECR move (to bound NAT cost, with VPC endpoints) and
   digest pinning are still open; the `aws` overlay meanwhile rewrites to
   `ghcr.io/dbaltas/mastori:latest` with `imagePullPolicy: Always`.
-- [ ] **Introduce ECR (with VPC endpoints) to control image-download costs.**
+- [x] **Introduce ECR (with VPC endpoints) to control image-download costs.**
   Motivated by the 2026-11-20 g5.xlarge smoke test: `vllm/vllm-openai` is
   ~25GB uncompressed (~10–12GB compressed over the wire from Docker Hub
   through the NAT), plus 3.5–16GB model weights per model. Every GPU node
   pull pays NAT data processing + egress from Docker Hub; a same-region ECR
   pull with VPC gateway endpoints is free of NAT processing charges.
-  Scope: ECR repo(s) mirroring `ghcr.io/dbaltas/mastori/*` and the vLLM
-  base image, `ecr` VPC endpoint in the Terraform module, `aws` overlay
-  image rewrite switching to the ECR refs. Digest pinning (above) stays a
-  separate item.
+  Done 2026-11-21: long-lived module `infra/aws-ecr` (own state, survives
+  `aws-destroy`) with repos `mastori`, `mastori/vllm`, `mastori/weights`;
+  `infra/aws` reads the repo via data source and creates `ecr.api`/`ecr.dkr`
+  interface endpoints (azs[0] only) + the free S3 gateway endpoint; `aws`/
+  `aws/traffic`/`aws-inference` overlays rewritten to ECR refs. Validated
+  live: base workloads pulled from ECR with **zero** NAT-gateway bytes
+  during the pull window (pulls bypass NAT via the endpoints). Heavy images
+  mirrored once from inside the cluster (`overlays/aws/mirror-jobs.yaml`,
+  `make aws-mirror-images`): `vllm-openai:v0.34.0` 11.3GB, Qwen3-4B weights
+  6.3GB — one-time NAT in ≈ $0.83 + endpoint processing ≈ $0.19; registry
+  storage ≈ $1.80/mo. Digest pinning (above) stays a separate item.
+  Open: switch `docker-publish.yml` CI to ECR (needs AWS creds in Actions;
+  GHCR remains the fallback), and re-check the NAT CloudWatch metrics
+  anomaly (datapoints stayed empty even during the mirror window — routing
+  leaves only the NAT as internet egress, so topology is the proof).
 - [x] **`aws` overlay:** IRSA annotations, node sizes, region. Nothing
   app-specific in the overlay. Done 2026-11-18:
   `deploy/kubernetes/overlays/aws` — image rewrite + `Always` pull policy
@@ -209,6 +220,37 @@ error/edge cases.
   `nvidia.com/gpu: 1` on the GPU pool (GHCR images); vllmworker stays
   Pending until the GPU pool is scaled (`make aws-gpu-scale`). The adapter
   backend URL still points at the kind-local Ollama endpoint.
+  Partial 2026-11-21: real vLLM server wired in `overlays/aws-inference`
+  (`vllm-server.yaml`: ECR `mastori/vllm:v0.34.0`, Qwen3-4B weights exported
+  from the ECR weights image by an initContainer into an emptyDir, served
+  OpenAI-compatible on `vllm:8000`; bridge `vllmworker` calls it directly,
+  GPU-unclaimed). Not yet verified end to end: first bring-up was killed by
+  the root-volume bug (see GPU node learnings) and the stack was torn down
+  before the fix could prove out. Next run order: `aws-apply`, `aws-nvidia`,
+  `aws-gpu-scale GPU_NODES=1`, `aws-deploy-inference`, then verify
+  `vllm` /health + one `/v1/chat/completions` before any traffic.
+  **GPU node learnings (2026-11-21 run 1) — first-thing check-list:**
+  - g5.* is NOT offered in eu-north-1a (11-20 smoke test ran elsewhere);
+    default is g6.xlarge (L4, 24GB) — and g6.xlarge is 4 vCPU / 16GB, same
+    shape as g5.xlarge (verified via describe-instance-types; don't assume
+    8/32). Node allocatable: ~3920m CPU, ~14.4Gi — size pods for that.
+  - LT root volume: AL2023 EKS AMI roots on /dev/xvda; a /dev/sda1 mapping
+    attaches an unused second disk instead of growing root → 20GB ephemeral
+    and kubelet evictions. Fixed in `infra/aws/eks.tf` (LT v2, /dev/xvda
+    120GB) but UNVERIFIED — confirm `kubectl get node <gpu>` capacity ≈ 120GB
+    before re-running anything heavy.
+  - NFD worker (nvdp chart) must tolerate the mastori/gpu taint or the GPU
+    labels never land and the device-plugin DaemonSet never schedules
+    (chicken-and-egg). Fixed via `nfd.worker.tolerations` in `make aws-nvidia`.
+  - dcgm-exporter needs `serviceMonitor.enabled=false` (no Prometheus-Operator
+    CRDs in this stack). Fixed in `make aws-nvidia`.
+  - The vllmworker bridge must NOT request nvidia.com/gpu (JSON6902 unclaim
+    in overlays/aws-inference) — the GPU belongs to the vllm server pod.
+  - Pods cannot reach IMDS (hop limit 1): ECR auth inside pods comes from the
+    `ecr-push-creds` secret (12h token; `make aws-mirror-images` refreshes).
+  - Rolling updates of GPU-pod deployments deadlock (new pod waits for the
+    GPU the old pod holds): recycle with `scale --replicas=0` → delete pods
+    → `scale --replicas=1` instead of waiting on a hung rollout.
 - [ ] **GPU node group** scales to zero; Budgets alert on; spot allowed only
   with the interrupted-run-is-invalid rule. Node group done 2026-11-20
   (`desired=min=0` default, ON_DEMAND; spot via `gpu_capacity_type`).
@@ -217,6 +259,21 @@ error/edge cases.
   run manifest records GPU model, driver, CUDA, instance type.
 - [ ] Day-1 gates before first GPU run: request GPU quota, verify g5.xlarge
   availability in eu-north-1, dated pricing/calculator check.
+  Update 2026-11-21: gate resolved by substitution — g5.* unavailable in
+  1a, GPU default is g6.xlarge (L4); dated calculator check still open
+  (~$0.80/h on-demand L4, re-verify before relying on it). Knee-cap
+  experiment plumbing is ready: one GPU node
+  (`make aws-gpu-scale GPU_NODES=1`), vllm + qwen3-4b weights already in
+  ECR (no HF/Docker Hub downloads on nodes), `overlays/aws/traffic`
+  rewritten to ECR. Run recipe: scale GPU to 1, `make aws-deploy-inference`,
+  scale mockworker to 0 (`kubectl -n mastori scale deploy/mockworker
+  --replicas=0` — its empty WORKER_MODELS registry entry matches EVERY
+  model and would steal GPU traffic), then
+  `make aws-run-traffic TRAFFIC_MODEL=qwen3-4b TRAFFIC_WORKLOAD=short
+  TRAFFIC_STEPS="5:60s,10:60s,20:60s,40:60s,80:60s" TRAFFIC_WARMUP=1m`
+  (TRAFFIC_STEPS is supported by cmd/traffic applyEnv). Scale GPU back to
+  0 right after. Open: INFERENCE_MAX_TOKENS cap so worker outputs match
+  the mock token budgets used by the knee analysis.
 
 ## Milestone 3 — Azure, concrete
 
