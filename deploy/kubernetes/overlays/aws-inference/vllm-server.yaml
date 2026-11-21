@@ -1,0 +1,152 @@
+# Real vLLM server on the GPU pool (cloud-specific: ECR images from the
+# long-lived infra/aws-ecr registry). The weights image
+# (mastori/weights:qwen3-4b) is exported into an emptyDir by an initContainer
+# (crane streams the flattened layers out of the registry — the pull runs
+# over the VPC endpoints, NAT-free) and the vLLM container serves it from
+# disk, so a GPU node boot needs no Hugging Face download.
+#
+# vllmworker (components/inference) points INFERENCE_BASE_URL at the vllm
+# Service directly: vLLM serves the OpenAI-compatible API natively, so the
+# Ollama-translation adapter is not in the cloud path.
+#
+# The weights image layout: the baked Qwen3-4B files sit at the image ROOT
+# (crane append of the /work/weights tar; the bake job's own manifest
+# confirms). The initContainer exports the flattened image into the emptyDir
+# mounted at /models, and vLLM serves --model /models directly.
+#
+# Serving: --served-model-name qwen3-4b keeps job model names short and
+# stable across model-image changes; --max-model-len bounds KV-cache
+# allocation so the L4's 24GB leaves headroom for concurrency.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: mastori
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      nodeSelector:
+        mastori/pool: gpu
+      tolerations:
+        - key: mastori/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      initContainers:
+        - name: weights
+          image: public.ecr.aws/docker/library/alpine:3.21
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache curl tar >/dev/null
+              # ECR auth: pods cannot reach IMDS (hop limit 1), so the token
+              # comes from the ecr-push-creds secret (12h validity; refresh
+              # with make aws-mirror-images). Pulls are read-only.
+              mkdir -p /tmp/dockercfg
+              printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" \
+                "$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 | tr -d '\n')" \
+                > /tmp/dockercfg/config.json
+              export DOCKER_CONFIG=/tmp/dockercfg
+              case $(uname -m) in
+                aarch64) CRANE_ARCH=arm64 ;;
+                x86_64)  CRANE_ARCH=x86_64 ;;
+                *) CRANE_ARCH=$(uname -m) ;;
+              esac
+              curl -fsSL -o /tmp/pkg.tgz \
+                "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$CRANE_ARCH.tar.gz"
+              tar xzf /tmp/pkg.tgz -C /tmp crane && chmod +x /tmp/crane
+              /tmp/crane export \
+                273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/weights:qwen3-4b \
+                - | tar xf - -C /models
+              test -f /models/model.safetensors.index.json
+              du -sh /models
+          env:
+            - name: AWS_REGION
+              value: eu-north-1
+            - name: REGISTRY
+              value: 273354666694.dkr.ecr.eu-north-1.amazonaws.com
+            - name: ECR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ecr-push-creds
+                  key: password
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: vllm
+          image: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/vllm:v0.34.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --model
+            - /models
+            - --served-model-name
+            - qwen3-4b
+            - --max-model-len
+            - "8192"
+          ports:
+            - containerPort: 8000
+              name: http
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          resources:
+            # g6.xlarge allocatable: 3920m CPU, 14.4Gi memory, 1x L4 (24GB).
+            # vLLM is GPU-bound; CPU RAM holds the weight load + process
+            # overhead, KV cache lives in VRAM (--gpu-memory-utilization).
+            requests:
+              cpu: "2"
+              memory: 6Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "3"
+              memory: 10Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          emptyDir:
+            sizeLimit: 12Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: mastori
+spec:
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

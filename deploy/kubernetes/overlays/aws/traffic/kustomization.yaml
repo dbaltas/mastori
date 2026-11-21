@@ -1,6 +1,6 @@
 # Traffic Job for EKS. Reuses deploy/kubernetes/traffic-job.yaml (kept out of
 # the main kustomizations so `cluster-deploy` never starts a run as a side
-# effect); this overlay only rewrites the image to GHCR and forces a pull,
+# effect); this overlay only rewrites the image to ECR and forces a pull,
 # mirroring the parent overlays/aws kustomization. Applied by
 # `make aws-run-traffic`; the datasets-manifest and traffic-config ConfigMaps
 # are (re)created by that target before the Job is applied.
@@ -10,7 +10,7 @@ resources:
   - traffic-job.yaml
 images:
   - name: mastori/api
-    newName: ghcr.io/dbaltas/mastori
+    newName: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori
     newTag: latest
 patches:
   - path: pull-policy.yaml

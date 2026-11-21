@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-config
+  namespace: mastori
+data:
+  INFERENCE_MODEL: "qwen3-4b"

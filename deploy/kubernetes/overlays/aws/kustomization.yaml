@@ -3,9 +3,12 @@
 #
 # Only two deltas from base:
 #  - images: kind loads mastori/api:latest into the node's local store, but
-#    EKS nodes pull from a registry. Rewrite to the published GHCR image.
-#    TODO(digest pinning): pin by digest once CI publishes; `latest` is a
-#    knowingly mutable tag kept until the digest-pinning item lands.
+#    EKS nodes pull from a registry. Rewrite to the ECR image (273354666694
+#    .dkr.ecr.eu-north-1.amazonaws.com/mastori, long-lived module
+#    infra/aws-ecr): in-region + VPC-endpoint pulls (no NAT billing), and
+#    nodes pull with their node role, no extra auth. TODO(digest pinning):
+#    pin by digest once CI publishes; `latest` is a knowingly mutable tag
+#    kept until the digest-pinning item lands.
 #  - imagePullPolicy: Always (see pull-policy.yaml).
 #
 # Nothing else: no NodePort (access is port-forward only), no tolerations on
@@ -16,7 +19,7 @@ resources:
   - ../../base
 images:
   - name: mastori/api
-    newName: ghcr.io/dbaltas/mastori
+    newName: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori
     newTag: latest
 patches:
   - path: pull-policy.yaml

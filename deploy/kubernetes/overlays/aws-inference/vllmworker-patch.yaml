@@ -1,0 +1,31 @@
+# Cloud deltas for the vllmworker bridge:
+#  - INFERENCE_BASE_URL -> the real vLLM Service (no Ollama adapter in the
+#    cloud path; vLLM serves the OpenAI-compatible API natively).
+#  - WORKER_MODELS: registers for qwen3-4b so the scheduler routes GPU-model
+#    jobs here; "default" also routes because the API's DEFAULT_MODEL is
+#    "default" and the worker falls back to INFERENCE_MODEL per job.
+#  - INFERENCE_MODEL: fallback model sent to vLLM when the job says "default".
+#    Patched here too because the ConfigMap patch only updates the ConfigMap,
+#    while components/inference hardcodes the env in the Deployment.
+#
+# The GPU request from components/inference (fakegpu's mechanism) must NOT
+# apply here: the worker is a CPU bridge making HTTP calls and the L4 belongs
+# to the vllm server. Strategic merge cannot delete map keys, so the
+# nvidia.com/gpu removal is a JSON6902 patch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllmworker
+  namespace: mastori
+spec:
+  template:
+    spec:
+      containers:
+        - name: vllmworker
+          env:
+            - name: INFERENCE_BASE_URL
+              value: "http://vllm.mastori.svc.cluster.local:8000"
+            - name: WORKER_MODELS
+              value: "default,qwen3-4b"
+            - name: INFERENCE_MODEL
+              value: "qwen3-4b"

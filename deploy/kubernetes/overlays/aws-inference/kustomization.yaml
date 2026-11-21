@@ -1,28 +1,48 @@
-# EKS GPU inference (Milestone 2 prep). Same inference workloads as the kind
-# inference overlay, without the fakegpu component: on EKS the AL2023 NVIDIA
-# AMI + NVIDIA device plugin (helm, make aws-nvidia) advertise the real
-# nvidia.com/gpu extended resource, and fakegpu would fight it.
+# EKS GPU inference (Milestone 2). Same inference workloads as the kind
+# inference overlay, without the fakegpu component: on EKS the NVIDIA AMI
+# (g6.xlarge, AL2023 NVIDIA AMI) + NVIDIA device plugin (helm, make
+# aws-nvidia) advertise the real nvidia.com/gpu extended resource, and
+# fakegpu would fight it.
 #
 # Deltas from base + components/inference:
-#  - images: EKS pulls from GHCR, not the node's local store (same rewrite
-#    as overlays/aws; digest pinning TODO, see overlays/aws/kustomization.yaml).
+#  - images: EKS pulls from the long-lived ECR registry (same rewrite as
+#    overlays/aws; digest pinning TODO, see overlays/aws/kustomization.yaml).
 #  - imagePullPolicy: Always for the inference deployments (pull-policy.yaml).
+#  - vllm server (vllm-server.yaml): the real vLLM backend (mastori/vllm
+#    image + Qwen3-4B weights exported from mastori/weights into an
+#    emptyDir), served OpenAI-compatible on vllm:8000.
+#  - vllmworker-patch.yaml: the bridge worker calls the vLLM Service
+#    directly (no Ollama adapter in the cloud path) and registers for the
+#    qwen3-4b model so the scheduler routes GPU jobs to it.
+#  - inference-config-patch.yaml: default inference model = qwen3-4b.
 #
-# Nothing here bills by itself: vllmworker requests nvidia.com/gpu and stays
-# Pending until a GPU node is scaled up (make aws-gpu-scale) and the device
-# plugin DaemonSet is running. The inference backend the adapter forwards to
-# is the Milestone 2 "real vLLM server Deployment" (docs/cloud-k8s-prep.md);
-# until it lands, INFERENCE_BASE_URL/OLLAMA_BASE_URL in components/inference
-# still point at the kind-local Ollama endpoint.
+# Nothing here bills by itself: vllmworker/vllm request nvidia.com/gpu and
+# stay Pending until a GPU node is scaled up (make aws-gpu-scale) and the
+# device plugin DaemonSet is running. The Ollama adapter from
+# components/inference still deploys (shared component) but is unused on
+# EKS: point its OLLAMA_BASE_URL at a real Ollama instance only when needed.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+  - vllm-server.yaml
 components:
   - ../../components/inference
 images:
   - name: mastori/api
-    newName: ghcr.io/dbaltas/mastori
+    newName: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori
     newTag: latest
 patches:
   - path: pull-policy.yaml
+  - path: inference-config-patch.yaml
+  - path: vllmworker-patch.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: vllmworker
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/resources/requests/nvidia.com~1gpu
+      - op: remove
+        path: /spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu

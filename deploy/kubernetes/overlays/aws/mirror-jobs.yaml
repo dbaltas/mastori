@@ -1,0 +1,125 @@
+# One-time mirror jobs: pull the heavy images into the long-lived ECR
+# registry from inside the cluster (fast AWS uplink), so later node pulls
+# run over the VPC endpoints with no NAT billing.
+#  - mirror-vllm: skopeo streams vllm/vllm-openai:v0.34.0 Docker Hub -> ECR
+#    (no local disk needed for the ~11GB; one-time NAT egress from the node).
+#  - bake-weights: downloads Qwen/Qwen3-4B from Hugging Face, tars it, and
+#    pushes a scratch-based weights image with crane.
+# Both need ECR push creds (secret ecr-push-creds, 12h token) and are
+# recreated with `make aws-mirror-images` when the token expires.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mirror-vllm
+  namespace: mastori
+  labels:
+    app: mastori-mirror
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: mastori-mirror
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: skopeo
+          image: public.ecr.aws/docker/library/alpine:3.21
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache skopeo >/dev/null
+              skopeo --version
+              skopeo copy \
+                --retry-times 8 \
+                docker://docker.io/vllm/vllm-openai:v0.34.0 \
+                docker://273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/vllm:v0.34.0 \
+                --dest-creds "AWS:$ECR_PASSWORD"
+              echo MIRROR-OK
+          env:
+            - name: ECR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ecr-push-creds
+                  key: password
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "2", memory: 4Gi }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bake-weights
+  namespace: mastori
+  labels:
+    app: mastori-mirror
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: mastori-mirror
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bake
+          image: public.ecr.aws/docker/library/alpine:3.21
+          workingDir: /work
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              apk add --no-cache curl tar >/dev/null
+              mkdir -p /work/weights /work/bin /work/dockercfg
+              base=https://huggingface.co/Qwen/Qwen3-4B/resolve/main
+              for f in config.json generation_config.json merges.txt \
+                       model-00001-of-00003.safetensors \
+                       model-00002-of-00003.safetensors \
+                       model-00003-of-00003.safetensors \
+                       model.safetensors.index.json \
+                       tokenizer.json tokenizer_config.json vocab.json; do
+                echo "fetching $f"
+                curl -fsSL -o "/work/weights/$f" "$base/$f"
+              done
+              du -sh /work/weights
+              case $(uname -m) in
+                aarch64) CRANE_ARCH=arm64 ;;
+                x86_64)  CRANE_ARCH=x86_64 ;;
+                *) CRANE_ARCH=$(uname -m) ;;
+              esac
+              curl -fsSL -o /work/bin/pkg.tgz \
+                "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$CRANE_ARCH.tar.gz"
+              tar xzf /work/bin/pkg.tgz -C /work/bin crane && chmod +x /work/bin/crane
+              printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" \
+                "$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 -w 0)" \
+                > /work/dockercfg/config.json
+              export DOCKER_CONFIG=/work/dockercfg
+              tar cf - -C /work/weights . \
+                | /work/bin/crane append \
+                  -f - \
+                  -t "$REGISTRY/mastori/weights:qwen3-4b"
+              /work/bin/crane digest "$REGISTRY/mastori/weights:qwen3-4b" \
+                && echo WEIGHTS-OK
+          env:
+            - name: ECR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ecr-push-creds
+                  key: password
+            - name: REGISTRY
+              value: 273354666694.dkr.ecr.eu-north-1.amazonaws.com
+          resources:
+            requests: { cpu: "1", memory: 6Gi }
+            limits: { cpu: "4", memory: 12Gi }
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: 12Gi
