@@ -297,6 +297,28 @@ error/edge cases.
   runner handles (retry/backoff) instead of failing runs? 2026-11-22 GPU
   samples showed full-GPU bursts then idle — measure whether request
   queuing smooths that or dumps bursts straight onto the GPU.
+- [ ] **GPU/vLLM knee sweep 2026-11-22 (exploratory) — done, findings in
+  `benchmark/results/20261122-eks-gpu-vllm-knee/runs/MANIFEST.md`.**
+  Real vLLM + Qwen3-4B on g6.xlarge L4: flat floor through ~1-2K offered
+  (p50 ~630ms, TTFT ~36ms), knee between 10K and 20K (completion 100%→~50%),
+  no strong forward/reverse hysteresis; L4 ceiling ~19K prefill / ~12.2K
+  decode tok/s (client-side); failure taxonomy mapped (429 admission cap,
+  503 Redis pool starvation, dial-refused bursts, deep-queue OOMs).
+  Open items from it:
+  - [ ] Deploy REDIS_POOL_SIZE (code committed `1d056d6`, needs push → CI →
+    GHCR → api rollout restart) and rerun the reversed ladder error-free
+    (20K/30K points: no 429, no pool-starvation 503, no OOM).
+  - [ ] Add a Prometheus scrape for `vllm:8000/metrics` (engine counters:
+    `vllm:prompt_tokens_total` / `generation_tokens_total`) — the one
+    telemetry gap; today only client-side + DCGM + api metrics were scraped.
+  - [ ] Fix `make aws-gpu-scale GPU_NODES=0` (it sets maxSize=0, invalid;
+    must clamp maxSize=1 while min/desired go to 0).
+  - [ ] Formal experiment dir: `PROVENANCE.md` hand-finished, results
+    submodule committed/pushed, story written; then teardown.
+  - [ ] Decide the admission-cap story for the formal run: 429-at-1000
+    (knee under admission control) vs open admission at 5000 (pure
+    saturation latency profile) — today's data supports either; pick one
+    methodology and record it.
 - [ ] **Architecture code review.** Full pass over the system boundaries
   (traffic → API → Redis → scheduler → worker/adapter → vLLM, plus the
   dataset cache and provider layout) before Milestone 3 porting: interfaces
