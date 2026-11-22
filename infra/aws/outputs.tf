@@ -32,3 +32,13 @@ output "vpc_id" {
   description = "VPC holding the cluster."
   value       = aws_vpc.main.id
 }
+
+output "datasets_cache_bucket" {
+  description = "S3 bucket for the remote dataset cache (DATASETS_S3_BUCKET)."
+  value       = aws_s3_bucket.datasets_cache.bucket
+}
+
+output "datasets_cache_role_arn" {
+  description = "IRSA role ARN for the traffic ServiceAccount (S3 dataset cache)."
+  value       = aws_iam_role.datasets_cache.arn
+}

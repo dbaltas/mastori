@@ -1,0 +1,20 @@
+# S3 remote cache for the datasets initContainer: prepare restores from the
+# bucket (or seeds it on a miss). The bucket name comes from Terraform
+# (terraform -chdir=infra/aws output datasets_cache_bucket); AWS_REGION is
+# needed because the IRSA-injected credentials are region-scoped to the
+# cluster's region.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: traffic
+  namespace: mastori
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: datasets
+          env:
+            - name: DATASETS_S3_BUCKET
+              value: REPLACE_FROM_TERRAFORM_OUTPUT
+            - name: AWS_REGION
+              value: REPLACE_FROM_TERRAFORM_OUTPUT

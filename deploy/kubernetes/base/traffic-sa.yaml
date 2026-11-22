@@ -1,0 +1,10 @@
+# ServiceAccount for the traffic Job (deploy/kubernetes/traffic-job.yaml).
+# Plain everywhere else: kind has no IRSA, and the local S3 cache mode is
+# disabled there (no DATASETS_S3_BUCKET in the traffic-config, the datasets
+# initContainer fetches from the source service directly). The aws/traffic
+# overlay carries the IRSA-annotated copy of this SA.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traffic
+  namespace: mastori

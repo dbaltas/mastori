@@ -36,6 +36,36 @@ directory never touches it.
 - IAM roles for cluster and nodes, plus the OIDC provider for IRSA
   (use `irsa_oidc_issuer` output in trust policies; annotate SAs with
   `eks.amazonaws.com/role-arn`).
+- **S3 dataset cache** (`s3.tf`): a private bucket keyed by the datasets.yaml
+  manifest SHA-256 (`datasets/<manifestSHA>/cache.tar.gz` + `.sha256`
+  sidecar), an S3 VPC gateway endpoint on the private route tables
+  (in-region S3 traffic bypasses the NAT gateway and its data-processing
+  charges), and the `mastori-datasets-cache` IRSA role for the traffic
+  ServiceAccount (S3 read + write on this bucket only: restore on hit, seed
+  on miss). `force_destroy` is on — the cache is re-seedable, not source
+  data; objects expire after 90 days (a changed datasets.yaml re-seeds under
+  a new SHA prefix, so stale prefixes are dead weight).
+
+### Wiring the S3 dataset cache
+
+After `terraform apply`, print the values and paste them into the two
+overlay files:
+
+```
+make aws-datasets-cache-config
+# -> paste the role ARN into deploy/kubernetes/overlays/aws/traffic/service-account.yaml
+#    (eks.amazonaws.com/role-arn)
+# -> paste DATASETS_S3_BUCKET and AWS_REGION into
+#    deploy/kubernetes/overlays/aws/traffic/s3.yaml
+```
+
+Then `make aws-run-traffic` prepares the cache in the datasets initContainer
+(`/datasets prepare`): HEAD the pack for the current manifest SHA; on a hit,
+download, verify the `.sha256` sidecar, and unpack into the emptyDir (~
+seconds in-region); on a miss, fetch from the source service, pack, and
+upload (first run pays the Hugging Face fetch once). The bucket name and
+region are also consumed as `DATASETS_S3_BUCKET` / `AWS_REGION` by
+`mastori-datasets seed|restore|prepare` locally.
 
 ## Access (private, per decision 2)
 

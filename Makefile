@@ -3,7 +3,7 @@ CLUSTER_NAME := mastori
 AWS_DIR := infra/aws
 AWS_ECR_DIR := infra/aws-ecr
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-datasets-cache-config aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
@@ -11,13 +11,18 @@ build:
 test:
 	go test ./...
 
-# Starts a throwaway Redis on 7099, runs the integration tests against it, then removes it.
+# Starts a throwaway Redis (7099) and LocalStack S3 (7098) on loopback, runs
+# the integration tests against them, then removes both. LocalStack backs the
+# dataset cache roundtrip test (S3 API compatible, no cloud spend; MinIO is
+# no longer published to Docker Hub).
 test-integration:
-	-@docker rm -f mastori-it-redis >/dev/null 2>&1
+	-@docker rm -f mastori-it-redis mastori-it-s3 >/dev/null 2>&1
 	docker run -d --rm --name mastori-it-redis -p 7099:6379 redis:7-alpine >/dev/null
-	@sleep 1
-	INTEGRATION_REDIS_ADDR=localhost:7099 go test -tags integration -race -count=1 ./test/integration/...; \
-	status=$$?; docker rm -f mastori-it-redis >/dev/null; exit $$status
+	docker run -d --rm --name mastori-it-s3 -p 7098:4566 -e SERVICES=s3 localstack/localstack:3.8.1 >/dev/null
+	@sleep 8
+	INTEGRATION_REDIS_ADDR=localhost:7099 INTEGRATION_S3_ADDR=localhost:7098 \
+	go test -tags integration -race -count=1 ./test/integration/...; \
+	status=$$?; docker rm -f mastori-it-redis mastori-it-s3 >/dev/null; exit $$status
 
 # FLUSHDB against the Redis pod in the kind cluster. Only run between
 # experiments: it kills in-flight jobs and consumer groups.
@@ -130,6 +135,17 @@ aws-mirror-images:
 
 aws-kubeconfig:
 	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region eu-north-1
+
+# Prints the S3 dataset-cache values to paste into
+# deploy/kubernetes/overlays/aws/traffic/{service-account,s3}.yaml (the
+# IRSA role ARN and DATASETS_S3_BUCKET/AWS_REGION). Requires aws-apply.
+aws-datasets-cache-config:
+	@echo "service-account.yaml eks.amazonaws.com/role-arn:" && \
+	  terraform -chdir=$(AWS_DIR) output -raw datasets_cache_role_arn && echo "" && \
+	echo "s3.yaml DATASETS_S3_BUCKET:" && \
+	  terraform -chdir=$(AWS_DIR) output -raw datasets_cache_bucket && echo "" && \
+	echo "s3.yaml AWS_REGION:" && \
+	  terraform -chdir=$(AWS_DIR) output -raw region && echo ""
 
 # Applies the aws overlay (base workloads, GHCR images) to the current
 # kubectl context. Requires the node label fix in infra/aws/eks.tf (already

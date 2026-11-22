@@ -7,8 +7,11 @@
 # kustomization: `cluster-deploy` should not start a traffic run as a side
 # effect.
 #
-# Data flow: the datasets initContainers fetch the dataset cache into a
-# shared emptyDir and validate it against the manifest, then /traffic replays
+# Data flow: the datasets initContainer prepares the dataset cache into a
+# shared emptyDir — restore from the S3 remote cache (IRSA on EKS) or, on a
+# cache miss, fetch from the source service and seed the bucket; without
+# DATASETS_S3_BUCKET it fetches directly (local kind). The validate
+# initContainer checks the cache against the manifest, then /traffic replays
 # it against the in-cluster API. Records are also streamed to stdout
 # (TRAFFIC_RECORDS_STDOUT), because the distroless image has no shell or tar
 # for `kubectl cp`.
@@ -28,13 +31,14 @@ spec:
       restartPolicy: Never
       nodeSelector:
         mastori/pool: cpu
+      serviceAccountName: traffic
       initContainers:
         - name: datasets
           image: mastori/api:latest
           imagePullPolicy: IfNotPresent
           command:
             - /datasets
-            - fetch
+            - prepare
             - --manifest
             - /etc/mastori/datasets.yaml
             - --cache

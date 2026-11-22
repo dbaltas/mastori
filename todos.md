@@ -93,14 +93,20 @@ error/edge cases.
 
 ### Datasets in-cluster cache reuse
 
-- [ ] The traffic Job's `datasets` initContainer re-fetches the full dataset
+- [x] The traffic Job's `datasets` initContainer re-fetches the full dataset
   cache from Hugging Face on **every run** (~15–25s of per-run overhead over
-  the NAT) into a fresh `emptyDir`. Add cache reuse across runs: either a
-  small read-only PVC seeded once (a fetcher Job with `if-not-exists`
-  semantics), or a S3-backed warm cache, or a built-in image layer refresh
-  when the manifest SHA changes. Keyed on the `datasets.yaml` manifest SHA so
-  a manifest change invalidates the cache; keep the no-data-on-nodes rule
-  (nothing persistent lands on the node filesystem).
+  the NAT) into a fresh `emptyDir`. Done 2026-11-21 (S3-backed remote cache):
+  `/datasets prepare` restores a single tar.gz pack from the private S3
+  bucket keyed on the `datasets.yaml` manifest SHA
+  (`datasets/<manifestSHA>/cache.tar.gz` + `.sha256` sidecar); on a miss it
+  fetches from HF, packs, and uploads (first run pays the fetch once). S3 VPC
+  gateway endpoint in Terraform keeps in-region pulls free of NAT processing
+  charges; IRSA role for the `traffic` ServiceAccount (read+write, this
+  bucket only); 90-day expiry reclaims stale manifest versions. Kind/local
+  runs keep the direct fetch (`DATASETS_S3_BUCKET` unset). Unit tests with an
+  in-memory store (`internal/datasets/store_test.go`) and an S3-API
+  integration test against throwaway LocalStack (`make test-integration`,
+  `test/integration/datasets_cache_test.go`).
 
 ### Structured environment capture
 
