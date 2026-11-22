@@ -33,7 +33,7 @@ func newRunnerHarness(t *testing.T) *runnerHarness {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	q := queue.NewRedisQueue(mr.Addr(), "jobs", "jobs:chunks:", "jobs:abandon:")
+	q := queue.NewRedisQueue(mr.Addr(), "jobs", "jobs:chunks:", "jobs:abandon:", 16)
 	t.Cleanup(func() { _ = q.Close() })
 	return &runnerHarness{t: t, mr: mr, client: client, q: q, reg: registry.New(client, "", time.Minute)}
 }

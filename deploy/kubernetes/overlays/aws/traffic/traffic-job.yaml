@@ -91,10 +91,13 @@ spec:
           resources:
             requests:
               cpu: 250m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: "2"
-              memory: 512Mi
+              # 512Mi OOMKilled at 20K-30K with MAX_INFLIGHT=5000 (api-config):
+              # the open-loop sender holds ~5k concurrent SSE streams + record
+              # buffers. 1Gi covers the deep-queue regime (2026-11-22).
+              memory: 1Gi
       volumes:
         - name: data
           emptyDir: {}

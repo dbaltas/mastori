@@ -272,6 +272,11 @@ traffic-configmaps:
 traffic-wait:
 	@echo "waiting for the traffic job (timeout $(TRAFFIC_WAIT_TIMEOUT))..." && \
 	if ! kubectl -n mastori wait --for=condition=complete --timeout=$(TRAFFIC_WAIT_TIMEOUT) job/traffic; then \
+	  failed=$$(kubectl -n mastori get job traffic -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null); \
+	  if [ "$$failed" = "True" ]; then \
+	    echo "traffic job failed (init or run error):" && \
+	    kubectl -n mastori logs job/traffic --all-containers --tail=50 2>&1; exit 1; \
+	  fi; \
 	  echo "traffic job did not complete:" && \
 	  kubectl -n mastori get pods -l app=traffic && \
 	  kubectl -n mastori logs job/traffic --tail=50; exit 1; fi && \
@@ -349,16 +354,27 @@ cluster-run-traffic: docker-build
 	$(MAKE) traffic-wait
 
 # Runs the traffic generator inside the EKS cluster: the Job is applied
-# through the aws/traffic overlay, which rewrites the image to the GHCR
-# digest the nodes can pull (no kind load step). Results recovery is the
-# same cluster-traffic-results target — it only uses the current kubectl
-# context. Set EXPERIMENT=<name> for the same auto-capture hook as
-# cluster-run-traffic.
+# through a temp-dir copy of the aws/traffic overlay whose dataset-cache
+# values are rendered live from Terraform outputs — the committed overlay
+# keeps placeholder values (single source of truth is Terraform), so the
+# run never depends on the working tree (concurrent sessions may hold or
+# restore those files). Results recovery is the same cluster-traffic-results
+# target — it only uses the current kubectl context. Set EXPERIMENT=<name>
+# for the same auto-capture hook as cluster-run-traffic.
 aws-run-traffic:
 	@if [ -n "$(EXPERIMENT)" ] && [ ! -f benchmark/results/$(EXPERIMENT)/environment/PROVENANCE.md ]; then $(MAKE) cluster-env-capture EXPERIMENT=$(EXPERIMENT); fi
 	$(MAKE) traffic-configmaps
 	kubectl -n mastori delete job traffic --ignore-not-found
-	kubectl -n mastori apply -k deploy/kubernetes/overlays/aws/traffic
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	cp -R deploy/kubernetes/overlays/aws/traffic/. $$tmp/ && \
+	bucket=$$(terraform -chdir=$(AWS_DIR) output -raw datasets_cache_bucket) && \
+	role=$$(terraform -chdir=$(AWS_DIR) output -raw datasets_cache_role_arn) && \
+	region=$$(terraform -chdir=$(AWS_DIR) output -raw region) && \
+	sed -i.bak1 -e "s/REPLACE_DATASETS_CACHE_BUCKET/$$bucket/" $$tmp/s3.yaml && \
+	sed -i.bak2 -e "s/REPLACE_DATASETS_CACHE_REGION/$$region/" $$tmp/s3.yaml && \
+	sed -i.bak3 -e "s|arn:aws:iam::000000000000:role/REPLACE_ME|$$role|" $$tmp/service-account.yaml && \
+	rm -f $$tmp/*.bak* && \
+	kubectl -n mastori apply -k $$tmp
 	$(MAKE) traffic-wait
 
 # Recovers the records and summary of the last traffic job from the pod logs

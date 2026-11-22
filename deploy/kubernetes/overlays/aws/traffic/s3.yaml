@@ -15,6 +15,6 @@ spec:
         - name: datasets
           env:
             - name: DATASETS_S3_BUCKET
-              value: REPLACE_FROM_TERRAFORM_OUTPUT
+              value: REPLACE_DATASETS_CACHE_BUCKET
             - name: AWS_REGION
-              value: REPLACE_FROM_TERRAFORM_OUTPUT
+              value: REPLACE_DATASETS_CACHE_REGION

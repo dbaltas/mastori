@@ -23,10 +23,16 @@ type RedisQueue struct {
 	abandonPrefix string
 }
 
-func NewRedisQueue(addr, stream, chunksPrefix, abandonPrefix string) *RedisQueue {
+func NewRedisQueue(addr, stream, chunksPrefix, abandonPrefix string, poolSize int) *RedisQueue {
 	return &RedisQueue{
 		client: redis.NewClient(&redis.Options{
 			Addr: addr,
+			// Pool sized for the deep-queue regime: with MAX_INFLIGHT in the
+			// thousands, that many concurrent enqueues/chunk reads can be in
+			// flight at once; the go-redis default (10xGOMAXPROCS, ~20-30)
+			// starved under load and surfaced as 503 "queue unavailable"
+			// (2026-11-22, 20K/30K GPU runs).
+			PoolSize: poolSize,
 		}),
 		stream:        stream,
 		chunksPrefix:  chunksPrefix,

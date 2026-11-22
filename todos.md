@@ -280,6 +280,32 @@ error/edge cases.
   (TRAFFIC_STEPS is supported by cmd/traffic applyEnv). Scale GPU back to
   0 right after. Open: INFERENCE_MAX_TOKENS cap so worker outputs match
   the mock token budgets used by the knee analysis.
+- [ ] **Get the AWS account ID out of git.** `273354666694` is hardcoded in
+  the overlays (ECR refs in `kustomization.yaml` files, `mirror-jobs.yaml`,
+  `vllm-server.yaml`, traffic IRSA role/bucket) and in `infra/aws-ecr`. The
+  2026-11-22 hardcode of the traffic placeholders was reverted; the rest
+  predates it. Durable fix: generate ECR registry / bucket / role ARN from
+  `terraform output` at deploy time (small make target), then scrub history
+  before the repo goes public.
+- [ ] **Clean up `make aws-run-traffic`.** The target grew ad-hoc
+  (TRAFFIC_* env passthrough, model/workload/steps wiring, the mockworker
+  scale-down dance); restructure it before the knee sweep so the run recipe
+  above is one command instead of a checklist.
+- [ ] **Queue before vLLM + 429 handling at high request rates.** Question
+  to answer during the knee sweep: does the queue-before-inference path
+  hold at 1k req/s, and does the adapter/worker return 429s the traffic
+  runner handles (retry/backoff) instead of failing runs? 2026-11-22 GPU
+  samples showed full-GPU bursts then idle — measure whether request
+  queuing smooths that or dumps bursts straight onto the GPU.
+- [ ] **Architecture code review.** Full pass over the system boundaries
+  (traffic → API → Redis → scheduler → worker/adapter → vLLM, plus the
+  dataset cache and provider layout) before Milestone 3 porting: interfaces
+  worth extracting vs. the "three concrete implementations first" rule,
+  error/recovery paths, coupling that the kustomize overlays hide.
+- [ ] **Golang code review.** Idiomatic pass over `cmd/` + `internal/`
+  (traffic runner, scheduler, worker, datasets, fakegpu): context/timeout
+  handling, goroutine lifetimes, error wrapping, test coverage gaps
+  flagged in the local-quality items above.
 
 ## Milestone 3 — Azure, concrete
 

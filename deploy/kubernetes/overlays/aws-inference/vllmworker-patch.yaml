@@ -29,3 +29,11 @@ spec:
               value: "default,qwen3-4b"
             - name: INFERENCE_MODEL
               value: "qwen3-4b"
+          # 256Mi OOMKilled at 20K/30K with MAX_INFLIGHT=5000: the bridge
+          # buffers SSE chunks for thousands of concurrent jobs. 1Gi covers
+          # the deep-queue regime (2026-11-22).
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              memory: 256Mi

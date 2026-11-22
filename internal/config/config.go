@@ -13,6 +13,7 @@ type Config struct {
 	RedisStream    string
 	ChunksPrefix   string
 	AbandonPrefix  string
+	RedisPoolSize  int
 	RequestTimeout time.Duration
 	MaxInflight    int
 	DefaultModel   string
@@ -28,6 +29,7 @@ func Load() (*Config, error) {
 		RedisStream:    getenv("REDIS_STREAM", "jobs"),
 		ChunksPrefix:   getenv("REDIS_CHUNKS_PREFIX", "jobs:chunks:"),
 		AbandonPrefix:  getenv("REDIS_ABANDON_PREFIX", "jobs:abandon:"),
+		RedisPoolSize:  512,
 		RequestTimeout: 60 * time.Second,
 		MaxInflight:    1000,
 		DefaultModel:   getenv("DEFAULT_MODEL", "default"),
@@ -42,6 +44,14 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid MAX_INFLIGHT %q: must be a positive integer", v)
 		}
 		cfg.MaxInflight = n
+	}
+
+	if v := os.Getenv("REDIS_POOL_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid REDIS_POOL_SIZE %q: must be a positive integer", v)
+		}
+		cfg.RedisPoolSize = n
 	}
 
 	if v := os.Getenv("REQUEST_TIMEOUT"); v != "" {

@@ -5,8 +5,11 @@
 # fakegpu would fight it.
 #
 # Deltas from base + components/inference:
-#  - images: EKS pulls from the long-lived ECR registry (same rewrite as
-#    overlays/aws; digest pinning TODO, see overlays/aws/kustomization.yaml).
+#  - images: the mastori/api image comes from GHCR (CI-published on every
+#    main push, see overlays/aws/kustomization.yaml; the image is small so
+#    NAT pulls are negligible). The vLLM server and model weights in
+#    vllm-server.yaml keep their absolute ECR references — they are GB-scale
+#    and must stay on the NAT-free VPC-endpoint path.
 #  - imagePullPolicy: Always for the inference deployments (pull-policy.yaml).
 #  - vllm server (vllm-server.yaml): the real vLLM backend (mastori/vllm
 #    image + Qwen3-4B weights exported from mastori/weights into an
@@ -30,7 +33,7 @@ components:
   - ../../components/inference
 images:
   - name: mastori/api
-    newName: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori
+    newName: ghcr.io/dbaltas/mastori
     newTag: latest
 patches:
   - path: pull-policy.yaml

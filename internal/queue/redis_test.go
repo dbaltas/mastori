@@ -14,7 +14,7 @@ import (
 func newTestQueue(t *testing.T) (*RedisQueue, *miniredis.Miniredis, *redis.Client) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	q := NewRedisQueue(mr.Addr(), "jobs", "jobs:chunks:", "jobs:abandon:")
+	q := NewRedisQueue(mr.Addr(), "jobs", "jobs:chunks:", "jobs:abandon:", 16)
 	t.Cleanup(func() { _ = q.Close() })
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })

@@ -37,10 +37,12 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: "1"
-              memory: 512Mi
+              # 512Mi held ~3k concurrent SSE streams/pod but MAX_INFLIGHT=5000
+              # (deep-queue regime, 2026-11-22) needs headroom: ~5k streams/pod.
+              memory: 1Gi
           livenessProbe:
             httpGet:
               path: /healthz
