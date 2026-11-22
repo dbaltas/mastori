@@ -34,6 +34,10 @@ spec:
       labels:
         app: vllm
     spec:
+      # The `vllm` Service injects VLLM_PORT=tcp://... via service links,
+      # which vLLM rejects at engine init (ValueError: VLLM_PORT appears to
+      # be a URI, seen 2026-11-22). Disable env injection entirely.
+      enableServiceLinks: false
       nodeSelector:
         mastori/pool: gpu
       tolerations:
@@ -90,7 +94,11 @@ spec:
       containers:
         - name: vllm
           image: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/vllm:v0.34.0
-          imagePullPolicy: IfNotPresent
+          # Always: the tag is re-pointed in ECR when the amd64 image is
+          # re-mirrored (mirror-jobs.yaml), but nodes keep the old arch cached
+          # under the same tag — IfNotPresent then crashes with
+          # "exec format error" and never re-resolves (seen 2026-11-22).
+          imagePullPolicy: Always
           args:
             - --model
             - /models

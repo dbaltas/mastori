@@ -3,6 +3,9 @@
 # run over the VPC endpoints with no NAT billing.
 #  - mirror-vllm: skopeo streams vllm/vllm-openai:v0.34.0 Docker Hub -> ECR
 #    (no local disk needed for the ~11GB; one-time NAT egress from the node).
+#    Pin --override-arch amd64: this Job runs on the ARM64 CPU node and
+#    skopeo otherwise copies the node's arch — the 2026-11-22 mirror pushed
+#    arm64 and the GPU pod crash-looped with "exec format error".
 #  - bake-weights: downloads Qwen/Qwen3-4B from Hugging Face, tars it, and
 #    pushes a scratch-based weights image with crane.
 # Both need ECR push creds (secret ecr-push-creds, 12h token) and are
@@ -34,6 +37,8 @@ spec:
               apk add --no-cache skopeo >/dev/null
               skopeo --version
               skopeo copy \
+                --override-os linux \
+                --override-arch amd64 \
                 --retry-times 8 \
                 docker://docker.io/vllm/vllm-openai:v0.34.0 \
                 docker://273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/vllm:v0.34.0 \
