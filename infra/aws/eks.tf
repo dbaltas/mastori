@@ -195,10 +195,12 @@ resource "aws_eks_node_group" "gpu" {
 
   launch_template {
     id = aws_launch_template.gpu.id
-    # Same pinning rationale as the CPU group above. v2 re-points the 120GB
-    # gp3 root volume at /dev/xvda (the AMI's actual root device; v1 under
-    # /dev/sda1 attached an unused second disk).
-    version = "2"
+    # Same pinning rationale as the CPU group above. The template itself
+    # defines the 120GB gp3 root volume on /dev/xvda (the AMI's actual root
+    # device); the older "/dev/sda1 attaches an unused second disk" problem
+    # was fixed in the template definition (2026-11-21), so v1 is correct
+    # since the destroy/recreate of 2026-11-22.
+    version = "1"
   }
 
   tags = {

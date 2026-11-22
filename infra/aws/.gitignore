@@ -8,3 +8,5 @@ tfplan
 tfplan*
 tfplan.json
 terraform.tfvars
+# Terraform session logs (apply/plan captures stay on disk only)
+*.log

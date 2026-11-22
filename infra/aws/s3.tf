@@ -1,6 +1,6 @@
 # Remote dataset cache: an S3 bucket keyed by the datasets.yaml manifest
-# SHA-256, the VPC gateway endpoint that makes in-region pulls free of NAT
-# processing charges, and the IRSA role for the traffic Job's ServiceAccount.
+# SHA-256 and the IRSA role for the traffic Job's ServiceAccount. The S3
+# VPC gateway endpoint lives in vpc.tf (shared with the ECR pull path).
 #
 # Data flow (cmd/datasets prepare): the traffic Job's datasets initContainer
 # restores the cache pack from the bucket; on a miss it fetches from the
@@ -54,20 +54,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "datasets_cache" {
     expiration {
       days = 90
     }
-  }
-}
-
-# VPC gateway endpoint for S3: same-region S3 traffic from the private
-# subnets bypasses the NAT gateway (no data-processing charges; the ECR VPC
-# endpoints follow the same pattern when they land).
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id            = aws_vpc.main.id
-  service_name      = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = aws_route_table.private[*].id
-
-  tags = {
-    Name = "${var.cluster_name}-s3"
   }
 }
 
