@@ -144,6 +144,7 @@ type Summary struct {
 	TTFTMsP95         float64        `json:"ttft_ms_p95"`
 	TTFTMsMean        float64        `json:"ttft_ms_mean"`
 	TokensOutTotal    int64          `json:"tokens_out_total"`
+	TokensInTotal     int64          `json:"tokens_in_total"`
 	OutputPath        string         `json:"output_path"`
 	Mode              string         `json:"mode"`
 	Datasets          map[string]int `json:"datasets"`
@@ -162,6 +163,7 @@ type accumulator struct {
 	byStatus  map[int]int
 	errors    map[string]int
 	tokensOut int64
+	tokensIn  int64
 	latency   LatencyStats
 	ttft      LatencyStats
 	datasets  map[string]int
@@ -200,6 +202,10 @@ func (a *accumulator) add(r Record, ok bool) {
 			a.errors[r.Error]++
 		}
 	}
+	// Counted for every record: rejected requests carry 0 prompt tokens
+	// (admission happens before prefill), so the sum equals admitted-prompt
+	// tokens while keeping the aggregate honest against the JSONL.
+	a.tokensIn += r.TokensIn
 }
 
 // warmupBarrier separates the warmup phase from the measured phase. Sends
@@ -544,6 +550,7 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		ByStatus:       a.byStatus,
 		Errors:         a.errors,
 		TokensOutTotal: a.tokensOut,
+		TokensInTotal:  a.tokensIn,
 		Datasets:       a.datasets,
 		RequestedRate:  cfg.Rate,
 	}
