@@ -318,7 +318,10 @@ error/edge cases.
   - [ ] Decide the admission-cap story for the formal run: 429-at-1000
     (knee under admission control) vs open admission at 5000 (pure
     saturation latency profile) — today's data supports either; pick one
-    methodology and record it.
+    methodology and record it. Decided 2026-11-23 for the tok/s GPU
+    utilization runs: open admission (no 429 shaping, MAX_INFLIGHT high) so
+    the engine is driven to true saturation and peak tok/s is measurable;
+    the 429-at-cap variant stays an option for a later formal knee run.
 - [ ] **Architecture code review.** Full pass over the system boundaries
   (traffic → API → Redis → scheduler → worker/adapter → vLLM, plus the
   dataset cache and provider layout) before Milestone 3 porting: interfaces
