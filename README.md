@@ -4,7 +4,7 @@ A benchmarking platform for LLM inference on GPU infrastructure.
 
 Run the same LLM workload on identical GPU resources across different providers — AWS, Azure, Nebius, Verda, or any other — and compare throughput, latency, utilization, and cost.
 
-> **Status: early implementation.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployed on a local kind cluster. An optional inference layer adds real local generation: a vLLM-compatible adapter (`cmd/adapter`) backed by host Ollama plus a real inference worker (`cmd/vllmworker`) that speaks the same API surface a cloud vLLM server will. Scheduling policies and cloud providers are still ahead. See the [design document](gpu-inference-benchmarking-platform.md) for the full plan. Benchmark results are published to [the GitHub Pages site](https://dbaltas.github.io/mastori/).
+> **Status: cloud-ready.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployed on a local kind cluster. The same stack runs on AWS EKS: Terraform IaC (`infra/aws`) provisions the cluster with a CPU node pool and a scale-to-zero GPU node pool, real inference runs vLLM (`mastori/vllm`) serving Qwen3-4B from ECR-backed weights, and the traffic generator measures knee points with per-run provenance, metrics export, and results that survive teardown (`benchmark/results/`). See the [design document](gpu-inference-benchmarking-platform.md) for the full plan. Benchmark results are published to [the GitHub Pages site](https://dbaltas.github.io/mastori/).
 
 ![Grafana dashboard](docs/grafana-overview.png)
 
@@ -31,8 +31,8 @@ Run the same LLM workload on identical GPU resources across different providers 
 2. ~~Kubernetes with Prometheus and Grafana~~
 3. ~~Traffic generator and workload profiles~~
 4. ~~Real local inference workers (Ollama behind a vLLM-compatible adapter)~~
-5. Cloud deployment with mock workers (CPU pool, IaC)
-6. Cloud deployment with GPU inference (GPU pool, vLLM)
+5. ~~Cloud deployment with mock workers (CPU pool, IaC)~~
+6. ~~Cloud deployment with GPU inference (GPU pool, vLLM)~~
 7. Cross-provider experiments
 
 ## Running locally
