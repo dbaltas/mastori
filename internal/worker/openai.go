@@ -19,11 +19,12 @@ import (
 	"github.com/dbaltas/mastori/internal/queue"
 )
 
-// OllamaGenerator generates completions by calling an inference backend that
-// exposes the vLLM OpenAI-compatible API (locally: the Ollama adapter in
+// OpenAIGenerator generates completions by calling an inference backend that
+// exposes the OpenAI-compatible completions API (locally: the adapter in
 // internal/adapter; in the cloud: a real vLLM server). The backend URL is the
-// same in both cases, so the worker needs no changes when moving to vLLM.
-type OllamaGenerator struct {
+// same in both cases, so the worker needs no changes when moving between
+// backends.
+type OpenAIGenerator struct {
 	// BaseURL is the vLLM-compatible server root, e.g. http://adapter:8080.
 	BaseURL string
 	// Model is used when the job does not name a concrete model.
@@ -51,7 +52,7 @@ type sseEvent struct {
 	} `json:"usage"`
 }
 
-func (g *OllamaGenerator) client() *http.Client {
+func (g *OpenAIGenerator) client() *http.Client {
 	c := g.Client
 	if c == nil {
 		c = http.DefaultClient
@@ -65,7 +66,7 @@ func (g *OllamaGenerator) client() *http.Client {
 	return &http.Client{Transport: otelhttp.NewTransport(transport), Timeout: c.Timeout}
 }
 
-func (g *OllamaGenerator) model(job queue.Job) string {
+func (g *OpenAIGenerator) model(job queue.Job) string {
 	if job.Model != "" && job.Model != "default" {
 		return job.Model
 	}
@@ -73,14 +74,14 @@ func (g *OllamaGenerator) model(job queue.Job) string {
 }
 
 // spanTracer returns the tracer used for inference spans.
-func (g *OllamaGenerator) spanTracer() oteltrace.Tracer {
+func (g *OpenAIGenerator) spanTracer() oteltrace.Tracer {
 	if g.Tracer != nil {
 		return g.Tracer
 	}
 	return tracer
 }
 
-func (g *OllamaGenerator) estimateTokens(text string) int64 {
+func (g *OpenAIGenerator) estimateTokens(text string) int64 {
 	n := len(strings.Fields(text))
 	if n == 0 {
 		n = 1
@@ -90,7 +91,7 @@ func (g *OllamaGenerator) estimateTokens(text string) int64 {
 
 // Run streams the completion for the job from the vLLM-compatible backend,
 // emitting one Chunk per streamed delta and a final Done chunk with usage.
-func (g *OllamaGenerator) Run(ctx context.Context, job queue.Job, onChunk func(queue.Chunk) error) error {
+func (g *OpenAIGenerator) Run(ctx context.Context, job queue.Job, onChunk func(queue.Chunk) error) error {
 	start := time.Now()
 	queueWaitMs := time.Since(job.CreatedAt).Milliseconds()
 

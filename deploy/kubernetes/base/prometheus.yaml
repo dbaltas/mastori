@@ -107,7 +107,11 @@ data:
             regex: Pending|Running
             action: keep
           - source_labels: [__meta_kubernetes_pod_label_app]
-            regex: api|scheduler|inference-adapter
+            # vllm: real vLLM server (overlays/aws-inference) exposes native
+            # Prometheus metrics on its OpenAI port (8000/http) — engine
+            # counters and TTFT/TPOT histograms. Absent on kind (adapter's
+            # synthesized vllm:* metrics are scraped via inference-adapter).
+            regex: api|scheduler|inference-adapter|vllm
             action: keep
           - source_labels: [__meta_kubernetes_pod_container_port_name]
             regex: http

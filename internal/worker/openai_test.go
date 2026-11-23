@@ -39,9 +39,9 @@ func newFakeAdapter(t *testing.T, status int, body string) *httptest.Server {
 	return srv
 }
 
-func collectOllamaChunks(t *testing.T, srv *httptest.Server, job queue.Job) ([]queue.Chunk, error) {
+func collectOpenAIChunks(t *testing.T, srv *httptest.Server, job queue.Job) ([]queue.Chunk, error) {
 	t.Helper()
-	g := &OllamaGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
 	var chunks []queue.Chunk
 	err := g.Run(context.Background(), job, func(c queue.Chunk) error {
 		chunks = append(chunks, c)
@@ -50,13 +50,13 @@ func collectOllamaChunks(t *testing.T, srv *httptest.Server, job queue.Job) ([]q
 	return chunks, err
 }
 
-func TestOllamaRunStreamsChunksAndUsage(t *testing.T) {
+func TestOpenAIRunStreamsChunksAndUsage(t *testing.T) {
 	body := sseChunk("the ") + sseChunk("model ") + sseChunk("streams") + "\n" +
 		"data: {\"id\":\"cmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n" +
 		"data: [DONE]\n\n"
 	srv := newFakeAdapter(t, http.StatusOK, body)
 
-	chunks, err := collectOllamaChunks(t, srv, queue.Job{ID: "j1", Prompt: "hello", CreatedAt: time.Now().UTC().Add(-5 * time.Millisecond)})
+	chunks, err := collectOpenAIChunks(t, srv, queue.Job{ID: "j1", Prompt: "hello", CreatedAt: time.Now().UTC().Add(-5 * time.Millisecond)})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -85,11 +85,11 @@ func TestOllamaRunStreamsChunksAndUsage(t *testing.T) {
 	}
 }
 
-func TestOllamaRunFallsBackToEstimatedTokens(t *testing.T) {
+func TestOpenAIRunFallsBackToEstimatedTokens(t *testing.T) {
 	body := sseChunk("one two three ") + "data: [DONE]\n\n"
 	srv := newFakeAdapter(t, http.StatusOK, body)
 
-	chunks, err := collectOllamaChunks(t, srv, queue.Job{ID: "j2", Prompt: "hi", CreatedAt: time.Now().UTC()})
+	chunks, err := collectOpenAIChunks(t, srv, queue.Job{ID: "j2", Prompt: "hi", CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -102,27 +102,27 @@ func TestOllamaRunFallsBackToEstimatedTokens(t *testing.T) {
 	}
 }
 
-func TestOllamaRunBackendError(t *testing.T) {
+func TestOpenAIRunBackendError(t *testing.T) {
 	srv := newFakeAdapter(t, http.StatusServiceUnavailable, "ollama down")
-	_, err := collectOllamaChunks(t, srv, queue.Job{ID: "j3", Prompt: "hi", CreatedAt: time.Now().UTC()})
+	_, err := collectOpenAIChunks(t, srv, queue.Job{ID: "j3", Prompt: "hi", CreatedAt: time.Now().UTC()})
 	if err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("err = %v, want status 503 error", err)
 	}
 }
 
-func TestOllamaRunSSEErrorEvent(t *testing.T) {
+func TestOpenAIRunSSEErrorEvent(t *testing.T) {
 	body := "data: {\"error\":{\"message\":\"model not found\"}}\n\ndata: [DONE]\n\n"
 	srv := newFakeAdapter(t, http.StatusOK, body)
-	_, err := collectOllamaChunks(t, srv, queue.Job{ID: "j4", Prompt: "hi", CreatedAt: time.Now().UTC()})
+	_, err := collectOpenAIChunks(t, srv, queue.Job{ID: "j4", Prompt: "hi", CreatedAt: time.Now().UTC()})
 	if err == nil || !strings.Contains(err.Error(), "model not found") {
 		t.Fatalf("err = %v, want backend error message", err)
 	}
 }
 
-func TestOllamaRunPropagatesChunkError(t *testing.T) {
+func TestOpenAIRunPropagatesChunkError(t *testing.T) {
 	body := sseChunk("a") + sseChunk("b") + "data: [DONE]\n\n"
 	srv := newFakeAdapter(t, http.StatusOK, body)
-	g := &OllamaGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
 	want := errors.New("redis down")
 	err := g.Run(context.Background(), queue.Job{ID: "j5", Prompt: "p", CreatedAt: time.Now().UTC()}, func(c queue.Chunk) error {
 		if c.Text == "b" {
@@ -135,7 +135,7 @@ func TestOllamaRunPropagatesChunkError(t *testing.T) {
 	}
 }
 
-func TestOllamaRunRespectsContextCancel(t *testing.T) {
+func TestOpenAIRunRespectsContextCancel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -149,7 +149,7 @@ func TestOllamaRunRespectsContextCancel(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	g := &OllamaGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -168,8 +168,8 @@ func TestOllamaRunRespectsContextCancel(t *testing.T) {
 	}
 }
 
-func TestOllamaModelSelection(t *testing.T) {
-	g := &OllamaGenerator{Model: "fallback"}
+func TestOpenAIModelSelection(t *testing.T) {
+	g := &OpenAIGenerator{Model: "fallback"}
 	if got := g.model(queue.Job{Model: "qwen2.5:0.5b"}); got != "qwen2.5:0.5b" {
 		t.Errorf("model = %q, want job model", got)
 	}
@@ -194,7 +194,7 @@ func spanTracer(t *testing.T) (oteltrace.Tracer, *tracetest.SpanRecorder) {
 	return tp.Tracer("test"), rec
 }
 
-func TestOllamaRunEmitsInferenceSpans(t *testing.T) {
+func TestOpenAIRunEmitsInferenceSpans(t *testing.T) {
 	body := sseChunk("a ") + sseChunk("b") + "data: [DONE]\n\n"
 	var traceparent string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +208,7 @@ func TestOllamaRunEmitsInferenceSpans(t *testing.T) {
 	prevProp := otel.GetTextMapPropagator()
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	t.Cleanup(func() { otel.SetTextMapPropagator(prevProp) })
-	g := &OllamaGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client(), Tracer: tracer}
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client(), Tracer: tracer}
 	var chunks []queue.Chunk
 	err := g.Run(context.Background(), queue.Job{ID: "j7", Prompt: "hi", CreatedAt: time.Now().UTC()}, func(c queue.Chunk) error {
 		chunks = append(chunks, c)
@@ -255,10 +255,10 @@ func TestOllamaRunEmitsInferenceSpans(t *testing.T) {
 	}
 }
 
-func TestOllamaRunRecordsErrorOnRequestSpan(t *testing.T) {
+func TestOpenAIRunRecordsErrorOnRequestSpan(t *testing.T) {
 	tracer, rec := spanTracer(t)
 	srv := newFakeAdapter(t, http.StatusServiceUnavailable, "down")
-	g := &OllamaGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client(), Tracer: tracer}
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client(), Tracer: tracer}
 	err := g.Run(context.Background(), queue.Job{ID: "j8", Prompt: "hi", CreatedAt: time.Now().UTC()}, func(c queue.Chunk) error {
 		return nil
 	})

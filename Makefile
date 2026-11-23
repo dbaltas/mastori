@@ -3,7 +3,7 @@ CLUSTER_NAME := mastori
 AWS_DIR := infra/aws
 AWS_ECR_DIR := infra/aws-ecr
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-datasets-cache-config aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-metrics-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-datasets-cache-config aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
@@ -388,3 +388,28 @@ cluster-traffic-results:
 	grep -F '"schema_version":"' $$log > benchmark/results/cluster/$$runid.jsonl && \
 	awk '/^\{$$/,/^\}$$/' $$log > benchmark/results/cluster/$$runid.summary.json && \
 	echo "wrote benchmark/results/cluster/$$runid.jsonl and benchmark/results/cluster/$$runid.summary.json"
+
+# Exports the Prometheus series for an experiment window into
+# benchmark/results/<EXPERIMENT>/metrics/, the committed replacement for the
+# hand-run export behind benchmark/results/20261122-eks-gpu-vllm-knee/metrics/.
+# One query_range per window, grouped by metric name; the default match keeps
+# the vllm:* engine counters (prompt/generation token totals, TTFT/TPOT
+# histograms) — the authoritative cross-check against client-side tok/s —
+# plus the DCGM and API series. Run BEFORE teardown; Prometheus retention is
+# 24h. Usage:
+#   make cluster-metrics-capture EXPERIMENT=<name> [START=...] [END=...] [STEP=15s] [MATCH='vllm:|DCGM_|mastori_']
+# START/END are RFC3339 UTC (END defaults to now, START to END-1h). In a run
+# recipe, pass both explicitly so the window spans the whole experiment.
+cluster-metrics-capture:
+	@test -n "$(EXPERIMENT)" || { echo "ERROR: set EXPERIMENT=<name>, e.g. make cluster-metrics-capture EXPERIMENT=20261123-eks-gpu-vllm" >&2; exit 1; }
+	@mkdir -p benchmark/results/$(EXPERIMENT)/metrics
+	@kubectl -n mastori get deploy/prometheus >/dev/null 2>&1 || { echo "ERROR: prometheus deployment not found in namespace mastori" >&2; exit 1; }
+	@kubectl -n mastori port-forward deploy/prometheus 9091:9090 >/dev/null 2>&1 & \
+	pfpid=$$!; trap 'kill $$pfpid 2>/dev/null' EXIT; \
+	sleep 2; \
+	go run ./cmd/promcapture \
+	  -url http://localhost:9091 \
+	  -out benchmark/results/$(EXPERIMENT)/metrics \
+	  $(if $(START),-start $(START)) $(if $(END),-end $(END)) \
+	  -step $(if $(STEP),$(STEP),15s) \
+	  -match "$(if $(MATCH),$(MATCH),vllm:|DCGM_|mastori_)"

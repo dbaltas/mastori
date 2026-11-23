@@ -135,7 +135,7 @@ func main() {
 	hb := time.Duration(cfg.heartbeatMs) * time.Millisecond
 	reg := registry.New(client, cfg.workerRegistryPrefix, 3*hb)
 
-	gen := &worker.OllamaGenerator{
+	gen := &worker.OpenAIGenerator{
 		BaseURL:   cfg.baseURL,
 		Model:     cfg.model,
 		MaxTokens: cfg.maxTokens,
