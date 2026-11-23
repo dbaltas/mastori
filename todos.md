@@ -209,6 +209,47 @@ error/edge cases.
 
 ## Milestone 2 — GPU / vLLM on EKS (gated: quota + capacity confirmed)
 
+### 2026-11-23 tok/s utilization session (exploratory, teardown done)
+
+- [x] Bring-up + 12-run tok/s ladder; results in
+  `benchmark/results/20261123-eks-gpu-vllm-toks/` (runs/ 12 summaries +
+  JSONL, metrics/prometheus-20261123-1703-1745.json 157 metrics,
+  environment/ hand-finished, runs/MANIFEST.md full tables + findings).
+  All runs valid, 0 failures, 0 rejections at every layer.
+- [x] **Hardware substitution caught in provenance**: the node was
+  **g5.xlarge A10G** (tfvars fallback; g6.xlarge dry in 1a, then in
+  1b the ASG took g5.xlarge). So today's 6.5K prefill / 1.6K decode
+  plateau figures are A10G — the 11-22 19K/12.2K ceilings are L4;
+  do not diff across. A10G-vs-L4 same-shape comparison still needed.
+- [x] **vLLM waiting-queue telemetry now live** (the 11-22 gap):
+  `vllm:num_requests_waiting` scraped every run; peaked at 727–739 in
+  saturation runs, 0 in sub-knee runs. vLLM's internal queue is
+  self-limited ~740; system-wide running+waiting ~990 < 1024 budget.
+- [ ] **Traffic sender silently skips offered arrivals** (found today,
+  scope agreed with user, NOT implemented): the measured send loop
+  re-derives delays from current elapsed time and blocks on the
+  inflight semaphore without accumulating a schedule
+  (`internal/traffic/runner.go` measured loop, `tracked:false`) — at
+  600 rq/s offered, ~7.9K of ~12K arrivals were never sent, with no
+  counter. Fix: offered/sent/skipped accounting in the summary (+ the
+  true steps-average `requested_rate` — today it reported the default
+  `rate` flag 10 instead). Unit tests per AGENTS.md. **This is the
+  first item for the next session.**
+- [ ] **Valve order documented**: runner semaphore (silent) → API 429
+  `server busy` at `MAX_INFLIGHT=1000` (marks run invalid) → vLLM
+  admission 429/503 (dies in the worker as a timeout, per the backlog
+  investigation). With current caps vLLM's own admission cap is
+  unreachable in-cluster; reaching it needs TRAFFIC_MAX_INFLIGHT and
+  API MAX_INFLIGHT > ~2500.
+- [ ] promcapture default-match anchoring bug fixed
+  (`vllm:.*|DCGM_.*|mastori_.*`, `TestDefaultMatchAnchoredNames`) —
+  working tree, needs commit+push; CI workflow for cmd/promcapture
+  under the paths-filter rule.
+- [ ] Export-before-destroy for this session done for metrics+runs+
+  provenance; **results submodule commit/push + story still open**
+  (Milestone 2 "formal experiment dir" item).
+
+
 - [ ] **NVIDIA stack:** GPU Operator (or device plugin), pinned driver/CUDA
   versions, `dcgm-exporter` metrics, DCGM pre-run diagnostics before a GPU
   enters a comparison. Partial 2026-11-20 (groundwork): GPU node group
@@ -257,6 +298,20 @@ error/edge cases.
   - Rolling updates of GPU-pod deployments deadlock (new pod waits for the
     GPU the old pod holds): recycle with `scale --replicas=0` → delete pods
     → `scale --replicas=1` instead of waiting on a hung rollout.
+  - GPU nodegroup now spans both private AZs (`eks.tf`) and tfvars carries
+    `gpu_instance_types = ["g6.xlarge", "g5.xlarge"]` (2026-11-23): 1a ran
+    dry of g6.xlarge (InsufficientInstanceCapacity); node came up in 1b as
+    g6.xlarge. Terraform-replacing the nodegroup resets scaling to 0 —
+    re-run `aws-gpu-scale GPU_NODES=1` after any nodegroup replacement.
+    Root-volume fix verified live: ephemeral-storage ≈ 120GB, gpu=1
+    advertised. The inference-adapter is scaled to 0 on EKS (not in the
+    cloud request path; vllmworker → vllm directly), and the
+    inference-config overlay patch now points OLLAMA_BASE_URL at
+    `http://vllm:8000` so the configmap is coherent if it's ever used.
+  - Prometheus targets verified up at bring-up (vllm:8000, dcgm:9400,
+    scheduler:8081, api): `vllm:num_requests_running/waiting`,
+    `vllm:kv_cache_usage_perc`, `vllm:*_tokens_total`, scheduler queue
+    gauges, `DCGM_FI_DEV_GPU_UTIL_RATIO` all present.
 - [ ] **GPU node group** scales to zero; Budgets alert on; spot allowed only
   with the interrupted-run-is-invalid rule. Node group done 2026-11-20
   (`desired=min=0` default, ON_DEMAND; spot via `gpu_capacity_type`).

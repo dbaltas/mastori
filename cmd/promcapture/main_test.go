@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +47,7 @@ func TestRunGroupsByMetricName(t *testing.T) {
 	end := start.Add(10 * time.Minute)
 	out := t.TempDir()
 
-	path, err := run(srv.URL, out, start, end, "15s", `vllm:|mastori_`)
+	path, err := run(srv.URL, out, start, end, "15s", defaultMatch)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -57,7 +59,7 @@ func TestRunGroupsByMetricName(t *testing.T) {
 		t.Fatalf("queries = %d, want 1", len(*queries))
 	}
 	q := (*queries)[0]
-	if q.Get("query") != `{__name__=~"vllm:|mastori_"}` {
+	if q.Get("query") != fmt.Sprintf(`{__name__=~%q}`, defaultMatch) {
 		t.Errorf("query = %q", q.Get("query"))
 	}
 	if q.Get("start") != start.Format(time.RFC3339) || q.Get("end") != end.Format(time.RFC3339) {
@@ -87,6 +89,32 @@ func TestRunGroupsByMetricName(t *testing.T) {
 	}
 	if _, ok := payload["DCGM_FI_DEV_GPU_UTIL_RATIO"]; ok {
 		t.Errorf("non-matching metric present in output")
+	}
+}
+
+// TestDefaultMatchAnchoredNames guards the 2026-11-23 bug: Prometheus
+// __name__ regexes are fully anchored, so alternatives without a trailing
+// wildcard (the old `vllm:|DCGM_|mastori_`) matched zero series and the
+// capture came back empty. Every alternative must end in .*
+// (or otherwise cover full names) for the real metric families.
+func TestDefaultMatchAnchoredNames(t *testing.T) {
+	re, err := regexp.Compile(defaultMatch)
+	if err != nil {
+		t.Fatalf("default match invalid: %v", err)
+	}
+	real := []string{
+		"vllm:generation_tokens_total",
+		"vllm:num_requests_waiting",
+		"vllm:time_to_first_token_seconds",
+		"DCGM_FI_DEV_GPU_UTIL_RATIO",
+		"DCGM_FI_PROF_GR_ENGINE_ACTIVE",
+		"mastori_api_inflight_requests",
+		"mastori_scheduler_queue_depth",
+	}
+	for _, name := range real {
+		if !re.MatchString(name) {
+			t.Errorf("default match does not match %q (anchored __name__ regex?)", name)
+		}
 	}
 }
 

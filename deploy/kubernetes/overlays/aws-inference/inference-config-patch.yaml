@@ -5,3 +5,8 @@ metadata:
   namespace: mastori
 data:
   INFERENCE_MODEL: "qwen3-4b"
+  DEFAULT_MODEL: "qwen3-4b"
+  # Cloud path: the OpenAI-compatible adapter fronts the real vLLM server
+  # (same OpenAI API), not the kind-local Ollama endpoint baked into the
+  # shared component's base configmap.
+  OLLAMA_BASE_URL: "http://vllm:8000"

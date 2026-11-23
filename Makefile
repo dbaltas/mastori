@@ -402,7 +402,7 @@ cluster-traffic-results:
 # histograms) — the authoritative cross-check against client-side tok/s —
 # plus the DCGM and API series. Run BEFORE teardown; Prometheus retention is
 # 24h. Usage:
-#   make cluster-metrics-capture EXPERIMENT=<name> [START=...] [END=...] [STEP=15s] [MATCH='vllm:|DCGM_|mastori_']
+#   make cluster-metrics-capture EXPERIMENT=<name> [START=...] [END=...] [STEP=15s] [MATCH='vllm:.*|DCGM_.*|mastori_.*']
 # START/END are RFC3339 UTC (END defaults to now, START to END-1h). In a run
 # recipe, pass both explicitly so the window spans the whole experiment.
 cluster-metrics-capture:

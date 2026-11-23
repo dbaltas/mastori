@@ -39,13 +39,21 @@ type rangeResponse struct {
 	} `json:"data"`
 }
 
+// defaultMatch selects the series captured per run: vllm:* engine counters,
+// DCGM_* GPU telemetry, and mastori_* platform gauges. Prometheus __name__
+// regexes are fully anchored, so each alternative must end in .* — the
+// pre-fix `vllm:|DCGM_|mastori_` matched zero series and captured nothing.
+const defaultMatch = `vllm:.*|DCGM_.*|mastori_.*`
+
 func main() {
 	urlFlag := flag.String("url", "http://localhost:9091", "Prometheus base URL")
 	outFlag := flag.String("out", "", "output directory (default: benchmark/results/<EXPERIMENT>/metrics via EXPERIMENT env)")
 	startFlag := flag.String("start", "", "window start, RFC3339 UTC (default: end-1h)")
 	endFlag := flag.String("end", "", "window end, RFC3339 UTC (default: now)")
 	stepFlag := flag.String("step", "15s", "query_range step")
-	matchFlag := flag.String("match", `vllm:|DCGM_|mastori_`, "regex matched against __name__")
+	// Prometheus __name__ regexes are fully anchored, so each alternative
+	// must end in .* to match a series name.
+	matchFlag := flag.String("match", defaultMatch, "regex matched against __name__")
 	flag.Parse()
 
 	out := *outFlag
