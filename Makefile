@@ -287,10 +287,11 @@ traffic-wait:
 
 # Captures the live cluster environment into
 # benchmark/results/<experiment>/environment/ before the first traffic run of
-# an experiment: node dump (instance type, allocatable, labels, taints,
-# kubelet/containerd versions), all mastori pods (images, image digests, env,
-# resources), configmaps (api-config, traffic-config, datasets-manifest),
-# workload list, kubectl version, host info, and a PROVENANCE.md skeleton to
+# an experiment: node dump (instance type, AZ, GPU chip/count, allocatable,
+# labels, taints, kubelet/containerd versions), all mastori pods (images,
+# image digests, env, resources), configmaps (api-config, traffic-config,
+# datasets-manifest), workload list, kubectl version, host info, and a
+# PROVENANCE.md skeleton to
 # hand-finish with context (co-location caveats, Redis state notes, image
 # build source).
 # Usage: make cluster-env-capture EXPERIMENT=20261120-eks-mockworker-knee
@@ -320,8 +321,12 @@ cluster-env-capture:
 	  echo "- benchmark submodule: $$(git -C benchmark rev-parse --short=7 HEAD)"; \
 	  echo "- dataset manifest SHA-256: $$(cat benchmark/results/$(EXPERIMENT)/environment/dataset-manifest.sha256)"; \
 	  echo; \
-	  echo 'Node summary (name, instance type, allocatable CPU/mem):'; \
-	  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.metadata.labels.node\.kubernetes\.io/instance-type}{"  "}{.status.allocatable.cpu}{"  "}{.status.allocatable.memory}{"\n"}{end}' 2>/dev/null | sed 's/^/  /'; \
+	  echo 'Node summary (name, instance type, AZ, GPU chip+count, allocatable CPU/mem):'; \
+	  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.metadata.labels.node\.kubernetes\.io/instance-type}{"  az="}{.metadata.labels.topology\.kubernetes\.io/zone}{"  gpu="}{.metadata.labels.nvidia\.com/gpu\.product}{" x"}{.status.allocatable.nvidia\.com/gpu}{"  "}{.status.allocatable.cpu}{"  "}{.status.allocatable.memory}{"\n"}{end}' 2>/dev/null | sed 's/^/  /'; \
+	  echo; \
+	  echo 'Pool topology (cross-AZ pools mean AZ-transfer cost/latency in the measured path):'; \
+	  echo "  cpu zones: $$(kubectl get nodes -l mastori/pool=cpu -o jsonpath='{range .items[*]}{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}' 2>/dev/null | sort -u | paste -sd, -)"; \
+	  echo "  gpu zones: $$(kubectl get nodes -l mastori/pool=gpu -o jsonpath='{range .items[*]}{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}' 2>/dev/null | sort -u | paste -sd, -)"; \
 	  echo; \
 	  echo 'Workloads in the mastori namespace (deploy/statefulset/job):'; \
 	  kubectl -n mastori get deploy,statefulset,job -o wide 2>/dev/null | sed 's/^/  /'; \
