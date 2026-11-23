@@ -99,3 +99,42 @@ func TestParseStepsErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestOfferedCounts(t *testing.T) {
+	// Constant: rate x window.
+	c := NewConstantPattern(20)
+	if got := c.Offered(30 * time.Second); math.Abs(got-600) > 1e-9 {
+		t.Errorf("constant offered = %v, want 600", got)
+	}
+	// Poisson: expected rate x window.
+	p := NewPoissonPattern(10, rand.New(rand.NewPCG(1, 2)))
+	if got := p.Offered(time.Minute); math.Abs(got-600) > 1e-9 {
+		t.Errorf("poisson offered = %v, want 600", got)
+	}
+	// Ramp: integral of the linear rate, (start+end)/2 x window.
+	r := RampPattern{StartRate: 10, EndRate: 110, Duration: time.Minute}
+	if got := r.Offered(time.Minute); math.Abs(got-3600) > 1e-9 {
+		t.Errorf("ramp offered = %v, want 3600", got)
+	}
+	// Ramp window shorter than pattern duration truncates the integral.
+	if got := r.Offered(30 * time.Second); math.Abs(got-1050) > 1e-9 {
+		t.Errorf("truncated ramp offered = %v, want 1050", got)
+	}
+	// Steps: per-segment rate x duration.
+	s := StepPattern{Segments: []StepSeg{
+		{Rate: 25, Duration: 10 * time.Second},
+		{Rate: 50, Duration: 10 * time.Second},
+		{Rate: 25, Duration: 10 * time.Second},
+	}}
+	if got := s.Offered(30 * time.Second); math.Abs(got-1000) > 1e-9 {
+		t.Errorf("steps offered = %v, want 1000", got)
+	}
+	// Steps window shorter than the segment total truncates mid-segment.
+	if got := s.Offered(15 * time.Second); math.Abs(got-500) > 1e-9 {
+		t.Errorf("truncated steps offered = %v, want 500", got)
+	}
+	// Steps window longer than the segments holds the final rate.
+	if got := s.Offered(40 * time.Second); math.Abs(got-1250) > 1e-9 {
+		t.Errorf("extended steps offered = %v, want 1250", got)
+	}
+}

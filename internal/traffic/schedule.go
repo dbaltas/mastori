@@ -12,6 +12,14 @@ import (
 // deterministic for a seeded RNG.
 type Pattern interface {
 	NextDelay(elapsed time.Duration) time.Duration
+
+	// Offered returns the expected number of scheduled arrivals over the
+	// given window. This is the schedule-implied offered load: arrivals the
+	// sender should attempt. Send-side backpressure (the in-flight
+	// semaphore) can prevent some of them from ever being sent — silently
+	// under the old recompute-from-now loop — so the summary reports
+	// offered vs sent (skipped_offered) to make the gap observable.
+	Offered(window time.Duration) float64
 }
 
 // ConstantPattern sends at a fixed rate.
@@ -24,6 +32,14 @@ func NewConstantPattern(ratePerSec float64) ConstantPattern {
 }
 
 func (p ConstantPattern) NextDelay(time.Duration) time.Duration { return p.Interval }
+
+// Offered returns interval-multiples fitting in the window.
+func (p ConstantPattern) Offered(window time.Duration) float64 {
+	if p.Interval <= 0 {
+		return 0
+	}
+	return window.Seconds() / p.Interval.Seconds()
+}
 
 // PoissonPattern draws exponential inter-arrival times (mean 1/rate).
 type PoissonPattern struct {
@@ -40,6 +56,15 @@ func NewPoissonPattern(ratePerSec float64, rng *rand.Rand) PoissonPattern {
 
 func (p PoissonPattern) NextDelay(time.Duration) time.Duration {
 	return time.Duration(p.rng.ExpFloat64() * float64(p.Mean))
+}
+
+// Offered returns the expected arrival count (rate x window); actual
+// Poisson arrivals vary around it.
+func (p PoissonPattern) Offered(window time.Duration) float64 {
+	if p.Mean <= 0 {
+		return 0
+	}
+	return window.Seconds() / p.Mean.Seconds()
 }
 
 // RampPattern linearly ramps the rate from Start to End over the run.
@@ -73,6 +98,19 @@ func (p RampPattern) NextDelay(elapsed time.Duration) time.Duration {
 	return time.Duration(float64(time.Second) / r)
 }
 
+// Offered integrates the instantaneous rate over the window (the exact
+// integral of a linear ramp truncated at the pattern duration).
+func (p RampPattern) Offered(window time.Duration) float64 {
+	w := window
+	if p.Duration > 0 && w > p.Duration {
+		w = p.Duration
+	}
+	if w <= 0 {
+		return 0
+	}
+	return (p.StartRate + p.rateAt(w)) / 2 * w.Seconds()
+}
+
 // StepSeg is one phase of a step pattern: a fixed rate held for a duration.
 type StepSeg struct {
 	Rate     float64
@@ -102,6 +140,33 @@ func (p StepPattern) NextDelay(elapsed time.Duration) time.Duration {
 		return time.Hour
 	}
 	return time.Duration(float64(time.Second) / rate)
+}
+
+// Offered integrates each segment's rate over its span, truncated at the
+// window. Past the last segment the pattern holds the final rate (matching
+// NextDelay), so a window longer than the segment total keeps counting at
+// that rate.
+func (p StepPattern) Offered(window time.Duration) float64 {
+	remaining := window
+	if remaining <= 0 {
+		return 0
+	}
+	var n float64
+	for _, seg := range p.Segments {
+		if remaining <= 0 {
+			break
+		}
+		w := seg.Duration
+		if w > remaining {
+			w = remaining
+		}
+		n += seg.Rate * w.Seconds()
+		remaining -= w
+	}
+	if remaining > 0 && len(p.Segments) > 0 {
+		n += p.Segments[len(p.Segments)-1].Rate * remaining.Seconds()
+	}
+	return n
 }
 
 // ParseSteps parses a step spec like "10:30s,50:60s" into segments.

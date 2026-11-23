@@ -688,6 +688,86 @@ func TestRunHangServerBoundedBySendTimeout(t *testing.T) {
 	}
 }
 
+func TestRunSummaryReportsOfferedAndSkipped(t *testing.T) {
+	// A 50ms server with a 3-slot in-flight cap cannot keep up with a
+	// 100 req/s schedule: the sender blocks on the semaphore and arrivals
+	// are skipped. The summary must surface offered vs sent instead of
+	// silently losing them.
+	srv := fakeAPI(t, 50*time.Millisecond, http.StatusOK)
+	out := t.TempDir() + "/results.jsonl"
+
+	cfg := &Config{
+		URL:      srv.URL,
+		Rows:     []Row{{Dataset: "d", Index: 0, Text: "p"}},
+		Weights:  map[string]float64{"d": 1},
+		Seed:     1,
+		Duration: 300 * time.Millisecond,
+		Rate:     10, // base flag; steps must win in requested_rate
+		Steps:    []StepSeg{{Rate: 100, Duration: 300 * time.Millisecond}},
+		// MaxInflight: 3 default would be 4x100=400; pin it low.
+		MaxInflight: 3,
+		Timeout:     5 * time.Second,
+		OutputPath:  out,
+	}
+
+	summary, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if summary.OfferedRequests != 30 {
+		t.Errorf("offered_requests = %d, want 30 (100 req/s x 300ms)", summary.OfferedRequests)
+	}
+	if summary.Requests >= summary.OfferedRequests {
+		t.Fatalf("test setup wrong: no backpressure skip (%d sent vs %d offered)", summary.Requests, summary.OfferedRequests)
+	}
+	if summary.SkippedOffered != summary.OfferedRequests-summary.Requests {
+		t.Errorf("skipped_offered = %d, want %d", summary.SkippedOffered, summary.OfferedRequests-summary.Requests)
+	}
+	// requested_rate must be the steps average, not the base rate flag.
+	if summary.RequestedRate != 100 {
+		t.Errorf("requested_rate = %v, want 100 (steps average)", summary.RequestedRate)
+	}
+}
+
+func TestRunSummaryRequestedRateIsStepsAverage(t *testing.T) {
+	// Fast server, so nothing is skipped: requested_rate must still report
+	// the steps average (25+75)/2, not the base cfg.Rate flag.
+	srv := fakeAPI(t, time.Millisecond, http.StatusOK)
+	out := t.TempDir() + "/results.jsonl"
+
+	cfg := &Config{
+		URL:      srv.URL,
+		Rows:     []Row{{Dataset: "d", Index: 0, Text: "p"}},
+		Weights:  map[string]float64{"d": 1},
+		Seed:     1,
+		Duration: 200 * time.Millisecond,
+		Rate:     10, // base flag; steps must win in requested_rate
+		Steps: []StepSeg{
+			{Rate: 25, Duration: 100 * time.Millisecond},
+			{Rate: 75, Duration: 100 * time.Millisecond},
+		},
+		Timeout:    5 * time.Second,
+		OutputPath: out,
+	}
+
+	summary, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if summary.RequestedRate != 50 {
+		t.Errorf("requested_rate = %v, want 50", summary.RequestedRate)
+	}
+	if summary.OfferedRequests != 10 {
+		t.Errorf("offered_requests = %d, want 10", summary.OfferedRequests)
+	}
+	// Off-by-one boundary slack is possible when the last scheduled send
+	// lands exactly on the window edge; anything beyond that is an
+	// accounting bug.
+	if summary.SkippedOffered > 1 {
+		t.Errorf("skipped_offered = %d, want <=1 on an unloaded run", summary.SkippedOffered)
+	}
+}
+
 func TestContextCancelStopsRun(t *testing.T) {
 	srv := fakeAPI(t, 10*time.Millisecond, http.StatusOK)
 	out := t.TempDir() + "/results.jsonl"

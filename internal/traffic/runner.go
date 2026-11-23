@@ -133,6 +133,12 @@ type Summary struct {
 	Errors            map[string]int `json:"errors"`
 	RequestedRate     float64        `json:"requested_rate"`
 	AchievedSendRate  float64        `json:"achieved_send_rate"`
+	// OfferedRequests is the schedule-implied arrival count for the
+	// measured window (expected for Poisson); SkippedOffered is how many
+	// of those were never sent because the in-flight semaphore held the
+	// sender back (open-loop only; closed-loop reports neither).
+	OfferedRequests int `json:"offered_requests,omitempty"`
+	SkippedOffered  int `json:"skipped_offered,omitempty"`
 	Throughput        float64        `json:"throughput_rps"`
 	LatencyMsP50      float64        `json:"latency_ms_p50"`
 	LatencyMsP95      float64        `json:"latency_ms_p95"`
@@ -305,6 +311,10 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		drainGrace = cfg.Timeout + 10*time.Second
 	}
 	barrier := newWarmupBarrier(warmupEnd, drainGrace)
+	var offered float64
+	if cfg.Concurrency == 0 {
+		offered = pattern.Offered(cfg.Duration)
+	}
 
 	summaryPath := SummaryPath(cfg.OutputPath)
 	startSummary := &Summary{
@@ -450,6 +460,17 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	s.WarmupDrainMs = barrier.drainWall.Milliseconds()
 	s.FinishedAt = finished
 	s.OutputPath = cfg.OutputPath
+	if cfg.Concurrency == 0 {
+		// Open-loop: offered is the schedule-implied arrival count for the
+		// measured window, and requested_rate is the true offered average
+		// (with steps, cfg.Rate is just the base flag, not what was
+		// scheduled).
+		s.OfferedRequests = int(math.Round(offered))
+		if s.Requests < s.OfferedRequests {
+			s.SkippedOffered = s.OfferedRequests - s.Requests
+		}
+		s.RequestedRate = offered / cfg.Duration.Seconds()
+	}
 	interrupted := checkInterrupted(cfg)
 	if interrupted {
 		s.Errors["interrupted"]++
