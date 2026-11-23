@@ -22,8 +22,10 @@
 # Nothing here bills by itself: vllmworker/vllm request nvidia.com/gpu and
 # stay Pending until a GPU node is scaled up (make aws-gpu-scale) and the
 # device plugin DaemonSet is running. The Ollama adapter from
-# components/inference still deploys (shared component) but is unused on
-# EKS: point its OLLAMA_BASE_URL at a real Ollama instance only when needed.
+# components/inference is scaled to 0 here: the cloud path is
+# vllmworker → vLLM (OpenAI-compatible) directly, so the adapter is
+# unused on EKS and was only ever a readiness-gate red herring on the
+# GPU pool (observed 2026-11-23).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -39,6 +41,15 @@ patches:
   - path: pull-policy.yaml
   - path: inference-config-patch.yaml
   - path: vllmworker-patch.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: inference-adapter
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 0
   - target:
       group: apps
       version: v1
