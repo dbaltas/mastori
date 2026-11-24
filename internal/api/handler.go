@@ -41,6 +41,13 @@ func NewHandler(cfg *config.Config, q queue.Queue, m *metrics.Metrics, logger *s
 type generateRequest struct {
 	Prompt string `json:"prompt"`
 	Model  string `json:"model"`
+	// MaxTokens caps output tokens; 0/absent leaves the backend default.
+	MaxTokens int64 `json:"max_tokens"`
+	// IgnoreEOS keeps the backend generating until MaxTokens is reached.
+	IgnoreEOS bool `json:"ignore_eos"`
+	// Temperature pins sampling when present; absent leaves the backend
+	// default (nil on the job).
+	Temperature *float64 `json:"temperature"`
 }
 
 type generateResponse struct {
@@ -270,11 +277,14 @@ func (h *Handler) parseAndEnqueue(w http.ResponseWriter, r *http.Request, ctx co
 	)
 
 	job := queue.Job{
-		ID:        newJobID(),
-		TraceID:   traceIDFromContext(ctx),
-		Model:     model,
-		Prompt:    req.Prompt,
-		CreatedAt: time.Now().UTC(),
+		ID:          newJobID(),
+		TraceID:     traceIDFromContext(ctx),
+		Model:       model,
+		Prompt:      req.Prompt,
+		CreatedAt:   time.Now().UTC(),
+		MaxTokens:   req.MaxTokens,
+		IgnoreEOS:   req.IgnoreEOS,
+		Temperature: req.Temperature,
 	}
 	job.Traceparent, job.Tracestate = tracing.InjectTraceContext(ctx)
 	span.SetAttributes(attribute.String("job.id", job.ID))

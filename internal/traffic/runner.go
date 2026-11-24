@@ -34,6 +34,21 @@ type Config struct {
 	MaxInflight int
 	Stream      bool // use the SSE /generate/stream endpoint
 	Timeout     time.Duration
+	// GenerationParams are sent on every request so the measured workload's
+	// output length and sampling are explicit rather than backend defaults.
+	GenerationParams
+	// SchedulerURL gates the run against the scheduler's /metrics endpoint
+	// when set (plus ExpectedWorkers): before the run, workers_healthy must
+	// equal ExpectedWorkers; after the run, per-worker dispatched_total
+	// counters are recorded in the summary. Empty disables the gate.
+	SchedulerURL string
+	// ExpectedWorkers is the healthy-worker count the preflight gate
+	// requires; 0 disables the preflight check.
+	ExpectedWorkers int
+	// Smoke runs one preflight streaming request and asserts chunks > 1,
+	// TTFT < e2e, and (for ignore_eos runs) tokens_out == max_tokens; a
+	// failure aborts the run. The result is recorded in the summary.
+	Smoke bool
 	// DrainGrace caps how long the measured phase waits for in-flight
 	// warmup requests to finish (default Timeout + 10s).
 	DrainGrace time.Duration
@@ -42,6 +57,12 @@ type Config struct {
 	// a run executed inside the cluster is recoverable from the pod logs
 	// (distroless images have no shell, so results cannot be copied out).
 	RecordsStdout bool
+	// preflightHealthy stores the preflight workers_healthy observation for
+	// the summary (set by Run when the scheduler gate is configured).
+	preflightHealthy int
+	// smokeCheck stores the preflight smoke result for the summary (set by
+	// Run when the smoke gate is configured), including on failure.
+	smokeCheck *SmokeCheck
 	// ManifestSHA256 identifies the seed data: the SHA-256 of the dataset
 	// manifest that produced the cache rows, empty when unknown.
 	ManifestSHA256 string
@@ -137,23 +158,42 @@ type Summary struct {
 	// measured window (expected for Poisson); SkippedOffered is how many
 	// of those were never sent because the in-flight semaphore held the
 	// sender back (open-loop only; closed-loop reports neither).
-	OfferedRequests int `json:"offered_requests,omitempty"`
-	SkippedOffered  int `json:"skipped_offered,omitempty"`
-	Throughput        float64        `json:"throughput_rps"`
-	LatencyMsP50      float64        `json:"latency_ms_p50"`
-	LatencyMsP95      float64        `json:"latency_ms_p95"`
-	LatencyMsP99      float64        `json:"latency_ms_p99"`
-	LatencyMsMean     float64        `json:"latency_ms_mean"`
-	LatencyMsMin      float64        `json:"latency_ms_min"`
-	LatencyMsMax      float64        `json:"latency_ms_max"`
-	TTFTMsP50         float64        `json:"ttft_ms_p50"`
-	TTFTMsP95         float64        `json:"ttft_ms_p95"`
-	TTFTMsMean        float64        `json:"ttft_ms_mean"`
-	TokensOutTotal    int64          `json:"tokens_out_total"`
-	TokensInTotal     int64          `json:"tokens_in_total"`
-	OutputPath        string         `json:"output_path"`
-	Mode              string         `json:"mode"`
-	Datasets          map[string]int `json:"datasets"`
+	OfferedRequests int     `json:"offered_requests,omitempty"`
+	SkippedOffered  int     `json:"skipped_offered,omitempty"`
+	Throughput      float64 `json:"throughput_rps"`
+	// MaxInflight records the in-flight ceiling the run enforced (open
+	// loop), so saturated-latency numbers are read together with the cap
+	// that produced them (Little's law: the cap sets the latency band).
+	MaxInflight    int            `json:"max_inflight,omitempty"`
+	LatencyMsP50   float64        `json:"latency_ms_p50"`
+	LatencyMsP95   float64        `json:"latency_ms_p95"`
+	LatencyMsP99   float64        `json:"latency_ms_p99"`
+	LatencyMsMean  float64        `json:"latency_ms_mean"`
+	LatencyMsMin   float64        `json:"latency_ms_min"`
+	LatencyMsMax   float64        `json:"latency_ms_max"`
+	TTFTMsP50      float64        `json:"ttft_ms_p50"`
+	TTFTMsP95      float64        `json:"ttft_ms_p95"`
+	TTFTMsMean     float64        `json:"ttft_ms_mean"`
+	TokensOutTotal int64          `json:"tokens_out_total"`
+	TokensInTotal  int64          `json:"tokens_in_total"`
+	OutputPath     string         `json:"output_path"`
+	Mode           string         `json:"mode"`
+	Datasets       map[string]int `json:"datasets"`
+	// GenerationParams records the run's output-control parameters, so a
+	// summary is self-describing about what shaped its output lengths.
+	GenerationParams
+	// SmokeCheck records the preflight smoke request's result when the
+	// smoke gate is enabled.
+	SmokeCheck *SmokeCheck `json:"smoke_check,omitempty"`
+	// WorkersHealthyPreflight is the scheduler's mastori_scheduler_workers_healthy
+	// gauge observed before the run; ExpectedWorkers is what it was required
+	// to be. Both are recorded only when the scheduler gate is configured.
+	WorkersHealthyPreflight int `json:"workers_healthy_preflight,omitempty"`
+	ExpectedWorkers         int `json:"expected_workers,omitempty"`
+	// DispatchedByWorker maps worker id -> mastori_scheduler_dispatched_total
+	// observed after the run, so a stray worker (e.g. a mock worker serving
+	// GPU models) is visible in the summary itself.
+	DispatchedByWorker map[string]int64 `json:"dispatched_by_worker,omitempty"`
 	// DatasetManifestSHA256 identifies the seed data the run replayed
 	// (SHA-256 of the dataset manifest), empty when unknown.
 	DatasetManifestSHA256 string `json:"dataset_manifest_sha256,omitempty"`
@@ -288,6 +328,27 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		return nil, err
 	}
 
+	// Preflight gate: abort before sending traffic when the scheduler does
+	// not report the expected number of healthy workers. A run against a
+	// half-registered fleet (e.g. a mock worker still serving every model)
+	// is not worth executing, let alone publishing.
+	if cfg.SchedulerURL != "" && cfg.ExpectedWorkers > 0 {
+		healthy, err := CheckWorkersHealthy(ctx, cfg.SchedulerURL, cfg.ExpectedWorkers)
+		if err != nil {
+			return nil, err
+		}
+		cfg.preflightHealthy = int(healthy)
+	}
+	// Smoke gate: one real request must stream before the run is allowed
+	// to start (chunks > 1, TTFT < e2e, output length honored).
+	if cfg.Smoke {
+		sc, err := RunSmokeCheck(ctx, cfg)
+		cfg.smokeCheck = sc
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	fileWriter, err := NewResultWriter(cfg.OutputPath)
 	if err != nil {
 		return nil, err
@@ -300,7 +361,7 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		writer = fileWriter
 	}
 
-	sender := NewSender(cfg.URL, cfg.Model, cfg.Stream, cfg.Timeout)
+	sender := NewSender(cfg.URL, cfg.Model, cfg.Stream, cfg.GenerationParams, cfg.Timeout)
 	selector := NewWeightedRowSource(cfg.Rows, cfg.Weights, cfg.Seed)
 	pattern := buildPattern(cfg)
 	total := cfg.Warmup + cfg.Duration
@@ -475,6 +536,19 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	if interrupted {
 		s.Errors["interrupted"]++
 	}
+	// Post-run capture: which workers actually received dispatches. A
+	// summary is the artifact reviewers trust, so the per-worker split is
+	// recorded even when the scheduler is unreachable (with a warning).
+	if cfg.SchedulerURL != "" {
+		captureCtx, captureCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		dispatched, err := FetchDispatchedByWorker(captureCtx, cfg.SchedulerURL)
+		captureCancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: read per-worker dispatched counters: %v\n", err)
+		} else {
+			s.DispatchedByWorker = dispatched
+		}
+	}
 	if s.Failures > 0 || interrupted {
 		s.Status = StatusInvalid
 	} else {
@@ -538,6 +612,7 @@ func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, w
 		Chunks:        res.Chunks,
 		TokensIn:      res.APIResp.TokensIn,
 		TokensOut:     res.APIResp.TokensOut,
+		MaxTokens:     cfg.GenerationParams.MaxTokens,
 		APITotalMs:    res.APIResp.TotalMs,
 		Error:         errMsg,
 	}
@@ -581,6 +656,13 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 	}
 	s.DatasetManifestSHA256 = cfg.ManifestSHA256
 	s.Mode = modeLabel(cfg)
+	s.GenerationParams = cfg.GenerationParams
+	if cfg.Concurrency == 0 {
+		s.MaxInflight = cfg.inflightLimit()
+	}
+	s.WorkersHealthyPreflight = cfg.preflightHealthy
+	s.ExpectedWorkers = cfg.ExpectedWorkers
+	s.SmokeCheck = cfg.smokeCheck
 	if a.latency.Count() > 0 {
 		s.LatencyMsP50 = a.latency.Percentile(50)
 		s.LatencyMsP95 = a.latency.Percentile(95)

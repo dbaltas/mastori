@@ -17,6 +17,13 @@
 # Serving: --served-model-name qwen3-4b keeps job model names short and
 # stable across model-image changes; --max-model-len bounds KV-cache
 # allocation so the L4's 24GB leaves headroom for concurrency.
+#
+# Scheduler knobs are pinned explicitly rather than left at engine defaults:
+# the 2026-11-23 GPU session assumed --max-num-seqs 1024 while the engine ran
+# the default 256 (vllm:num_requests_running peaked at exactly 256), which is
+# what capped saturation and KV usage at ~29% (2026-11-24 review, H5). Any
+# sweep of these values must be a deliberate, recorded experiment: change the
+# pin here, re-capture the environment, and cite both in the story.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -106,6 +113,10 @@ spec:
             - qwen3-4b
             - --max-model-len
             - "8192"
+            # Pinned at the engine default (256) so the running config is
+            # explicit and captured; see the comment above the Deployment.
+            - --max-num-seqs
+            - "256"
           ports:
             - containerPort: 8000
               name: http

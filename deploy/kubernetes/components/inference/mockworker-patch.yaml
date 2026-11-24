@@ -1,0 +1,14 @@
+# Benchmark review 2026-11-24 (H1): a mock worker with no WORKER_MODELS
+# matches every model in the registry and round-robin then splits benchmark
+# traffic between the real worker and the mock fleet (the 2026-11-22 EKS GPU
+# session lost 2/3 of its requests to two mock workers this way). In the
+# inference overlays a real worker serves the model, so the mock workers
+# must register for the mock model only. The base stack (overlays/local)
+# keeps the serve-any default because its jobs use the "default" model.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mockworker-config
+  namespace: mastori
+data:
+  WORKER_MODELS: "mock"

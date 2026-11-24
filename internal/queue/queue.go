@@ -15,6 +15,16 @@ type Job struct {
 	Model       string
 	Prompt      string
 	CreatedAt   time.Time
+	// MaxTokens caps output tokens for this job; 0 leaves the backend's
+	// default in place (the worker's INFERENCE_MAX_TOKENS, then the
+	// backend's own default).
+	MaxTokens int64
+	// IgnoreEOS keeps the backend generating until MaxTokens is reached,
+	// so a benchmark run measures a known output length instead of the
+	// model's natural stopping point.
+	IgnoreEOS bool
+	// Temperature pins sampling when set; nil leaves the backend default.
+	Temperature *float64
 }
 
 type Result struct {

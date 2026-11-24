@@ -2,7 +2,9 @@ package traffic
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,7 +46,7 @@ func streamAPI(t *testing.T, delay, tokenGap time.Duration, chunks int, status i
 
 func TestSendStream(t *testing.T) {
 	srv := streamAPI(t, 5*time.Millisecond, 5*time.Millisecond, 5, http.StatusOK)
-	s := NewSender(srv.URL, "", true, 5*time.Second)
+	s := NewSender(srv.URL, "", true, GenerationParams{}, 5*time.Second)
 
 	res, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"})
 	if err != nil {
@@ -74,7 +76,7 @@ func TestSendStreamZeroChunks(t *testing.T) {
 		fmt.Fprint(w, "event: done\ndata: [DONE]\n\n")
 	}))
 	t.Cleanup(srv.Close)
-	s := NewSender(srv.URL, "", true, 5*time.Second)
+	s := NewSender(srv.URL, "", true, GenerationParams{}, 5*time.Second)
 
 	if _, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"}); err == nil {
 		t.Error("stream without chunks should error")
@@ -89,7 +91,7 @@ func TestSendStreamErrorEvent(t *testing.T) {
 		fmt.Fprint(w, "event: error\ndata: {\"error\":\"timed out\"}\n\n")
 	}))
 	t.Cleanup(srv.Close)
-	s := NewSender(srv.URL, "", true, 5*time.Second)
+	s := NewSender(srv.URL, "", true, GenerationParams{}, 5*time.Second)
 
 	_, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"})
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
@@ -99,7 +101,7 @@ func TestSendStreamErrorEvent(t *testing.T) {
 
 func TestSendStreamNon200(t *testing.T) {
 	srv := streamAPI(t, 0, 0, 5, http.StatusServiceUnavailable)
-	s := NewSender(srv.URL, "", true, 5*time.Second)
+	s := NewSender(srv.URL, "", true, GenerationParams{}, 5*time.Second)
 
 	res, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"})
 	if err == nil {
@@ -120,7 +122,7 @@ func TestSendBlockingUnchanged(t *testing.T) {
 		fmt.Fprint(w, `{"job_id":"j1","text":"ok","tokens_in":3,"tokens_out":7,"total_ms":9}`)
 	}))
 	t.Cleanup(srv.Close)
-	s := NewSender(srv.URL, "", false, 5*time.Second)
+	s := NewSender(srv.URL, "", false, GenerationParams{}, 5*time.Second)
 
 	res, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"})
 	if err != nil {
@@ -145,11 +147,66 @@ func TestSendStreamPath(t *testing.T) {
 	}))
 	t.Cleanup(rec.Close)
 
-	s := NewSender(rec.URL, "", true, 5*time.Second)
+	s := NewSender(rec.URL, "", true, GenerationParams{}, 5*time.Second)
 	if _, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if gotPath != "/generate/stream" {
 		t.Errorf("stream mode hit %s", gotPath)
+	}
+}
+
+func TestSendGenerationParams(t *testing.T) {
+	// Output-control parameters must reach the API request body: without
+	// max_tokens the backend default (vLLM completions: 16) shapes the
+	// measured workload silently (2026-11-24 review, H3).
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"job_id":"j1","text":"ok","tokens_in":1,"tokens_out":1,"total_ms":1}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	temp := 0.0
+	s := NewSender(srv.URL, "m", false, GenerationParams{
+		MaxTokens:   256,
+		IgnoreEOS:   true,
+		Temperature: &temp,
+	}, 5*time.Second)
+	if _, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got["max_tokens"] != float64(256) || got["ignore_eos"] != true || got["temperature"] != float64(0) {
+		t.Errorf("generation params = %v, want max_tokens 256, ignore_eos true, temperature 0", got)
+	}
+	if got["prompt"] != "p" || got["model"] != "m" {
+		t.Errorf("prompt/model lost: %v", got)
+	}
+}
+
+func TestSendOmitsUnsetGenerationParams(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"job_id":"j1","text":"ok","tokens_in":1,"tokens_out":1,"total_ms":1}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	s := NewSender(srv.URL, "", false, GenerationParams{}, 5*time.Second)
+	if _, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	for _, key := range []string{"max_tokens", "ignore_eos", "temperature", "model"} {
+		if _, present := got[key]; present {
+			t.Errorf("%s present in request, want omitted", key)
+		}
 	}
 }

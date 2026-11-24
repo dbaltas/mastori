@@ -4,3 +4,6 @@ kind: Component
 resources:
   - adapter.yaml
   - vllmworker.yaml
+
+patches:
+  - path: mockworker-patch.yaml

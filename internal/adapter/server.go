@@ -330,11 +330,17 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, spec s
 		if firstAt.IsZero() {
 			firstAt = now
 			s.Metrics.TTFTSeconds.WithLabelValues(spec.model).Observe(firstAt.Sub(start).Seconds())
-			if !emit(map[string]any{
-				"id": id, "object": object, "created": start.Unix(), "model": spec.model,
-				"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
-			}) {
-				return errClientGone
+			// Chat completions open with a role delta; the plain
+			// completions API has no role and streams text directly, so
+			// consumers parsing choices[].text (the worker's
+			// OpenAIGenerator) see the first token here.
+			if spec.chat {
+				if !emit(map[string]any{
+					"id": id, "object": object, "created": start.Unix(), "model": spec.model,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
+				}) {
+					return errClientGone
+				}
 			}
 		} else if !lastAt.IsZero() {
 			s.Metrics.TimePerOutputToken.WithLabelValues(spec.model).Observe(now.Sub(lastAt).Seconds())
@@ -348,9 +354,15 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, spec s
 		if content != "" {
 			text.WriteString(content)
 			tokensOut++
+			var choice map[string]any
+			if spec.chat {
+				choice = map[string]any{"index": 0, "delta": map[string]any{"content": content}, "finish_reason": nil}
+			} else {
+				choice = map[string]any{"index": 0, "text": content, "finish_reason": nil}
+			}
 			if !emit(map[string]any{
 				"id": id, "object": object, "created": start.Unix(), "model": spec.model,
-				"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": content}, "finish_reason": nil}},
+				"choices": []map[string]any{choice},
 			}) {
 				return errClientGone
 			}
@@ -365,9 +377,13 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, spec s
 		return
 	}
 
+	finalChoice := map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}
+	if !spec.chat {
+		finalChoice = map[string]any{"index": 0, "text": "", "finish_reason": "stop"}
+	}
 	_ = emit(map[string]any{
 		"id": id, "object": object, "created": start.Unix(), "model": spec.model,
-		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		"choices": []map[string]any{finalChoice},
 	})
 	if spec.includeUsage {
 		usage := openAIUsage{

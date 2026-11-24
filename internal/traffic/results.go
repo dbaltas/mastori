@@ -29,8 +29,12 @@ type Record struct {
 	Chunks        int       `json:"chunks,omitempty"`
 	TokensIn      int64     `json:"tokens_in"`
 	TokensOut     int64     `json:"tokens_out"`
-	APITotalMs    int64     `json:"api_total_ms"`
-	Error         string    `json:"error,omitempty"`
+	// MaxTokens is the output-token cap requested for this request, so
+	// requested vs actual completion_tokens (TokensOut) is visible per row
+	// instead of hidden in a backend default.
+	MaxTokens  int64  `json:"max_tokens,omitempty"`
+	APITotalMs int64  `json:"api_total_ms"`
+	Error      string `json:"error,omitempty"`
 }
 
 // ResultWriter appends records as JSON lines, creating parent directories.

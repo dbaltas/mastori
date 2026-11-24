@@ -41,10 +41,15 @@ type sseEvent struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+	// Choices follows the OpenAI completions streaming schema, which vLLM
+	// serves on /v1/completions: each chunk carries choices[].text, and the
+	// final usage event (stream_options.include_usage) has empty choices.
+	// Chat-completions delta events (choices[].delta.content) are NOT
+	// accepted here: parsing them made the worker see zero tokens on real
+	// vLLM and only the trailing Done chunk, so client TTFT degenerated to
+	// e2e latency (2026-11-24 benchmark review, H2).
 	Choices []struct {
-		Delta struct {
-			Content string `json:"content"`
-		} `json:"delta"`
+		Text string `json:"text"`
 	} `json:"choices"`
 	Usage *struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
@@ -103,8 +108,20 @@ func (g *OpenAIGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 			"include_usage": true,
 		},
 	}
-	if g.MaxTokens > 0 {
+	// Job-level generation parameters (from the benchmark run) win over the
+	// worker-level default, so a run controls its output length explicitly
+	// instead of inheriting the backend's max_tokens default (16 for vLLM
+	// completions).
+	if job.MaxTokens > 0 {
+		body["max_tokens"] = job.MaxTokens
+	} else if g.MaxTokens > 0 {
 		body["max_tokens"] = g.MaxTokens
+	}
+	if job.IgnoreEOS {
+		body["ignore_eos"] = true
+	}
+	if job.Temperature != nil {
+		body["temperature"] = *job.Temperature
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -181,7 +198,7 @@ func (g *OpenAIGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 			return fail(fmt.Errorf("inference: backend error: %s", ev.Error.Message))
 		}
 		for _, c := range ev.Choices {
-			if c.Delta.Content == "" {
+			if c.Text == "" {
 				continue
 			}
 			if !sawFirstToken {
@@ -195,12 +212,12 @@ func (g *OpenAIGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 					attribute.Int64("stream.ttft_ms", ttft.Milliseconds()),
 				))
 			}
-			chunk := queue.Chunk{JobID: job.ID, Text: c.Delta.Content}
+			chunk := queue.Chunk{JobID: job.ID, Text: c.Text}
 			if err := onChunk(chunk); err != nil {
 				return fail(err)
 			}
 			tokensOut++
-			text.WriteString(c.Delta.Content)
+			text.WriteString(c.Text)
 		}
 		if ev.Usage != nil {
 			tokensIn = ev.Usage.PromptTokens

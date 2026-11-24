@@ -86,27 +86,41 @@ func main() {
 	}
 
 	cfg := &traffic.Config{
-		RunID:          runID,
-		URL:            *opts.url,
-		Model:          *opts.model,
-		Rows:           rows,
-		Weights:        weights,
-		Seed:           *opts.seed,
-		Warmup:         *opts.warmup,
-		DrainGrace:     *opts.drainGrace,
-		Duration:       runDuration,
-		Concurrency:    *opts.concurrency,
-		Rate:           *opts.rate,
-		Arrival:        *opts.arrival,
-		RampEndRate:    *opts.rampEnd,
-		Steps:          steps,
-		MaxInflight:    *opts.maxInflight,
-		Stream:         *opts.stream,
-		Timeout:        *opts.timeout,
-		OutputPath:     outPath,
-		RecordsStdout:  *opts.recordsStdout,
-		ManifestSHA256: manifestSHA,
-		RedisAddr:      os.Getenv("REDIS_ADDR"),
+		RunID:           runID,
+		URL:             *opts.url,
+		Model:           *opts.model,
+		Rows:            rows,
+		Weights:         weights,
+		Seed:            *opts.seed,
+		Warmup:          *opts.warmup,
+		DrainGrace:      *opts.drainGrace,
+		Duration:        runDuration,
+		Concurrency:     *opts.concurrency,
+		Rate:            *opts.rate,
+		Arrival:         *opts.arrival,
+		RampEndRate:     *opts.rampEnd,
+		Steps:           steps,
+		MaxInflight:     *opts.maxInflight,
+		Stream:          *opts.stream,
+		Timeout:         *opts.timeout,
+		OutputPath:      outPath,
+		RecordsStdout:   *opts.recordsStdout,
+		ManifestSHA256:  manifestSHA,
+		RedisAddr:       os.Getenv("REDIS_ADDR"),
+		SchedulerURL:    *opts.schedulerURL,
+		ExpectedWorkers: *opts.expectedWorker,
+		Smoke:           *opts.smoke,
+	}
+	// Generation params: temperature is sent unless the user opted out with
+	// a negative value; max_tokens/ignore_eos follow their flags.
+	cfg.MaxTokens = *opts.maxTokens
+	cfg.IgnoreEOS = *opts.ignoreEOS && *opts.maxTokens > 0
+	if *opts.temperature >= 0 {
+		cfg.Temperature = opts.temperature
+	}
+	if cfg.IgnoreEOS && cfg.MaxTokens == 0 {
+		fmt.Fprintln(os.Stderr, "error: --ignore-eos needs --max-tokens")
+		os.Exit(2)
 	}
 
 	ctx, stop := traffic.RunSignalContext(context.Background())

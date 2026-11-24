@@ -32,18 +32,54 @@ type SendResult struct {
 
 // Sender posts single requests to the API. It uses the SSE streaming
 // endpoint when Stream is set, otherwise the blocking /generate endpoint.
+//
+// GenerationParams carries the run's output-control parameters; they are sent
+// on every request so the backend's defaults (vLLM completions defaults to
+// max_tokens=16) cannot silently shape the measured workload.
 type Sender struct {
 	URL    string
 	Model  string
 	Stream bool
-	HTTP   *http.Client
+	GenerationParams
+	HTTP *http.Client
 }
 
-func NewSender(url, model string, stream bool, timeout time.Duration) *Sender {
+// GenerationParams controls output length and sampling per request. The zero
+// value omits every parameter from the request body, leaving backend defaults
+// in place.
+type GenerationParams struct {
+	// MaxTokens caps output tokens; 0 omits the parameter.
+	MaxTokens int64 `json:"max_tokens,omitempty"`
+	// IgnoreEOS makes the backend generate until MaxTokens, so output
+	// length follows the workload instead of the model's stopping point.
+	IgnoreEOS bool `json:"ignore_eos,omitempty"`
+	// Temperature pins sampling when non-nil; nil omits the parameter.
+	Temperature *float64 `json:"temperature,omitempty"`
+}
+
+func (p GenerationParams) body(prompt, model string) map[string]any {
+	body := map[string]any{"prompt": prompt}
+	if model != "" {
+		body["model"] = model
+	}
+	if p.MaxTokens > 0 {
+		body["max_tokens"] = p.MaxTokens
+	}
+	if p.IgnoreEOS {
+		body["ignore_eos"] = true
+	}
+	if p.Temperature != nil {
+		body["temperature"] = *p.Temperature
+	}
+	return body
+}
+
+func NewSender(url, model string, stream bool, params GenerationParams, timeout time.Duration) *Sender {
 	return &Sender{
-		URL:    url,
-		Model:  model,
-		Stream: stream,
+		URL:              url,
+		Model:            model,
+		Stream:           stream,
+		GenerationParams: params,
 		HTTP: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
@@ -63,10 +99,7 @@ func NewSender(url, model string, stream bool, timeout time.Duration) *Sender {
 // error event, and transport failures are all surfaced as errors; the status
 // is always recorded for backpressure analysis.
 func (s *Sender) Send(ctx context.Context, row Row) (SendResult, error) {
-	body, err := json.Marshal(map[string]string{
-		"prompt": row.Text,
-		"model":  s.Model,
-	})
+	body, err := json.Marshal(s.body(row.Text, s.Model))
 	if err != nil {
 		return SendResult{}, fmt.Errorf("encode request: %w", err)
 	}

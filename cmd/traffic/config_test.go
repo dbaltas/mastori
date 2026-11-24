@@ -98,6 +98,43 @@ func TestEnvFlagsReferenceRealFlags(t *testing.T) {
 	}
 }
 
+// The review-fix env vars (output control and run gates) must reach their
+// flags through the ConfigMap path.
+func TestApplyEnvSetsGenerationAndGateFlags(t *testing.T) {
+	fs := flag.NewFlagSet("traffic", flag.ContinueOnError)
+	opts := registerTrafficFlags(fs)
+
+	env := map[string]string{
+		"TRAFFIC_MAX_TOKENS":       "256",
+		"TRAFFIC_IGNORE_EOS":       "true",
+		"TRAFFIC_TEMPERATURE":      "0",
+		"TRAFFIC_SCHEDULER_URL":    "http://scheduler.mastori.svc.cluster.local:8081",
+		"TRAFFIC_EXPECTED_WORKERS": "1",
+		"TRAFFIC_SMOKE":            "true",
+	}
+	if err := applyEnv(fs, func(key string) string { return env[key] }); err != nil {
+		t.Fatalf("applyEnv: %v", err)
+	}
+	if *opts.maxTokens != 256 {
+		t.Errorf("max-tokens = %d, want 256", *opts.maxTokens)
+	}
+	if !*opts.ignoreEOS {
+		t.Error("ignore-eos = false, want true")
+	}
+	if *opts.temperature != 0 {
+		t.Errorf("temperature = %v, want 0", *opts.temperature)
+	}
+	if *opts.schedulerURL != "http://scheduler.mastori.svc.cluster.local:8081" {
+		t.Errorf("scheduler-url = %q", *opts.schedulerURL)
+	}
+	if *opts.expectedWorker != 1 {
+		t.Errorf("expected-workers = %d, want 1", *opts.expectedWorker)
+	}
+	if !*opts.smoke {
+		t.Error("smoke = false, want true")
+	}
+}
+
 func TestManifestHash(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "datasets.yaml")
 	if err := os.WriteFile(path, []byte("datasets:\n  mmlu-short:\n"), 0o644); err != nil {

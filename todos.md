@@ -327,14 +327,14 @@ error/edge cases.
   (`make aws-gpu-scale GPU_NODES=1`), vllm + qwen3-4b weights already in
   ECR (no HF/Docker Hub downloads on nodes), `overlays/aws/traffic`
   rewritten to ECR. Run recipe: scale GPU to 1, `make aws-deploy-inference`,
-  scale mockworker to 0 (`kubectl -n mastori scale deploy/mockworker
-  --replicas=0` — its empty WORKER_MODELS registry entry matches EVERY
-  model and would steal GPU traffic), then
-  `make aws-run-traffic TRAFFIC_MODEL=qwen3-4b TRAFFIC_WORKLOAD=short
+  then `make aws-run-traffic TRAFFIC_MODEL=qwen3-4b TRAFFIC_WORKLOAD=short
   TRAFFIC_STEPS="5:60s,10:60s,20:60s,40:60s,80:60s" TRAFFIC_WARMUP=1m`
-  (TRAFFIC_STEPS is supported by cmd/traffic applyEnv). Scale GPU back to
-  0 right after. Open: INFERENCE_MAX_TOKENS cap so worker outputs match
-  the mock token budgets used by the knee analysis.
+  (TRAFFIC_STEPS is supported by cmd/traffic applyEnv). The aws-inference
+  overlay now scales mockworker to 0 itself (2026-11-24 review fix), so the
+  manual scale-down step is gone. Output length is no longer open:
+  `TRAFFIC_MAX_TOKENS` (+ `TRAFFIC_IGNORE_EOS`, `TRAFFIC_TEMPERATURE=0`)
+  sends an explicit cap with every request (2026-11-24 review fix), so the
+  knee analysis gets a known output length without INFERENCE_MAX_TOKENS.
 - [ ] **Get the AWS account ID out of git.** `273354666694` is hardcoded in
   the overlays (ECR refs in `kustomization.yaml` files, `mirror-jobs.yaml`,
   `vllm-server.yaml`, traffic IRSA role/bucket) and in `infra/aws-ecr`. The
@@ -377,6 +377,46 @@ error/edge cases.
     utilization runs: open admission (no 429 shaping, MAX_INFLIGHT high) so
     the engine is driven to true saturation and peak tok/s is measurable;
     the 429-at-cap variant stays an option for a later formal knee run.
+### Benchmark methodology review 2026-11-24 (mastori-notes/review-2026-11-24/05-benchmark-methodology.md)
+
+- [x] **H2 — completions stream mis-parsed.** `internal/worker/openai.go`
+  parsed chat-completions `choices[].delta.content` while calling
+  `/v1/completions`, so every real vLLM token was dropped: client TTFT
+  equaled e2e, TPOT/ITL were uncomputable, and quality eval was impossible.
+  Done 2026-11-24: worker parses `choices[].text` (the real completions
+  schema), the local adapter emits the real shape for `/v1/completions`
+  (role/content deltas stay on chat), regression tests pin both directions
+  (chat-shaped stream yields no text chunks), and a vLLM-shaped stream
+  fixture (`internal/worker/testdata/`) covers the parser.
+- [x] **H2 — smoke gate.** One preflight streaming request must show
+  `chunks > 1`, `TTFT < e2e`, and (for `ignore_eos` runs)
+  `tokens_out == max_tokens`, or the run aborts. Done 2026-11-24:
+  `TRAFFIC_SMOKE=true` (default in the cluster run targets), result recorded
+  in the summary (`smoke_check`).
+- [x] **H1 — mock workers steal GPU traffic.** Empty `WORKER_MODELS`
+  matches every model, and round-robin then split the 11-22 GPU session 1:2
+  with two mock workers. Done 2026-11-24: inference overlays register
+  mockworker for `mock` only (`components/inference/mockworker-patch.yaml`),
+  the aws-inference overlay scales mockworker to 0 itself, and runs gate on
+  the scheduler: preflight `workers_healthy == TRAFFIC_EXPECTED_WORKERS`
+  (fail-closed abort) plus per-worker `dispatched_total` captured into the
+  summary (`dispatched_by_worker`).
+- [x] **H3 — 16-token output default.** vLLM completions defaults
+  `max_tokens=16`; 100% of the 11-23 requests finished on `length`. Done
+  2026-11-24: `TRAFFIC_MAX_TOKENS`/`TRAFFIC_IGNORE_EOS`/`TRAFFIC_TEMPERATURE`
+  flow through traffic → API → job → worker → vLLM (job-level params win
+  over the worker's `INFERENCE_MAX_TOKENS`), and each JSONL row records the
+  requested cap (`max_tokens`) next to actual `tokens_out`. Still open: per-
+  workload output distributions (needs the §13 spec in the benchmark
+  submodule).
+- [x] **H5 (partial) — pin and record the vLLM scheduler knobs.** The 11-23
+  story assumed `max_num_seqs=1024` while the engine ran the default 256.
+  Done 2026-11-24: `vllm-server.yaml` pins `--max-num-seqs 256` explicitly
+  (any sweep is a deliberate recorded change), and the summary records the
+  sender inflight cap context (`max_inflight` via generation params +
+  preflight worker counts). Still open: the story rewrites (H4) and the
+  closed-loop/goodput protocol (H6/H7) for the re-baseline.
+
 - [ ] **Architecture code review.** Full pass over the system boundaries
   (traffic → API → Redis → scheduler → worker/adapter → vLLM, plus the
   dataset cache and provider layout) before Milestone 3 porting: interfaces

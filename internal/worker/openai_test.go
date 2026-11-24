@@ -2,9 +2,13 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,8 +25,10 @@ import (
 	"github.com/dbaltas/mastori/internal/queue"
 )
 
+// sseChunk emits a chunk in the OpenAI completions streaming shape, the
+// schema vLLM serves on /v1/completions and the shape the worker parses.
 func sseChunk(content string) string {
-	return "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + content + "\"}}]}\n\n"
+	return "data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1763991361,\"model\":\"tiny\",\"choices\":[{\"index\":0,\"text\":\"" + content + "\",\"logprobs\":null,\"finish_reason\":null}]}\n\n"
 }
 
 func newFakeAdapter(t *testing.T, status int, body string) *httptest.Server {
@@ -82,6 +88,137 @@ func TestOpenAIRunStreamsChunksAndUsage(t *testing.T) {
 	}
 	if last.QueueWaitMs < 5 {
 		t.Errorf("queue_wait_ms = %d, want >= 5", last.QueueWaitMs)
+	}
+}
+
+// TestOpenAIRunParsesVLLMCompletionsStream runs the generator against a
+// stream in the exact shape vLLM v0.34 serves on /v1/completions with
+// stream_options.include_usage (testdata fixture): text_completion chunks
+// carrying choices[].text, a trailing empty-text chunk with
+// finish_reason=length, a usage event with empty choices, then [DONE]. This
+// is the regression test for the review's H2 finding: parsing
+// chat-completions delta.content against a real vLLM stream dropped every
+// token, so client TTFT degenerated to e2e latency.
+func TestOpenAIRunParsesVLLMCompletionsStream(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "vllm-completions-stream.txt"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	srv := newFakeAdapter(t, http.StatusOK, string(raw))
+
+	chunks, err := collectOpenAIChunks(t, srv, queue.Job{ID: "j-vllm", Prompt: "What is the capital of France?", CreatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	var sb strings.Builder
+	textChunks := 0
+	for _, c := range chunks {
+		if c.Done {
+			break
+		}
+		textChunks++
+		sb.WriteString(c.Text)
+	}
+	if textChunks != 6 {
+		t.Errorf("text chunks = %d, want 6 (fixture tokens)", textChunks)
+	}
+	if got := sb.String(); got != "The capital of France is Paris" {
+		t.Errorf("text = %q, want the streamed fixture text", got)
+	}
+	last := chunks[len(chunks)-1]
+	if !last.Done {
+		t.Error("final chunk not marked done")
+	}
+	if last.TokensIn != 9 || last.TokensOut != 6 {
+		t.Errorf("tokens = %d/%d, want usage 9/6", last.TokensIn, last.TokensOut)
+	}
+}
+
+// TestOpenAIRunIgnoresChatDeltaShape pins the schema decision: chat
+// completions delta events (choices[].delta.content) are not parsed by the
+// completions generator. A backend that streams the chat shape against this
+// endpoint yields no text chunks (the usage event still reports the true
+// token count), instead of a silently wrong measurement.
+func TestOpenAIRunIgnoresChatDeltaShape(t *testing.T) {
+	body := "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n" +
+		"data: [DONE]\n\n"
+	srv := newFakeAdapter(t, http.StatusOK, body)
+
+	chunks, err := collectOpenAIChunks(t, srv, queue.Job{ID: "j-delta", Prompt: "hi", CreatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	textChunks := 0
+	for _, c := range chunks {
+		if !c.Done {
+			textChunks++
+			if c.Text != "" {
+				t.Errorf("unexpected text chunk %q from chat-shaped stream", c.Text)
+			}
+		}
+	}
+	if textChunks != 0 {
+		t.Errorf("text chunks = %d, want 0 (chat delta.content must not be parsed)", textChunks)
+	}
+}
+
+func TestOpenAIRunSendsJobGenerationParams(t *testing.T) {
+	temp := 0.0
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseChunk("x") + "data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client(), MaxTokens: 999}
+	err := g.Run(context.Background(), queue.Job{
+		ID: "j9", Prompt: "p", CreatedAt: time.Now().UTC(),
+		MaxTokens:   256,
+		IgnoreEOS:   true,
+		Temperature: &temp,
+	}, func(c queue.Chunk) error { return nil })
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// Job-level params win over the worker-level default.
+	if got := gotBody["max_tokens"]; got != float64(256) {
+		t.Errorf("max_tokens = %v, want 256 (job value wins over generator default)", got)
+	}
+	if got := gotBody["ignore_eos"]; got != true {
+		t.Errorf("ignore_eos = %v, want true", got)
+	}
+	if got := gotBody["temperature"]; got != float64(0) {
+		t.Errorf("temperature = %v, want 0", got)
+	}
+}
+
+func TestOpenAIRunOmitsUnsetGenerationParams(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseChunk("x") + "data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	g := &OpenAIGenerator{BaseURL: srv.URL, Model: "tiny", Client: srv.Client()}
+	err := g.Run(context.Background(), queue.Job{ID: "j10", Prompt: "p", CreatedAt: time.Now().UTC()}, func(c queue.Chunk) error { return nil })
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	for _, key := range []string{"max_tokens", "ignore_eos", "temperature"} {
+		if _, present := gotBody[key]; present {
+			t.Errorf("%s present in request, want omitted so the backend default applies", key)
+		}
 	}
 }
 

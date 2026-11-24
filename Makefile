@@ -226,6 +226,20 @@ TRAFFIC_SEED ?= 42
 # throttles burst step profiles (a 500 rps segment with ~0.6s latency needs
 # ~300 in flight). 1000 matches the published 2026-11-15 methodology.
 TRAFFIC_MAX_INFLIGHT ?= 1000
+# Output-length control (2026-11-24 review, H3): vLLM completions defaults to
+# max_tokens=16, which silently capped every measured output. The run's
+# target should be set per experiment (e.g. TRAFFIC_MAX_TOKENS=256); with
+# TRAFFIC_IGNORE_EOS=true the backend generates to exactly that length.
+TRAFFIC_MAX_TOKENS ?=
+TRAFFIC_IGNORE_EOS ?=
+TRAFFIC_TEMPERATURE ?= 0
+# Run gates (2026-11-24 review, H1/H2): the scheduler /metrics preflight
+# (workers_healthy must equal TRAFFIC_EXPECTED_WORKERS, e.g. 1 on the AWS GPU
+# stack) and a smoke request asserting chunks > 1 and TTFT < e2e before any
+# measured traffic is sent. Both abort the run when they fail.
+TRAFFIC_SCHEDULER_URL ?= http://scheduler.mastori.svc.cluster.local:8081
+TRAFFIC_EXPECTED_WORKERS ?=
+TRAFFIC_SMOKE ?= true
 TRAFFIC_WAIT_TIMEOUT ?= 30m
 # Path to the dataset manifest (the benchmark submodule). The traffic Job
 # fetches its in-cluster cache from this file, so changing datasets.yaml is
@@ -259,7 +273,13 @@ traffic-configmaps:
 	  'TRAFFIC_WARMUP=$(TRAFFIC_WARMUP)' \
 	  'TRAFFIC_SHORT_PERCENTAGE=$(TRAFFIC_SHORT_PERCENTAGE)' \
 	  'TRAFFIC_SEED=$(TRAFFIC_SEED)' \
-	  'TRAFFIC_MAX_INFLIGHT=$(TRAFFIC_MAX_INFLIGHT)'; \
+	  'TRAFFIC_MAX_INFLIGHT=$(TRAFFIC_MAX_INFLIGHT)' \
+	  'TRAFFIC_MAX_TOKENS=$(TRAFFIC_MAX_TOKENS)' \
+	  'TRAFFIC_IGNORE_EOS=$(TRAFFIC_IGNORE_EOS)' \
+	  'TRAFFIC_TEMPERATURE=$(TRAFFIC_TEMPERATURE)' \
+	  'TRAFFIC_SCHEDULER_URL=$(TRAFFIC_SCHEDULER_URL)' \
+	  'TRAFFIC_EXPECTED_WORKERS=$(TRAFFIC_EXPECTED_WORKERS)' \
+	  'TRAFFIC_SMOKE=$(TRAFFIC_SMOKE)'; \
 	do echo "$$kv" >> $$envfile; done && \
 	kubectl -n mastori apply -f deploy/kubernetes/base/traffic-config.yaml && \
 	kubectl -n mastori create configmap datasets-manifest --from-file=datasets.yaml=$(DATASETS_MANIFEST) --dry-run=client -o yaml | kubectl apply -f - -n mastori && \

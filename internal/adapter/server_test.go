@@ -122,21 +122,27 @@ func TestCompletionsStream(t *testing.T) {
 		events = append(events, ev)
 	}
 
-	if len(events) != 6 { // role delta + 2 content + finish + usage + [DONE]
-		t.Fatalf("events = %d, want 6", len(events))
+	// Completions streaming has no role delta: content chunks carry
+	// choices[].text (the schema real vLLM serves and the worker parses),
+	// then finish, then usage, then [DONE].
+	if len(events) != 5 { // 2 content + finish + usage + [DONE]
+		t.Fatalf("events = %d, want 5", len(events))
 	}
-	if events[0] == nil || events[len(events)-1] != nil {
-		t.Fatalf("missing role delta or [DONE] sentinel: %v", events)
+	if events[len(events)-1] != nil {
+		t.Fatalf("missing [DONE] sentinel: %v", events)
 	}
-	second := events[1]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
-	if second["content"] != "one " {
-		t.Errorf("first content delta = %v", second)
+	first := events[0]["choices"].([]any)[0].(map[string]any)
+	if first["text"] != "one " {
+		t.Errorf("first content chunk = %v, want choices[0].text = \"one \"", first)
 	}
-	finish := events[3]["choices"].([]any)[0].(map[string]any)["finish_reason"].(string)
+	if _, hasDelta := first["delta"]; hasDelta {
+		t.Errorf("completions chunk carries delta field: %v", first)
+	}
+	finish := events[2]["choices"].([]any)[0].(map[string]any)["finish_reason"].(string)
 	if finish != "stop" {
 		t.Errorf("finish_reason = %q", finish)
 	}
-	usage := events[4]["usage"].(map[string]any)
+	usage := events[3]["usage"].(map[string]any)
 	if usage["completion_tokens"].(float64) != 2 || usage["prompt_tokens"].(float64) != 3 {
 		t.Errorf("usage = %v", usage)
 	}

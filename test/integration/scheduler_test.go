@@ -100,7 +100,7 @@ func newStack(t *testing.T, policyName string) *stack {
 		MaxInflight:    100,
 		DefaultModel:   "default",
 	}
-	q := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisStream, cfg.ChunksPrefix, cfg.AbandonPrefix)
+	q := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisStream, cfg.ChunksPrefix, cfg.AbandonPrefix, 10)
 	t.Cleanup(func() { _ = q.Close() })
 	am := metrics.New()
 	h := api.NewHandler(cfg, q, am, logger)

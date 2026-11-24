@@ -1,0 +1,17 @@
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":"The","logprobs":null,"finish_reason":null,"stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":" capital","logprobs":null,"finish_reason":null,"stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":" of","logprobs":null,"finish_reason":null,"stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":" France","logprobs":null,"finish_reason":null,"stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":" is","logprobs":null,"finish_reason":null,"stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":" Paris","logprobs":null,"finish_reason":null,"stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"length","stop_reason":null}]}
+
+data: {"id":"cmpl-8f2c1e4a9b","object":"text_completion","created":1763991361,"model":"qwen3-4b","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":6,"total_tokens":15}}
+
+data: [DONE]

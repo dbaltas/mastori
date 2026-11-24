@@ -54,6 +54,15 @@ patches:
       group: apps
       version: v1
       kind: Deployment
+      name: mockworker
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 0
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
       name: vllmworker
     patch: |-
       - op: remove

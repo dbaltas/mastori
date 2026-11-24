@@ -11,10 +11,10 @@ import (
 )
 
 type MockGenerator struct {
-	MinTokens  int
-	MaxTokens  int
-	TokenDelay time.Duration
-	FirstDelay time.Duration
+	MinTokens        int
+	MaxTokens        int
+	TokenDelay       time.Duration
+	FirstDelay       time.Duration
 	TokenCountJitter float64
 	TokenDelayJitter float64
 	FirstDelayJitter float64
