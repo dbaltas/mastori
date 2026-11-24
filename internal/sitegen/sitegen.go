@@ -6,7 +6,6 @@ package sitegen
 import (
 	"fmt"
 	"html"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +28,11 @@ type Experiment struct {
 	Objective string
 	// ConfigName is the published experiment config file name ("" if none).
 	ConfigName string
+	// StoryPath is the story file's path relative to benchmarkRoot (e.g.
+	// "results/<dir>/story.md", or wherever the experiment YAML's `story:`
+	// field points). WriteOutput and the story renderer must use this
+	// instead of assuming results/<Dir>/story.md.
+	StoryPath string
 }
 
 // experimentYAML mirrors the header block of benchmark/experiments/*.yaml.
@@ -95,6 +99,7 @@ func loadExperiment(configPath, benchmarkRoot string) (*Experiment, error) {
 		Date:       strings.TrimSpace(meta.Date),
 		Objective:  strings.TrimSpace(meta.Objective),
 		ConfigName: filepath.Base(configPath),
+		StoryPath:  filepath.ToSlash(meta.Story),
 	}, nil
 }
 
@@ -119,9 +124,10 @@ func DiscoverStories(benchmarkRoot string, known map[string]bool) ([]Experiment,
 			continue
 		}
 		stories = append(stories, Experiment{
-			Dir:   entry.Name(),
-			Title: firstNonEmpty(titleFromMarkdown(storyPath), entry.Name()),
-			Date:  dateFromDirName(entry.Name()),
+			Dir:       entry.Name(),
+			Title:     firstNonEmpty(titleFromMarkdown(storyPath), entry.Name()),
+			Date:      dateFromDirName(entry.Name()),
+			StoryPath: filepath.ToSlash(filepath.Join("results", entry.Name(), "story.md")),
 		})
 	}
 	return stories, nil
@@ -210,11 +216,11 @@ func CopyFile(src, dst string) error {
 }
 
 // WriteOutput writes story markdown and experiment config copies into outDir.
-// Each experiment gets outDir/<Dir>/story.md (when available) and, when the
-// experiment has a config, outDir/experiments/<ConfigName>.
+// Each experiment gets outDir/<Dir>/story.md (when its StoryPath exists) and,
+// when the experiment has a config, outDir/experiments/<ConfigName>.
 func WriteOutput(outDir string, experiments []Experiment, benchmarkRoot string) error {
 	for _, exp := range experiments {
-		storySrc := filepath.Join(benchmarkRoot, "results", exp.Dir, "story.md")
+		storySrc := filepath.Join(benchmarkRoot, filepath.FromSlash(exp.StoryPath))
 		if _, err := os.Stat(storySrc); err == nil {
 			if err := CopyFile(storySrc, filepath.Join(outDir, exp.Dir, "story.md")); err != nil {
 				return err
@@ -230,23 +236,6 @@ func WriteOutput(outDir string, experiments []Experiment, benchmarkRoot string) 
 		}
 	}
 	return nil
-}
-
-// WalkExperiments walks every regular file under root (used by main for
-// ancillary files). Exported for tests.
-func WalkExperiments(root string) ([]string, error) {
-	var paths []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		paths = append(paths, path)
-		return nil
-	})
-	return paths, err
 }
 
 const pageCSS = `body{max-width:820px;margin:2rem auto;padding:0 1rem;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;color:#222}a{color:#0366d6;text-decoration:none}a:hover{text-decoration:underline}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}pre{background:#f6f8fa;padding:.75rem;border-radius:6px;overflow-x:auto}code{background:#f6f8fa;padding:.1em .3em;border-radius:3px}table{border-collapse:collapse;margin:1rem 0}th,td{border:1px solid #d0d7de;padding:.35rem .6rem;text-align:left}h1,h2{line-height:1.25}.meta{color:#57606a;font-size:.9rem}ul.experiments{list-style:none;padding:0}ul.experiments li{margin:1.5rem 0;padding-bottom:1rem;border-bottom:1px solid #d8dee4}footer{margin-top:3rem;color:#57606a;font-size:.85rem}`
@@ -270,12 +259,17 @@ func RenderIndex(experiments []Experiment) string {
 	for _, exp := range experiments {
 		b.WriteString(`<li>`)
 		b.WriteString(`<h2><a href="` + html.EscapeString(exp.Dir) + `/story.html">` + html.EscapeString(exp.Title) + `</a></h2>`)
+		var metaParts []string
 		if exp.Date != "" {
-			b.WriteString(`<p class="meta">` + html.EscapeString(exp.Date))
-			if exp.ConfigName != "" {
-				b.WriteString(` · <a href="experiments/` + html.EscapeString(exp.ConfigName) + `">experiment config</a>`)
-			}
-			b.WriteString(`</p>`)
+			metaParts = append(metaParts, html.EscapeString(exp.Date))
+		}
+		if exp.ConfigName != "" {
+			// The config link must not depend on the date being set: a
+			// config without a date is still provenance worth publishing.
+			metaParts = append(metaParts, `<a href="experiments/`+html.EscapeString(exp.ConfigName)+`">experiment config</a>`)
+		}
+		if len(metaParts) > 0 {
+			b.WriteString(`<p class="meta">` + strings.Join(metaParts, " · ") + `</p>`)
 		}
 		if exp.Objective != "" {
 			b.WriteString(`<p>` + html.EscapeString(exp.Objective) + `</p>`)

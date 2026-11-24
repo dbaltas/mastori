@@ -12,7 +12,10 @@ import (
 )
 
 // SchemaVersion is the version of the exported record and summary format.
-const SchemaVersion = "0.1"
+// 0.2: latency_us/ttft_us replaced the truncated *_ms fields, ttft gained
+// the pre-header path and a has_ttft flag, and tpot/first/last chunk
+// timestamps plus tokens_out_source were added.
+const SchemaVersion = "0.2"
 
 // Record is one per-request observation written to the results JSONL file.
 type Record struct {
@@ -24,25 +27,47 @@ type Record struct {
 	Warmup        bool      `json:"warmup"`
 	SendAt        time.Time `json:"send_at"`
 	Status        int       `json:"status"`
-	LatencyMs     int64     `json:"latency_ms"`
-	TTFTMs        int64     `json:"ttft_ms,omitempty"`
-	Chunks        int       `json:"chunks,omitempty"`
-	TokensIn      int64     `json:"tokens_in"`
-	TokensOut     int64     `json:"tokens_out"`
+	// LatencyUs is the full client e2e latency in microseconds (not
+	// truncated to whole milliseconds, which would bias every aggregate
+	// down by ~0.5ms).
+	LatencyUs int64 `json:"latency_us"`
+	// TTFTUs is time-to-first-token measured from the request send, so it
+	// covers TCP connect, upload, API admission, queueing, and the RTT
+	// before the response headers. HasTTFT is false in blocking mode.
+	TTFTUs  int64 `json:"ttft_us,omitempty"`
+	HasTTFT bool  `json:"has_ttft,omitempty"`
+	// TPOTUs is the mean inter-chunk gap in microseconds
+	// ((last-first)/(tokens_out-1); 0 when tokens_out <= 1).
+	TPOTUs int64 `json:"tpot_us,omitempty"`
+	// FirstChunkAt/LastChunkAt are the absolute arrival times of the first
+	// and last token chunk (streaming mode only).
+	FirstChunkAt *time.Time `json:"first_chunk_at,omitempty"`
+	LastChunkAt  *time.Time `json:"last_chunk_at,omitempty"`
+	Chunks       int        `json:"chunks,omitempty"`
+	TokensIn     int64      `json:"tokens_in"`
+	TokensOut    int64      `json:"tokens_out"`
+	// TokensSource is "usage" or "estimated": where tokens_out came from.
+	// Estimated counts are invalid for tok/s claims.
+	TokensSource string `json:"tokens_out_source,omitempty"`
 	// MaxTokens is the output-token cap requested for this request, so
 	// requested vs actual completion_tokens (TokensOut) is visible per row
 	// instead of hidden in a backend default.
-	MaxTokens  int64  `json:"max_tokens,omitempty"`
-	APITotalMs int64  `json:"api_total_ms"`
-	Error      string `json:"error,omitempty"`
+	MaxTokens  int64 `json:"max_tokens,omitempty"`
+	APITotalMs int64 `json:"api_total_ms"`
+	// Error keeps the raw error message (ports, URLs, bodies included);
+	// ErrorKind is its low-cardinality classification used for the
+	// summary's errors map.
+	Error     string `json:"error,omitempty"`
+	ErrorKind string `json:"error_kind,omitempty"`
 }
 
 // ResultWriter appends records as JSON lines, creating parent directories.
 // Safe for concurrent use.
 type ResultWriter struct {
-	mu  sync.Mutex
-	f   *os.File
-	enc *json.Encoder
+	mu     sync.Mutex
+	f      *os.File
+	enc    *json.Encoder
+	teeEnc *json.Encoder
 }
 
 func NewResultWriter(path string) (*ResultWriter, error) {
@@ -59,16 +84,32 @@ func NewResultWriter(path string) (*ResultWriter, error) {
 	return &ResultWriter{f: f, enc: enc}, nil
 }
 
-// NewResultWriterTo writes records to an arbitrary writer, such as an
-// io.MultiWriter combining the results file with stdout.
+// NewResultWriterTo writes records to an arbitrary writer.
 func NewResultWriterTo(w io.Writer) *ResultWriter {
 	return &ResultWriter{enc: json.NewEncoder(w)}
+}
+
+// Tee mirrors every record to an additional writer (e.g. stdout) alongside
+// the results file, so a run executed inside the cluster is recoverable
+// from the pod logs. Call it before the first Write.
+func (w *ResultWriter) Tee(extra io.Writer) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.teeEnc = json.NewEncoder(extra)
 }
 
 func (w *ResultWriter) Write(r Record) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.enc.Encode(r)
+	if err := w.enc.Encode(r); err != nil {
+		return err
+	}
+	if w.teeEnc != nil {
+		if err := w.teeEnc.Encode(r); err != nil {
+			return fmt.Errorf("tee write: %w", err)
+		}
+	}
+	return nil
 }
 
 func (w *ResultWriter) Close() error {

@@ -26,16 +26,15 @@ func streamAPI(t *testing.T, delay, tokenGap time.Duration, chunks int, status i
 		}
 		flusher := w.(http.Flusher)
 		for i := 0; i < chunks; i++ {
-			done := i == chunks-1
-			var usage string
-			if done {
-				usage = `,"tokens_in":10,"tokens_out":20,"duration_ms":123`
+			if done := i == chunks-1; done {
+				// The terminal Done chunk carries no text, matching the
+				// API contract.
+				fmt.Fprintf(w, "event: chunk\ndata: {\"job_id\":\"j1\",\"text\":\"\",\"done\":true,\"tokens_in\":10,\"tokens_out\":20,\"duration_ms\":123}\n\n")
+			} else {
+				fmt.Fprintf(w, "event: chunk\ndata: {\"job_id\":\"j1\",\"text\":\"t%d\",\"done\":false}\n\n", i)
 			}
-			fmt.Fprintf(w, "event: chunk\ndata: {\"job_id\":\"j1\",\"text\":\"t%d\",\"done\":%t%s}\n\n", i, done, usage)
 			flusher.Flush()
-			if !done {
-				time.Sleep(tokenGap)
-			}
+			time.Sleep(tokenGap)
 		}
 		fmt.Fprint(w, "event: done\ndata: [DONE]\n\n")
 		flusher.Flush()
@@ -55,17 +54,47 @@ func TestSendStream(t *testing.T) {
 	if res.Status != 200 {
 		t.Errorf("status = %d", res.Status)
 	}
-	if res.Chunks != 5 {
-		t.Errorf("chunks = %d, want 5", res.Chunks)
+	if res.Chunks != 4 {
+		// 5 chunk events but the terminal Done chunk is not a token chunk.
+		t.Errorf("chunks = %d, want 4", res.Chunks)
 	}
 	if res.TTFT <= 0 {
 		t.Error("TTFT not recorded")
 	}
+	if res.TPOT <= 0 {
+		t.Error("TPOT not recorded")
+	}
 	if res.APIResp.TokensIn != 10 || res.APIResp.TokensOut != 20 || res.APIResp.TotalMs != 123 {
 		t.Errorf("usage not captured from done chunk: %+v", res.APIResp)
 	}
-	if res.APIResp.Text != "t0t1t2t3t4" {
-		t.Errorf("text = %q", res.APIResp.Text)
+	if res.TokensSource != "usage" {
+		t.Errorf("tokens source = %q, want usage", res.TokensSource)
+	}
+}
+
+func TestSendStreamTTFTIncludesPreHeaderTime(t *testing.T) {
+	// TTFT must cover everything before the first chunk, including the
+	// time the server spends before it even writes the response headers
+	// (TCP connect, upload, admission, queueing, one RTT). The old
+	// implementation anchored TTFT at the headers and could report a
+	// client TTFT lower than the API-side TTFT.
+	const headerDelay = 80 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(headerDelay)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: chunk\ndata: {\"text\":\"x\",\"done\":false}\n\n")
+		fmt.Fprint(w, "event: chunk\ndata: {\"text\":\"\",\"done\":true,\"tokens_in\":1,\"tokens_out\":2}\n\n")
+		fmt.Fprint(w, "event: done\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	s := NewSender(srv.URL, "", true, GenerationParams{}, 5*time.Second)
+	res, err := s.Send(context.Background(), Row{Dataset: "d", Index: 0, Text: "p"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if res.TTFT < headerDelay {
+		t.Errorf("TTFT %v < header delay %v: TTFT does not include the pre-header path", res.TTFT, headerDelay)
 	}
 }
 
@@ -142,7 +171,8 @@ func TestSendStreamPath(t *testing.T) {
 	rec := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "event: chunk\ndata: {\"text\":\"x\",\"done\":true,\"tokens_in\":1,\"tokens_out\":1}\n\n")
+		fmt.Fprint(w, "event: chunk\ndata: {\"text\":\"x\",\"done\":false,\"tokens_in\":0,\"tokens_out\":0}\n\n")
+		fmt.Fprint(w, "event: chunk\ndata: {\"text\":\"\",\"done\":true,\"tokens_in\":1,\"tokens_out\":1}\n\n")
 		fmt.Fprint(w, "event: done\ndata: [DONE]\n\n")
 	}))
 	t.Cleanup(rec.Close)

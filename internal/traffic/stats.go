@@ -19,9 +19,15 @@ const (
 // computes the standard benchmark percentiles.
 //
 // Values are accumulated in an HDR histogram: memory is bounded regardless
-// of run length or request rate, and percentile error is bounded by the
-// configured significant figures. Raw per-request values are preserved in
-// the results JSONL, so exact percentiles remain computable offline.
+// of run length or request length, and at 3 significant figures the
+// relative percentile error is about ±0.1% (HDR histogram buckets cover
+// 1/1000th of the value at full precision — the older "±1% at 3 sig figs"
+// reading confused decimal digits with binary bucket counts). Values above
+// the 10-minute trackable maximum are clamped to it silently by design:
+// such requests are counted (so success rates stay honest), and their raw
+// values remain available in the results JSONL for exact offline
+// percentiles. Tests tolerate 1% because the recorded value and the
+// histogram bucket that quantile falls in can straddle a bucket edge.
 type LatencyStats struct {
 	h *hdrhistogram.Histogram
 }
@@ -33,10 +39,15 @@ func newLatencyStats() *LatencyStats {
 // Add records one latency in milliseconds. Callers must serialize Add calls
 // (the traffic accumulator does); the zero value is usable.
 func (s *LatencyStats) Add(ms float64) {
+	s.AddUS(int64(math.Round(ms * histUnitMs)))
+}
+
+// AddUS records one latency in microseconds. Callers must serialize AddUS
+// calls (the traffic accumulator does); the zero value is usable.
+func (s *LatencyStats) AddUS(us int64) {
 	if s.h == nil {
 		s.h = hdrhistogram.New(1, trackableMaxMs*1000, histSigFigs)
 	}
-	us := int64(math.Round(ms * histUnitMs))
 	if us < 1 {
 		us = 1
 	}

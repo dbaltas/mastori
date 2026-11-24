@@ -17,16 +17,32 @@ type Sampler struct {
 	pos   int
 }
 
-func NewSampler(n int, seed int64) *Sampler {
+// NewSampler(n, seed) uses deriveSubSeed so per-group streams cannot overlap
+// across seeds (the old seed+group+1 scheme made seed=1/group=1 replay
+// seed=2/group=0).
+func NewSampler(n int, seed int64, group int) *Sampler {
 	if n < 1 {
 		n = 1
 	}
 	s := &Sampler{
 		n:   n,
-		rng: rand.New(rand.NewPCG(uint64(seed), uint64(seed))),
+		rng: rand.New(rand.NewPCG(mixSeed(uint64(seed), uint64(group)), mixSeed(uint64(seed), uint64(group)^0xD1B54A32D192ED03))),
 	}
 	s.reshuffle()
 	return s
+}
+
+// mixSeed is SplitMix64's finalizer: it spreads (seed, salt) pairs over the
+// full uint64 range, so related inputs (seed, seed+1) produce unrelated
+// RNG streams.
+func mixSeed(seed, salt uint64) uint64 {
+	h := seed + salt*0x9E3779B97F4A7C15
+	h ^= h >> 30
+	h *= 0xBF58476D1CE4E5B9
+	h ^= h >> 27
+	h *= 0x94D049BB133111EB
+	h ^= h >> 31
+	return h
 }
 
 func (s *Sampler) reshuffle() {
@@ -80,7 +96,7 @@ func NewWeightedRowSource(rows []Row, weights map[string]float64, seed int64) *W
 
 	samplers := make([]*Sampler, len(groups))
 	for i, g := range groups {
-		samplers[i] = NewSampler(len(g), seed+int64(i)+1)
+		samplers[i] = NewSampler(len(g), seed, i)
 	}
 
 	total := 0.0
@@ -107,7 +123,7 @@ func NewWeightedRowSource(rows []Row, weights map[string]float64, seed int64) *W
 		groups:   groups,
 		cum:      cum,
 		samplers: samplers,
-		rng:      rand.New(rand.NewPCG(uint64(seed*31+7), uint64(seed))),
+		rng:      rand.New(rand.NewPCG(mixSeed(uint64(seed), 7), mixSeed(uint64(seed), 8))),
 	}
 }
 

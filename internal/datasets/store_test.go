@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeStore is an in-memory ObjectStore for the unit tests.
@@ -128,6 +129,103 @@ func TestPackDeterministic(t *testing.T) {
 	}
 	if sha1 != sha2 {
 		t.Errorf("pack of the same cache produced different digests: %s vs %s", sha1, sha2)
+	}
+}
+
+func TestPackDeterministicAcrossMtimesAndUids(t *testing.T) {
+	// Two concurrent seeders produce files with different mtimes (and on
+	// different systems, different uid/gid); the packs must still be
+	// byte-identical, or the pack/sidecar PUT interleave A-pack, B-pack,
+	// B-sum, A-sum leaves a permanent checksum mismatch (B2).
+	src := testCacheDir(t)
+	dirs := []string{src}
+	for i := 0; i < 2; i++ {
+		dst := filepath.Join(t.TempDir(), "cache")
+		if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
+			t.Fatal(err)
+		}
+		dirs = append(dirs, dst)
+	}
+	// Vary mtime, uid, and gid on the copies.
+	future := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, name := range []string{"mmlu.jsonl", "sharegpt.jsonl"} {
+		p := filepath.Join(dirs[1], name)
+		if err := os.Chtimes(p, future, future); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(p, 1234, 5678); err != nil {
+			t.Skipf("cannot chown (%v); uid normalization not exercised", err)
+		}
+	}
+
+	var shas [3]string
+	for i, dir := range dirs {
+		pack := filepath.Join(t.TempDir(), fmt.Sprintf("pack-%d.tar.gz", i))
+		sha, err := Pack(dir, pack)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shas[i] = sha
+	}
+	if shas[0] != shas[1] || shas[0] != shas[2] {
+		t.Errorf("pack digests diverge across mtimes/uids: %s, %s, %s", shas[0], shas[1], shas[2])
+	}
+}
+
+func TestRestoreMissingSidecarIsCacheMiss(t *testing.T) {
+	// A seeder that dies between its two PUTs leaves a pack without a
+	// sidecar; that must surface as a cache miss (re-seed), not a
+	// permanent checksum failure (B4).
+	ctx := context.Background()
+	store := newFakeStore()
+	o := CacheOptions{ManifestPath: testManifest(t), CacheDir: testCacheDir(t), Bucket: "bkt", Store: store}
+	if err := uploadPack(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	sha, _ := SHA256File(o.ManifestPath)
+	delete(store.objects, "datasets/"+sha+"/"+checkObject)
+
+	o.CacheDir = filepath.Join(t.TempDir(), "fresh")
+	restored, err := Restore(ctx, o)
+	if err != nil {
+		t.Fatalf("restore with missing sidecar: %v", err)
+	}
+	if restored {
+		t.Error("restore reported a hit for a pack without its sidecar")
+	}
+}
+
+func TestUnpackRefusesSymlinkAtDestination(t *testing.T) {
+	// O_CREATE|O_TRUNC follows a pre-existing symlink at the destination;
+	// extraction must refuse to write through one (B6).
+	cacheDir := testCacheDir(t)
+	pack := filepath.Join(t.TempDir(), "cache.tar.gz")
+	if _, err := Pack(cacheDir, pack); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(outDir, "mmlu.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Unpack(pack, outDir)
+	if err == nil {
+		t.Fatal("unpack wrote through a pre-existing symlink")
+	}
+	if !strings.Contains(err.Error(), "non-regular path") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "original" {
+		t.Errorf("symlink target overwritten: %q", got)
 	}
 }
 

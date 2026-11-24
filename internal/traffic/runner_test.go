@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -123,7 +124,7 @@ func assertDrainInvariant(t *testing.T, path string, summary *Summary) {
 	const slack = 2 * time.Millisecond
 	var nWarmup int
 	for _, rec := range readRecords(t, path) {
-		completed := rec.SendAt.Add(time.Duration(rec.LatencyMs) * time.Millisecond)
+		completed := rec.SendAt.Add(time.Duration(rec.LatencyUs) * time.Microsecond)
 		if rec.Warmup {
 			nWarmup++
 			if completed.After(summary.MeasuredStartedAt.Add(slack)) {
@@ -597,12 +598,13 @@ func TestRunStreaming(t *testing.T) {
 		w.(http.Flusher).Flush()
 		time.Sleep(10 * time.Millisecond) // gap between headers and first chunk -> measurable TTFT
 		for i := 0; i < 3; i++ {
-			done := i == 2
-			usage := ""
-			if done {
-				usage = `,"tokens_in":10,"tokens_out":20,"duration_ms":5`
+			if i == 2 {
+				// The terminal Done chunk carries no text, matching the
+				// API contract.
+				fmt.Fprint(w, "event: chunk\ndata: {\"text\":\"\",\"done\":true,\"tokens_in\":10,\"tokens_out\":20,\"duration_ms\":5}\n\n")
+			} else {
+				fmt.Fprintf(w, "event: chunk\ndata: {\"text\":\"t%d\",\"done\":false}\n\n", i)
 			}
-			fmt.Fprintf(w, "event: chunk\ndata: {\"text\":\"t%d\",\"done\":%t%s}\n\n", i, done, usage)
 			w.(http.Flusher).Flush()
 		}
 		fmt.Fprint(w, "event: done\ndata: [DONE]\n\n")
@@ -636,7 +638,8 @@ func TestRunStreaming(t *testing.T) {
 		t.Errorf("TTFT p50 = %v", summary.TTFTMsP50)
 	}
 
-	// Records carry ttft_ms and chunks.
+	// Records carry ttft_us, has_ttft, and the token chunk count (the
+	// Done chunk is not a token chunk).
 	data, err := os.ReadFile(out)
 	if err != nil {
 		t.Fatal(err)
@@ -645,15 +648,22 @@ func TestRunStreaming(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.Split(strings.TrimSpace(string(data)), "\n")[0]), &rec); err != nil {
 		t.Fatal(err)
 	}
-	if rec.TTFTMs <= 0 || rec.Chunks != 3 {
+	if rec.TTFTUs <= 0 || !rec.HasTTFT || rec.Chunks != 2 {
 		t.Errorf("stream fields missing: %+v", rec)
+	}
+	if rec.FirstChunkAt == nil || rec.LastChunkAt == nil {
+		t.Errorf("chunk timestamps missing: %+v", rec)
 	}
 }
 
 func TestRunHangServerBoundedBySendTimeout(t *testing.T) {
 	// Server accepts connections but never responds: each send must time
 	// out at cfg.Timeout and the run must still exit with a partial summary.
+	// The handler must consume the request body so the server starts its
+	// background read: without that, r.Context() never cancels and
+	// httptest.Server.Close blocks for its full timeout (T1).
 	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
 		select {
 		case <-r.Context().Done():
 		case <-time.After(time.Minute):
@@ -720,8 +730,15 @@ func TestRunSummaryReportsOfferedAndSkipped(t *testing.T) {
 	if summary.Requests >= summary.OfferedRequests {
 		t.Fatalf("test setup wrong: no backpressure skip (%d sent vs %d offered)", summary.Requests, summary.OfferedRequests)
 	}
-	if summary.SkippedOffered != summary.OfferedRequests-summary.Requests {
-		t.Errorf("skipped_offered = %d, want %d", summary.SkippedOffered, summary.OfferedRequests-summary.Requests)
+	// skipped_backpressure counts arrivals the 3-slot semaphore refused
+	// before they could be sent; skipped_offered is only the residual
+	// schedule-vs-clock error.
+	if summary.SkippedBackpressure == 0 {
+		t.Errorf("skipped_backpressure = %d, want > 0 under a 3-slot cap at 100 req/s", summary.SkippedBackpressure)
+	}
+	if total := summary.Requests + summary.SkippedOffered + summary.SkippedBackpressure; total != summary.OfferedRequests {
+		t.Errorf("offered %d != sent %d + skipped_offered %d + skipped_backpressure %d",
+			summary.OfferedRequests, summary.Requests, summary.SkippedOffered, summary.SkippedBackpressure)
 	}
 	// requested_rate must be the steps average, not the base rate flag.
 	if summary.RequestedRate != 100 {

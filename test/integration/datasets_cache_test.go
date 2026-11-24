@@ -38,6 +38,11 @@ func s3Endpoint(t *testing.T) string {
 	}
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
+		// Locally a missing endpoint is a legitimate skip; in CI a silent
+		// skip can hide a broken provisioning step for months.
+		if os.Getenv("CI") == "true" {
+			t.Fatalf("S3 endpoint not reachable on %s in CI: %v", addr, err)
+		}
 		t.Skipf("S3 endpoint not reachable on %s: %v", addr, err)
 	}
 	conn.Close()

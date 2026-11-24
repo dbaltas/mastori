@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"github.com/dbaltas/mastori/internal/traffic"
@@ -70,7 +72,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	runID := time.Now().UTC().Format("20060102T150405Z") + fmt.Sprintf("-%d", time.Now().UnixNano()%1000)
+	runID := traffic.NewRunID()
 	outPath := *opts.output
 	if outPath == "" {
 		outPath = "benchmark/results/" + runID + ".jsonl"
@@ -123,10 +125,25 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Build provenance for the summary (empty when built without VCS
+	// stamping, e.g. `go test` or an uncommitted tree).
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range bi.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				cfg.VCSRev = s.Value
+			case "vcs.modified":
+				cfg.VCSModified = s.Value == "true"
+			}
+		}
+	}
+
 	ctx, stop := traffic.RunSignalContext(context.Background())
 	defer stop()
 
-	fmt.Printf("run %s: workload=%s rate=%.1f duration=%s warmup=%s seed=%d -> %s\n",
+	// The startup line always goes to stderr: with --records-stdout the
+	// stdout stream is the JSONL record feed and must stay parseable.
+	fmt.Fprintf(os.Stderr, "run %s: workload=%s rate=%.1f duration=%s warmup=%s seed=%d -> %s\n",
 		runID, *opts.workload, *opts.rate, runDuration, *opts.warmup, *opts.seed, outPath)
 	summary, err := traffic.Run(ctx, cfg)
 	if err != nil {
@@ -134,7 +151,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
+	// The final summary goes to stderr in records-stdout mode; otherwise
+	// stdout is the CLI's normal output channel.
+	summaryOut := io.Writer(os.Stdout)
+	if *opts.recordsStdout {
+		summaryOut = os.Stderr
+	}
+	enc := json.NewEncoder(summaryOut)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(summary); err != nil {
 		fmt.Fprintf(os.Stderr, "error: encode summary: %v\n", err)

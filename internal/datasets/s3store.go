@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -49,11 +50,16 @@ func NewS3Store(ctx context.Context, bucket string) (*s3Store, error) {
 
 // isNotFound reports whether the error is an AWS API error whose code marks a
 // missing object (HeadObject NotFound / GetObject NoSuchKey).
+//
+// NoSuchBucket is deliberately NOT a miss: a wrong or missing bucket is a
+// configuration error, and silently re-seeding every dataset into a bucket
+// that cannot be read would waste the seeding on every boot. It surfaces as
+// a hard error instead.
 func isNotFound(err error) bool {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "NotFound", "NoSuchKey", "NoSuchBucket":
+		case "NotFound", "NoSuchKey":
 			return true
 		}
 	}
@@ -100,14 +106,24 @@ func (s *s3Store) Put(ctx context.Context, key, srcPath string) error {
 	return err
 }
 
+// writeBodyToFile streams the body into dstPath through a temp file and a
+// rename, so a concurrent reader never observes a half-written object.
 func writeBodyToFile(body io.Reader, dstPath string) error {
-	f, err := os.Create(dstPath)
+	tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".tmp-"+filepath.Base(dstPath)+"-")
 	if err != nil {
-		return fmt.Errorf("create %s: %w", dstPath, err)
+		return fmt.Errorf("create temp file: %w", err)
 	}
-	if _, err := io.Copy(f, body); err != nil {
-		f.Close()
-		return fmt.Errorf("write %s: %w", dstPath, err)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := io.Copy(tmp, body); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write %s: %w", tmpPath, err)
 	}
-	return f.Close()
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return fmt.Errorf("rename %s: %w", tmpPath, err)
+	}
+	return nil
 }

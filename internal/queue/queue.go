@@ -48,11 +48,15 @@ type Chunk struct {
 	Done  bool   `json:"done"`
 	// Error, when non-empty, marks a terminal error chunk: the job failed on
 	// the worker and will never produce output. Done is also true.
-	Error       string `json:"error,omitempty"`
-	TokensIn    int64  `json:"tokens_in"`
-	TokensOut   int64  `json:"tokens_out"`
-	QueueWaitMs int64  `json:"queue_wait_ms"`
-	DurationMs  int64  `json:"duration_ms"`
+	Error     string `json:"error,omitempty"`
+	TokensIn  int64  `json:"tokens_in"`
+	TokensOut int64  `json:"tokens_out"`
+	// TokensSource records where the token counts came from: "usage" when
+	// the backend reported them, "estimated" when they were derived (e.g.
+	// a word count). Estimated counts are invalid for tok/s claims.
+	TokensSource string `json:"tokens_source,omitempty"`
+	QueueWaitMs  int64  `json:"queue_wait_ms"`
+	DurationMs   int64  `json:"duration_ms"`
 }
 
 type Queue interface {

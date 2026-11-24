@@ -9,6 +9,10 @@
 // cross-check against client-side tok/s figures. Run it against a reachable
 // Prometheus, e.g. behind `kubectl -n mastori port-forward deploy/prometheus
 // 9091:9090`, with -url http://localhost:9091.
+//
+// A run's window and run id can be taken straight from the run summary with
+// -summary <path.summary.json>, so the captured metrics window is the run's
+// measured window rather than "whatever the last hour was".
 package main
 
 import (
@@ -37,6 +41,22 @@ type rangeResponse struct {
 		ResultType string   `json:"resultType"`
 		Result     []series `json:"result"`
 	} `json:"data"`
+	Warnings []string `json:"warnings"`
+}
+
+type namesResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Result []string `json:"result"`
+	} `json:"data"`
+	Warnings []string `json:"warnings"`
+}
+
+// runSummary is the subset of a traffic run summary promcapture consumes.
+type runSummary struct {
+	RunID             string    `json:"run_id"`
+	MeasuredStartedAt time.Time `json:"measured_started_at"`
+	FinishedAt        time.Time `json:"finished_at"`
 }
 
 // defaultMatch selects the series captured per run: vllm:* engine counters,
@@ -48,9 +68,10 @@ const defaultMatch = `vllm:.*|DCGM_.*|mastori_.*`
 func main() {
 	urlFlag := flag.String("url", "http://localhost:9091", "Prometheus base URL")
 	outFlag := flag.String("out", "", "output directory (default: benchmark/results/<EXPERIMENT>/metrics via EXPERIMENT env)")
-	startFlag := flag.String("start", "", "window start, RFC3339 UTC (default: end-1h)")
-	endFlag := flag.String("end", "", "window end, RFC3339 UTC (default: now)")
-	stepFlag := flag.String("step", "15s", "query_range step")
+	startFlag := flag.String("start", "", "window start, RFC3339 UTC (default: end-1h, or the run summary's measured window with -summary)")
+	endFlag := flag.String("end", "", "window end, RFC3339 UTC (default: now, or the run summary's finished_at with -summary)")
+	summaryFlag := flag.String("summary", "", "path to a traffic run summary: take the window (measured_started_at..finished_at) and the run id from it")
+	stepFlag := flag.String("step", "15s", "query_range step (set to the Prometheus scrape interval for raw-resolution captures)")
 	// Prometheus __name__ regexes are fully anchored, so each alternative
 	// must end in .* to match a series name.
 	matchFlag := flag.String("match", defaultMatch, "regex matched against __name__")
@@ -65,7 +86,7 @@ func main() {
 		out = filepath.Join("benchmark", "results", exp, "metrics")
 	}
 
-	end := time.Now().UTC()
+	end := time.Time{}
 	if *endFlag != "" {
 		t, err := time.Parse(time.RFC3339, *endFlag)
 		if err != nil {
@@ -73,7 +94,7 @@ func main() {
 		}
 		end = t.UTC()
 	}
-	start := end.Add(-time.Hour)
+	start := time.Time{}
 	if *startFlag != "" {
 		t, err := time.Parse(time.RFC3339, *startFlag)
 		if err != nil {
@@ -81,53 +102,73 @@ func main() {
 		}
 		start = t.UTC()
 	}
+
+	runID := ""
+	if *summaryFlag != "" {
+		data, err := os.ReadFile(*summaryFlag)
+		if err != nil {
+			log.Fatalf("promcapture: -summary: %v", err)
+		}
+		var rs runSummary
+		if err := json.Unmarshal(data, &rs); err != nil {
+			log.Fatalf("promcapture: -summary: decode: %v", err)
+		}
+		if rs.RunID != "" {
+			runID = rs.RunID
+		}
+		if !rs.MeasuredStartedAt.IsZero() && start.IsZero() {
+			start = rs.MeasuredStartedAt.UTC()
+		}
+		if !rs.FinishedAt.IsZero() && end.IsZero() {
+			end = rs.FinishedAt.UTC()
+		}
+	}
+	if end.IsZero() {
+		end = time.Now().UTC()
+	}
+	if start.IsZero() {
+		start = end.Add(-time.Hour)
+	}
 	if start.After(end) {
 		log.Fatal("promcapture: -start is after -end")
 	}
 
-	if _, err := run(*urlFlag, out, start, end, *stepFlag, *matchFlag); err != nil {
+	if _, err := run(*urlFlag, out, start, end, *stepFlag, *matchFlag, runID); err != nil {
 		log.Fatalf("promcapture: %v", err)
 	}
 }
 
-// run queries Prometheus once for every series whose __name__ matches, groups
-// the result by metric name, and writes prometheus-<date>-<start>-<end>.json
-// into out. It returns the written file path.
-func run(baseURL, out string, start, end time.Time, step, match string) (string, error) {
+// run first resolves the metric names matching the __name__ regex (the label
+// API returns names, not series), then issues one query_range per metric
+// family. Querying per family keeps every individual query's sample count
+// bounded: one query across every series can exceed the server's
+// max_samples limit exactly on the long windows a benchmark cares about.
+// The result is grouped by metric name and written as
+// prometheus-<start>-<end>.json (UTC, second precision) into out. It
+// returns the written file path.
+func run(baseURL, out string, start, end time.Time, step, match, runID string) (string, error) {
 	if _, err := regexp.Compile(match); err != nil {
 		return "", fmt.Errorf("-match: %w", err)
 	}
-	q := url.Values{}
-	q.Set("query", fmt.Sprintf(`{__name__=~%q}`, match))
-	q.Set("start", start.Format(time.RFC3339))
-	q.Set("end", end.Format(time.RFC3339))
-	q.Set("step", step)
-
-	u := strings.TrimSuffix(baseURL, "/") + "/api/v1/query_range?" + q.Encode()
 	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Get(u)
-	if err != nil {
-		return "", fmt.Errorf("query_range: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("query_range: status %d", resp.StatusCode)
-	}
+	base := strings.TrimSuffix(baseURL, "/")
 
-	var rr rangeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
-		return "", fmt.Errorf("decode: %w", err)
-	}
-	if rr.Status != "success" {
-		return "", fmt.Errorf("query_range: prometheus status %q", rr.Status)
+	names, err := matchingNames(client, base, match)
+	if err != nil {
+		return "", err
 	}
 
 	grouped := map[string][]series{}
-	for _, s := range rr.Data.Result {
-		name := s.Metric["__name__"]
-		grouped[name] = append(grouped[name], series{Metric: s.Metric, Values: s.Values})
+	for _, name := range names {
+		ss, err := queryRange(client, base, name, start, end, step)
+		if err != nil {
+			return "", err
+		}
+		if len(ss) > 0 {
+			grouped[name] = ss
+		}
 	}
-	names := make([]string, 0, len(grouped))
+	names = make([]string, 0, len(grouped))
 	for name := range grouped {
 		names = append(names, name)
 	}
@@ -142,8 +183,9 @@ func run(baseURL, out string, start, end time.Time, step, match string) (string,
 		payload[name] = ss
 	}
 
-	day := start.Format("20060102")
-	file := fmt.Sprintf("prometheus-%s-%s-%s.json", day, start.Format("1504"), end.Format("1504"))
+	startStr := start.UTC().Format("20060102T150405")
+	endStr := end.UTC().Format("20060102T150405")
+	file := fmt.Sprintf("prometheus-%s-%s.json", startStr, endStr)
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return "", err
 	}
@@ -159,9 +201,74 @@ func run(baseURL, out string, start, end time.Time, step, match string) (string,
 	for _, ss := range grouped {
 		seriesCount += len(ss)
 	}
-	fmt.Printf("wrote %s (%d metrics, %d series, %s..%s step %s)\n",
-		path, len(names), seriesCount, start.Format(time.RFC3339), end.Format(time.RFC3339), step)
+	runNote := ""
+	if runID != "" {
+		runNote = " run " + runID
+	}
+	fmt.Printf("wrote %s (%d metrics, %d series, %s..%s step %s%s)\n",
+		path, len(names), seriesCount, start.Format(time.RFC3339), end.Format(time.RFC3339), step, runNote)
 	return path, nil
+}
+
+// matchingNames resolves the metric names whose __name__ matches the regex.
+func matchingNames(client *http.Client, base, match string) ([]string, error) {
+	q := url.Values{}
+	q.Set("match[]", fmt.Sprintf(`{__name__=~%q}`, match))
+	u := base + "/api/v1/label/__name__/values?" + q.Encode()
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, fmt.Errorf("label values: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("label values: status %d", resp.StatusCode)
+	}
+	var nr namesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&nr); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if nr.Status != "success" {
+		return nil, fmt.Errorf("label values: prometheus status %q", nr.Status)
+	}
+	logWarnings("label values", nr.Warnings)
+	return nr.Data.Result, nil
+}
+
+// queryRange captures one metric family over the window.
+func queryRange(client *http.Client, base, name string, start, end time.Time, step string) ([]series, error) {
+	q := url.Values{}
+	q.Set("query", fmt.Sprintf(`{__name__=%q}`, name))
+	q.Set("start", start.Format(time.RFC3339))
+	q.Set("end", end.Format(time.RFC3339))
+	q.Set("step", step)
+	u := base + "/api/v1/query_range?" + q.Encode()
+
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, fmt.Errorf("query_range %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("query_range %s: status %d", name, resp.StatusCode)
+	}
+	var rr rangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if rr.Status != "success" {
+		return nil, fmt.Errorf("query_range %s: prometheus status %q", name, rr.Status)
+	}
+	logWarnings("query_range "+name, rr.Warnings)
+	return rr.Data.Result, nil
+}
+
+// logWarnings surfaces Prometheus warnings, which used to be dropped: they
+// are how Prometheus reports, e.g., skipped series or lookback gaps that
+// would silently misdate a capture.
+func logWarnings(source string, warnings []string) {
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "promcapture: warning (%s): %s\n", source, w)
+	}
 }
 
 func labelKey(m map[string]string) string {

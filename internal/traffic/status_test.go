@@ -159,7 +159,7 @@ func TestRunWarmupOnlyFailuresValid(t *testing.T) {
 	}
 }
 
-func TestRunInterruptionFlagInvalidates(t *testing.T) {
+func TestRunInterruptionFlagLifecycle(t *testing.T) {
 	mr := miniredis.RunT(t)
 
 	out := t.TempDir() + "/results.jsonl"
@@ -184,22 +184,61 @@ func TestRunInterruptionFlagInvalidates(t *testing.T) {
 		t.Errorf("status without flag = %q, want valid", summary.Status)
 	}
 
+	// A stale flag from a previous incident is snapshotted and cleared at
+	// run start: it must not invalidate this run (03-scheduler-core #3 —
+	// one reclaim must not mark every run in the flag's remaining TTL
+	// invalid), but it stays visible in the summary.
 	mr.Set("run:interrupted", "1")
 	summary, err = Run(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("Run after flag: %v", err)
+		t.Fatalf("Run after stale flag: %v", err)
+	}
+	if summary.Status != StatusValid {
+		t.Errorf("status with stale flag = %q, want valid", summary.Status)
+	}
+	if !summary.InterruptedBeforeRun {
+		t.Error("interrupted_before_run not recorded for the stale flag")
+	}
+	if mr.Exists("run:interrupted") {
+		t.Error("stale flag was not cleared at run start")
 	}
 	if summary.Failures != 0 {
 		t.Errorf("expected zero request failures, got %d", summary.Failures)
 	}
-	if summary.Status != StatusInvalid {
-		t.Errorf("status with flag = %q, want invalid", summary.Status)
+
+	// An interruption during the run still invalidates: the flag is set
+	// (as the scheduler would on reclaim) while requests are in flight.
+	interruptOnce := make(chan struct{})
+	close(interruptOnce)
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-interruptOnce:
+			mr.Set("run:interrupted", "1")
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"job_id":"j1","text":"ok","tokens_in":10,"tokens_out":20,"total_ms":5}`)
+	}))
+	t.Cleanup(srv2.Close)
+	cfg.URL = srv2.URL
+
+	out2 := t.TempDir() + "/results.jsonl"
+	cfg.OutputPath = out2
+	summary, err = Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run with mid-run flag: %v", err)
 	}
-	if s := readSummaryFile(t, SummaryPath(out)); s.Status != StatusInvalid {
+	if summary.Status != StatusInvalid {
+		t.Errorf("status with mid-run flag = %q, want invalid", summary.Status)
+	}
+	if s := readSummaryFile(t, SummaryPath(out2)); s.Status != StatusInvalid {
 		t.Errorf("summary file status = %q, want invalid", s.Status)
 	}
 	if summary.Errors["interrupted"] != 1 {
 		t.Errorf("errors[interrupted] = %d, want 1", summary.Errors["interrupted"])
+	}
+	if summary.InterruptedBeforeRun {
+		t.Error("interrupted_before_run must be false when the flag appears mid-run")
 	}
 }
 

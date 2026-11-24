@@ -62,7 +62,6 @@ func redisAddr() string {
 
 func newStack(t *testing.T, policyName string) *stack {
 	t.Helper()
-	t.Parallel()
 
 	client := redis.NewClient(&redis.Options{Addr: redisAddr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -213,6 +212,8 @@ func eventually(t *testing.T, what string, cond func() bool) {
 }
 
 func TestRoundRobinSpreadsJobsAcrossWorkers(t *testing.T) {
+	t.Parallel()
+
 	s := newStack(t, "round-robin")
 	s.startWorker("w1")
 	s.startWorker("w2")
@@ -259,6 +260,8 @@ func TestRoundRobinSpreadsJobsAcrossWorkers(t *testing.T) {
 }
 
 func TestStreamingThroughScheduler(t *testing.T) {
+	t.Parallel()
+
 	s := newStack(t, "least-loaded")
 	s.startWorker("w1")
 
@@ -293,6 +296,8 @@ func TestStreamingThroughScheduler(t *testing.T) {
 }
 
 func TestLeastLoadedAvoidsBusyWorker(t *testing.T) {
+	t.Parallel()
+
 	s := newStack(t, "least-loaded")
 
 	// w1 is slow: the jobs below keep running for the whole test, so its
@@ -330,6 +335,8 @@ func TestLeastLoadedAvoidsBusyWorker(t *testing.T) {
 }
 
 func TestWorkerShutdownStopsRouting(t *testing.T) {
+	t.Parallel()
+
 	s := newStack(t, "round-robin")
 	s.startWorker("w1")
 	s.startWorker("w2")
@@ -352,6 +359,8 @@ func TestWorkerShutdownStopsRouting(t *testing.T) {
 }
 
 func TestJobsWaitUntilWorkerRegisters(t *testing.T) {
+	t.Parallel()
+
 	s := newStack(t, "round-robin")
 
 	type result struct {

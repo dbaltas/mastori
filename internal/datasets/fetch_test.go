@@ -64,7 +64,7 @@ func TestFetchWritesJSONL(t *testing.T) {
 	f.BaseURL = srv.URL
 	dir := t.TempDir()
 
-	path, err := f.Fetch(testDataset(), dir)
+	path, err := f.Fetch(t.Context(), testDataset(), dir)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -110,8 +110,35 @@ func TestFetchRetriesOn5xx(t *testing.T) {
 	f.BaseURL = srv.URL
 	f.Backoff = func(int) {}
 
-	if _, err := f.Fetch(testDataset(), t.TempDir()); err != nil {
+	if _, err := f.Fetch(t.Context(), testDataset(), t.TempDir()); err != nil {
 		t.Fatalf("Fetch after retries: %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestFetchRetriesOn429(t *testing.T) {
+	// HF throttles with 429; it must retry like a 5xx instead of failing
+	// the fetch on the first burst (B7).
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, rowsBody(2, 0))
+	}))
+	t.Cleanup(srv.Close)
+
+	f := NewFetcher()
+	f.BaseURL = srv.URL
+	f.Backoff = func(int) {}
+
+	if _, err := f.Fetch(t.Context(), testDataset(), t.TempDir()); err != nil {
+		t.Fatalf("Fetch after 429 retries: %v", err)
 	}
 	if attempts != 3 {
 		t.Errorf("attempts = %d, want 3", attempts)
@@ -124,7 +151,7 @@ func TestFetchFailsOn4xx(t *testing.T) {
 	f.BaseURL = srv.URL
 	f.Backoff = func(int) {}
 
-	if _, err := f.Fetch(testDataset(), t.TempDir()); err == nil {
+	if _, err := f.Fetch(t.Context(), testDataset(), t.TempDir()); err == nil {
 		t.Fatal("expected error on 404")
 	}
 }
@@ -135,7 +162,7 @@ func TestFetchExhaustedDataset(t *testing.T) {
 	f.BaseURL = srv.URL
 	f.Backoff = func(int) {}
 
-	if _, err := f.Fetch(testDataset(), t.TempDir()); err == nil {
+	if _, err := f.Fetch(t.Context(), testDataset(), t.TempDir()); err == nil {
 		t.Fatal("expected error when dataset returns no rows")
 	}
 }
@@ -215,7 +242,7 @@ func TestFetchRespectsSelectionStart(t *testing.T) {
 
 	d := testDataset()
 	d.Selection.Start = 7
-	if _, err := f.Fetch(d, t.TempDir()); err != nil {
+	if _, err := f.Fetch(t.Context(), d, t.TempDir()); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 }
@@ -226,7 +253,7 @@ func TestFetchWritesToCacheDir(t *testing.T) {
 	f.BaseURL = srv.URL
 
 	cache := filepath.Join(t.TempDir(), "nested", "cache")
-	path, err := f.Fetch(testDataset(), cache)
+	path, err := f.Fetch(t.Context(), testDataset(), cache)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}

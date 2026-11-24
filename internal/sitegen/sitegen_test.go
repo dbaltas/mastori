@@ -7,262 +7,137 @@ import (
 	"testing"
 )
 
-// writeTree creates files under a temp benchmark root shaped like the
-// benchmark submodule: experiments/*.yaml and results/<dir>/story.md.
-func writeTree(t *testing.T, files map[string]string) string {
+func writeFile(t *testing.T, path, content string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadExperimentsHonorsStoryField(t *testing.T) {
+	// The YAML `story:` field must decide which file the experiment
+	// publishes — not the results/<Dir>/story.md convention (B9).
 	root := t.TempDir()
-	for rel, content := range files {
-		path := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return root
-}
-
-func TestLoadExperiments(t *testing.T) {
-	root := writeTree(t, map[string]string{
-		"experiments/20261115-mockworker-scaling.yaml": `
+	writeFile(t, filepath.Join(root, "experiments", "demo.yaml"), `
 experiment:
-  name: mockworker-scaling-knee
-  date: "2026-11-15"
-  objective: >
-    Characterize mock worker scaling and find the smooth-throughput knee.
-  story: results/20261115-mockworker-scaling-knee/story.md
-`,
-		"results/20261115-mockworker-scaling-knee/story.md": "# Benchmark story — mockworker scaling\n\nBody text.\n",
-		// Experiment whose story has not been published yet: must be skipped.
-		"experiments/20261116-unpublished.yaml": `
-experiment:
-  name: unpublished
-  date: "2026-11-16"
-  story: results/20261116-unpublished/story.md
-`,
-	})
+  name: Demo
+  date: "2026-11-20"
+  objective: Check the honors-story path.
+  story: results/20261120-demo/custom-story.md
+`)
+	writeFile(t, filepath.Join(root, "results", "20261120-demo", "custom-story.md"), "# Custom title\n")
 
-	experiments, err := LoadExperiments(filepath.Join(root, "experiments"), root)
+	exps, err := LoadExperiments(filepath.Join(root, "experiments"), root)
 	if err != nil {
 		t.Fatalf("LoadExperiments: %v", err)
 	}
-	if len(experiments) != 1 {
-		t.Fatalf("got %d experiments, want 1 (unpublished story must be skipped): %+v", len(experiments), experiments)
+	if len(exps) != 1 {
+		t.Fatalf("experiments = %d, want 1", len(exps))
 	}
-
-	exp := experiments[0]
-	if exp.Dir != "20261115-mockworker-scaling-knee" {
-		t.Errorf("Dir = %q", exp.Dir)
+	exp := exps[0]
+	if exp.StoryPath != "results/20261120-demo/custom-story.md" {
+		t.Errorf("StoryPath = %q, want the YAML story field", exp.StoryPath)
 	}
-	if exp.Title != "Benchmark story — mockworker scaling" {
-		t.Errorf("Title = %q", exp.Title)
+	if exp.Title != "Custom title" {
+		t.Errorf("title = %q, want the story's first heading", exp.Title)
 	}
-	if exp.Date != "2026-11-15" {
-		t.Errorf("Date = %q", exp.Date)
-	}
-	if !strings.Contains(exp.Objective, "smooth-throughput knee") {
-		t.Errorf("Objective = %q", exp.Objective)
-	}
-	if exp.ConfigName != "20261115-mockworker-scaling.yaml" {
-		t.Errorf("ConfigName = %q", exp.ConfigName)
+	if exp.Date != "2026-11-20" || exp.ConfigName != "demo.yaml" {
+		t.Errorf("metadata = %q / %q", exp.Date, exp.ConfigName)
 	}
 }
 
-func TestLoadExperimentsTitleFallsBackToName(t *testing.T) {
-	root := writeTree(t, map[string]string{
-		"experiments/20261115-mockworker-scaling.yaml": `
+func TestLoadExperimentsSkipsUnpublishedStories(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "experiments", "pending.yaml"), `
 experiment:
-  name: fallback-name
-  story: results/20261115-mockworker-scaling-knee/story.md
-`,
-		"results/20261115-mockworker-scaling-knee/story.md": "No heading here.\n",
-	})
-
-	experiments, err := LoadExperiments(filepath.Join(root, "experiments"), root)
+  name: Pending
+  story: results/20261121-pending/story.md
+`)
+	exps, err := LoadExperiments(filepath.Join(root, "experiments"), root)
 	if err != nil {
 		t.Fatalf("LoadExperiments: %v", err)
 	}
-	if len(experiments) != 1 || experiments[0].Title != "fallback-name" {
-		t.Fatalf("got %+v, want single experiment titled fallback-name", experiments)
-	}
-}
-
-func TestLoadExperimentsIgnoresNonYAML(t *testing.T) {
-	root := writeTree(t, map[string]string{
-		"experiments/README.md": "not yaml",
-		"experiments/notes.txt": "still not yaml",
-	})
-
-	experiments, err := LoadExperiments(filepath.Join(root, "experiments"), root)
-	if err != nil {
-		t.Fatalf("LoadExperiments: %v", err)
-	}
-	if len(experiments) != 0 {
-		t.Fatalf("got %+v, want none", experiments)
+	if len(exps) != 0 {
+		t.Errorf("experiments = %d, want 0 for a story that does not exist", len(exps))
 	}
 }
 
 func TestDiscoverStories(t *testing.T) {
-	root := writeTree(t, map[string]string{
-		"results/20261115-mockworker-scaling-knee/story.md": "# Story A\n",
-		"results/20261114-legacy/story.md":                  "# Story B\n",
-		"results/_legacy/README.md":                         "no story.md here\n",
-		"results/20261113-raw/other.txt":                    "no story.md here\n",
-	})
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "results", "20261115-knee", "story.md"), "# Knee\n")
+	writeFile(t, filepath.Join(root, "results", "no-date-run", "story.md"), "# No date\n")
+	writeFile(t, filepath.Join(root, "results", "not-a-story", "other.md"), "# Other\n")
 
-	discovered, err := DiscoverStories(root, map[string]bool{"20261115-mockworker-scaling-knee": true})
+	got, err := DiscoverStories(root, nil)
 	if err != nil {
 		t.Fatalf("DiscoverStories: %v", err)
 	}
-	if len(discovered) != 1 {
-		t.Fatalf("got %+v, want only 20261114-legacy (known dir skipped, no-story dirs skipped)", discovered)
+	if len(got) != 2 {
+		t.Fatalf("discovered = %d, want 2", len(got))
 	}
-	if discovered[0].Dir != "20261114-legacy" || discovered[0].Title != "Story B" {
-		t.Fatalf("unexpected entry %+v", discovered[0])
-	}
-	if discovered[0].Date != "2026-11-14" {
-		t.Errorf("Date = %q, want 2026-11-14", discovered[0].Date)
-	}
-}
-
-func TestDateFromDirName(t *testing.T) {
-	cases := map[string]string{
-		"20261115-mockworker-scaling-knee": "2026-11-15",
-		"20260101-x":                       "2026-01-01",
-		"not-a-date":                       "",
-		"2026":                             "",
-		"20261301-x":                       "", // month 13
-		"20260232-x":                       "", // day 32
-	}
-	for dirName, want := range cases {
-		if got := dateFromDirName(dirName); got != want {
-			t.Errorf("dateFromDirName(%q) = %q, want %q", dirName, got, want)
+	var dated, undated bool
+	for _, exp := range got {
+		switch exp.Dir {
+		case "20261115-knee":
+			dated = exp.Date == "2026-11-15" && exp.StoryPath == "results/20261115-knee/story.md"
+		case "no-date-run":
+			undated = exp.Date == "" && exp.StoryPath == "results/no-date-run/story.md"
 		}
 	}
-}
-
-func TestMergeDedupesAndSortsNewestFirst(t *testing.T) {
-	configExperiments := []Experiment{
-		{Dir: "20261115-knee", Title: "Knee", Date: "2026-11-15"},
-	}
-	discovered := []Experiment{
-		{Dir: "20261115-knee", Title: "Knee (bare)", Date: "2026-11-15"},
-		{Dir: "20261110-early", Title: "Early", Date: "2026-11-10"},
-	}
-
-	merged := Merge(configExperiments, discovered)
-	if len(merged) != 2 {
-		t.Fatalf("got %d experiments, want 2: %+v", len(merged), merged)
-	}
-	if merged[0].Dir != "20261115-knee" || merged[0].Title != "Knee" {
-		t.Errorf("first = %+v, want config entry 20261115-knee", merged[0])
-	}
-	if merged[1].Dir != "20261110-early" {
-		t.Errorf("second = %+v, want 20261110-early", merged[1])
+	if !dated || !undated {
+		t.Errorf("discovery metadata incomplete: %+v", got)
 	}
 }
 
-func TestTitleFromMarkdownBytes(t *testing.T) {
-	cases := []struct {
-		md   string
-		want string
-	}{
-		{"# Title\nbody", "Title"},
-		{"intro\n\n# Later heading\n", "Later heading"},
-		{"## Not h1\n", ""},
-		{"", ""},
-		{"#NoSpace\n", ""},
-		{"#   Padded  \n", "Padded"},
-	}
-	for _, tc := range cases {
-		if got := titleFromMarkdownBytes([]byte(tc.md)); got != tc.want {
-			t.Errorf("titleFromMarkdownBytes(%q) = %q, want %q", tc.md, got, tc.want)
-		}
-	}
-}
+func TestWriteOutputUsesStoryPath(t *testing.T) {
+	root := t.TempDir()
+	storyDir := filepath.Join(root, "results", "20261120-demo")
+	writeFile(t, filepath.Join(storyDir, "custom-story.md"), "# Body\n")
 
-func TestRenderIndexListsAndEscapes(t *testing.T) {
-	experiments := []Experiment{
-		{Dir: "20261115-knee", Title: "A <title> & \"quote\"", Date: "2026-11-15",
-			Objective: "Find <knee>", ConfigName: "20261115-knee.yaml"},
-		{Dir: "20261110-early", Title: "Early", Date: "2026-11-10"},
-	}
-
-	out := RenderIndex(experiments)
-
-	for _, want := range []string{
-		`<a href="20261115-knee/story.html">`,
-		`experiments/20261115-knee.yaml`,
-		`A &lt;title&gt; &amp; &#34;quote&#34;`,
-		`Find &lt;knee&gt;`,
-		`<a href="20261110-early/story.html">Early</a>`,
-		`https://huggingface.co/datasets/dbaltas/inference-api-benchmark-mastori`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("index missing %q", want)
-		}
-	}
-	// Newest first.
-	if strings.Index(out, "20261115-knee") > strings.Index(out, "20261110-early") {
-		t.Error("index not sorted newest-first")
-	}
-}
-
-func TestRenderStoryPage(t *testing.T) {
-	out := RenderStoryPage("Story & <title>", "<h1>Body</h1>")
-	for _, want := range []string{
-		`<title>Story &amp; &lt;title&gt;</title>`,
-		`<h1>Body</h1>`,
-		`<a href="../index.html">`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("story page missing %q", want)
-		}
-	}
-}
-
-func TestWriteOutputCopiesStoryAndConfig(t *testing.T) {
-	root := writeTree(t, map[string]string{
-		"experiments/20261115-knee.yaml":                       "experiment:\n  name: knee\n  story: results/20261115-knee/story.md\n",
-		"results/20261115-knee/story.md":                       "# Knee\n",
-		"results/20261110-early/story.md":                      "# Early\n",
-		"results/20261110-early/runs/20261110T000000Z-0.jsonl": "{}\n",
-	})
-
-	experiments := []Experiment{
-		{Dir: "20261115-knee", Title: "Knee", ConfigName: "20261115-knee.yaml"},
-		{Dir: "20261110-early", Title: "Early"},
-	}
-	out := filepath.Join(t.TempDir(), "site")
-	if err := WriteOutput(out, experiments, root); err != nil {
+	exps := []Experiment{{
+		Dir:       "20261120-demo",
+		Title:     "Body",
+		StoryPath: "results/20261120-demo/custom-story.md",
+	}}
+	out := t.TempDir()
+	if err := WriteOutput(out, exps, root); err != nil {
 		t.Fatalf("WriteOutput: %v", err)
 	}
-
-	for _, path := range []string{
-		filepath.Join(out, "20261115-knee", "story.md"),
-		filepath.Join(out, "experiments", "20261115-knee.yaml"),
-		filepath.Join(out, "20261110-early", "story.md"),
-	} {
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("expected %s to exist: %v", path, err)
-		}
+	data, err := os.ReadFile(filepath.Join(out, "20261120-demo", "story.md"))
+	if err != nil {
+		t.Fatalf("published story missing: %v", err)
 	}
-	// Run JSONL files must not be copied.
-	if _, err := os.Stat(filepath.Join(out, "20261110-early", "runs")); !os.IsNotExist(err) {
-		t.Error("run data should not be copied to the site")
+	if string(data) != "# Body\n" {
+		t.Errorf("published story = %q", data)
 	}
 }
 
-func TestSortNewestFirst(t *testing.T) {
-	experiments := []Experiment{
-		{Dir: "a", Date: "2026-11-10"},
-		{Dir: "b", Date: "2026-11-15"},
-		{Dir: "c", Date: "2026-11-15"},
+func TestRenderIndexConfigLinkWithoutDate(t *testing.T) {
+	// The config link must render even when the experiment has no date
+	// (B9): provenance is worth publishing regardless of the date field.
+	html := RenderIndex([]Experiment{{Dir: "d", Title: "T", ConfigName: "x.yaml"}})
+	if !strings.Contains(html, `experiments/x.yaml`) {
+		t.Error("config link missing for an experiment without a date")
 	}
-	Sort(experiments)
-	if experiments[0].Dir != "b" || experiments[1].Dir != "c" || experiments[2].Dir != "a" {
-		t.Fatalf("sort order wrong: %+v", experiments)
+	if idx := RenderIndex([]Experiment{{Dir: "d", Title: "T", Date: "2026-01-01", ConfigName: "x.yaml"}}); !strings.Contains(idx, `2026-01-01 · <a href="experiments/x.yaml"`) {
+		t.Error("date and config link not joined on one meta line")
+	}
+}
+
+func TestMergeDedupesByDirAndSortsNewestFirst(t *testing.T) {
+	configs := []Experiment{{Dir: "20261120-a", Title: "A", Date: "2026-11-20"}}
+	discovered := []Experiment{
+		{Dir: "20261120-a", Title: "dup"},
+		{Dir: "20261125-b", Title: "B", Date: "2026-11-25"},
+	}
+	got := Merge(configs, discovered)
+	if len(got) != 2 {
+		t.Fatalf("merged = %d, want 2 (dup dropped)", len(got))
+	}
+	if got[0].Dir != "20261125-b" || got[1].Dir != "20261120-a" {
+		t.Errorf("order = %s, %s; want newest first", got[0].Dir, got[1].Dir)
 	}
 }

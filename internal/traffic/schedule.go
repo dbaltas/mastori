@@ -98,8 +98,9 @@ func (p RampPattern) NextDelay(elapsed time.Duration) time.Duration {
 	return time.Duration(float64(time.Second) / r)
 }
 
-// Offered integrates the instantaneous rate over the window (the exact
-// integral of a linear ramp truncated at the pattern duration).
+// Offered integrates the instantaneous rate over the window. Past the
+// pattern duration the rate holds at EndRate (matching NextDelay's clamp),
+// so a window longer than the ramp keeps counting.
 func (p RampPattern) Offered(window time.Duration) float64 {
 	w := window
 	if p.Duration > 0 && w > p.Duration {
@@ -108,7 +109,14 @@ func (p RampPattern) Offered(window time.Duration) float64 {
 	if w <= 0 {
 		return 0
 	}
-	return (p.StartRate + p.rateAt(w)) / 2 * w.Seconds()
+	var n float64
+	if w > 0 {
+		n += (p.StartRate + p.rateAt(w)) / 2 * w.Seconds()
+	}
+	if w < window {
+		n += p.rateAt(window) * (window - w).Seconds()
+	}
+	return n
 }
 
 // StepSeg is one phase of a step pattern: a fixed rate held for a duration.
@@ -187,6 +195,9 @@ func ParseSteps(spec string) ([]StepSeg, error) {
 		var rate float64
 		if _, err := fmt.Sscanf(part[:idx], "%f", &rate); err != nil {
 			return nil, fmt.Errorf("invalid rate in step %q: %w", part, err)
+		}
+		if rate <= 0 {
+			return nil, fmt.Errorf("invalid rate %g in step %q: rates must be positive (a zero rate would hang the schedule)", rate, part)
 		}
 		d, err := time.ParseDuration(strings.TrimSpace(part[idx+1:]))
 		if err != nil || d <= 0 {

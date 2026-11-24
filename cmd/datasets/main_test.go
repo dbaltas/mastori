@@ -7,7 +7,7 @@ import (
 )
 
 func TestRunFetchValidateUnknownDataset(t *testing.T) {
-	err := runFetchValidate("fetch", "testdata/nonexistent.yaml", t.TempDir(), "nope")
+	err := runFetchValidate(context.Background(), "fetch", "testdata/nonexistent.yaml", t.TempDir(), "nope")
 	if err == nil || !strings.Contains(err.Error(), "read manifest") {
 		t.Errorf("unexpected error: %v", err)
 	}

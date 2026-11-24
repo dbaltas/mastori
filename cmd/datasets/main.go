@@ -54,7 +54,7 @@ func main() {
 
 	switch cmd {
 	case "fetch", "validate":
-		if err := runFetchValidate(cmd, *manifestPath, *cacheDir, *only); err != nil {
+		if err := runFetchValidate(ctx, cmd, *manifestPath, *cacheDir, *only); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -69,7 +69,7 @@ func main() {
 	}
 }
 
-func runFetchValidate(cmd, manifestPath, cacheDir, only string) error {
+func runFetchValidate(ctx context.Context, cmd, manifestPath, cacheDir, only string) error {
 	manifest, err := datasets.LoadManifest(manifestPath)
 	if err != nil {
 		return err
@@ -96,7 +96,7 @@ func runFetchValidate(cmd, manifestPath, cacheDir, only string) error {
 		}
 		switch cmd {
 		case "fetch":
-			path, err := fetcher.Fetch(d, cacheDir)
+			path, err := fetcher.Fetch(ctx, d, cacheDir)
 			if err != nil {
 				return fmt.Errorf("%s: %w", name, err)
 			}

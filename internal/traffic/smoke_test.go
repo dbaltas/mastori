@@ -17,8 +17,9 @@ func TestRunSmokeCheckPasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("smoke check: %v", err)
 	}
-	if sc.Chunks != 5 {
-		t.Errorf("chunks = %d, want 5", sc.Chunks)
+	if sc.Chunks != 4 {
+		// 5 chunk events, but the terminal Done chunk is not a token chunk.
+		t.Errorf("chunks = %d, want 4", sc.Chunks)
 	}
 	if sc.TTFTMs >= sc.E2EMs {
 		t.Errorf("ttft %v not < e2e %v", sc.TTFTMs, sc.E2EMs)
@@ -40,8 +41,10 @@ func TestRunSmokeCheckRejectsSingleChunkStream(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected smoke check failure for a single-chunk stream")
 	}
-	if sc.Chunks != 1 {
-		t.Errorf("chunks = %d, want 1", sc.Chunks)
+	if sc != nil && sc.Chunks != 0 {
+		// The Done chunk is not a token chunk, so a Done-only stream has
+		// zero of them.
+		t.Errorf("chunks = %d, want 0", sc.Chunks)
 	}
 }
 

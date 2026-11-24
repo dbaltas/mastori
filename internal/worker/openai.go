@@ -240,13 +240,18 @@ func (g *OpenAIGenerator) Run(ctx context.Context, job queue.Job, onChunk func(q
 		attribute.Int64("job.tokens_out", tokensOut),
 		attribute.Int64("job.duration_ms", time.Since(start).Milliseconds()),
 	)
+	source := "usage"
+	if !sawUsage {
+		source = "estimated"
+	}
 	done := queue.Chunk{
-		JobID:       job.ID,
-		Done:        true,
-		TokensIn:    tokensIn,
-		TokensOut:   tokensOut,
-		QueueWaitMs: queueWaitMs,
-		DurationMs:  time.Since(start).Milliseconds(),
+		JobID:        job.ID,
+		Done:         true,
+		TokensIn:     tokensIn,
+		TokensOut:    tokensOut,
+		TokensSource: source,
+		QueueWaitMs:  queueWaitMs,
+		DurationMs:   time.Since(start).Milliseconds(),
 	}
 	select {
 	case <-ctx.Done():

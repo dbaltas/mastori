@@ -5,7 +5,7 @@ import (
 )
 
 func TestSamplerCycle(t *testing.T) {
-	s := NewSampler(10, 1)
+	s := NewSampler(10, 1, 0)
 	seen := make(map[int]int)
 	for i := 0; i < 10; i++ {
 		seen[s.Next()]++
@@ -29,8 +29,8 @@ func TestSamplerCycle(t *testing.T) {
 }
 
 func TestSamplerDeterministic(t *testing.T) {
-	a := NewSampler(50, 7)
-	b := NewSampler(50, 7)
+	a := NewSampler(50, 7, 0)
+	b := NewSampler(50, 7, 0)
 	for i := 0; i < 100; i++ {
 		if a.Next() != b.Next() {
 			t.Fatalf("sequences diverge at step %d with the same seed", i)
@@ -39,8 +39,8 @@ func TestSamplerDeterministic(t *testing.T) {
 }
 
 func TestSamplerDifferentSeeds(t *testing.T) {
-	a := NewSampler(50, 1)
-	b := NewSampler(50, 2)
+	a := NewSampler(50, 1, 0)
+	b := NewSampler(50, 2, 0)
 	same := true
 	for i := 0; i < 50; i++ {
 		if a.Next() != b.Next() {
@@ -50,6 +50,23 @@ func TestSamplerDifferentSeeds(t *testing.T) {
 	}
 	if same {
 		t.Error("different seeds produced identical sequences")
+	}
+}
+
+func TestSamplerSubStreamsDoNotOverlapAcrossSeeds(t *testing.T) {
+	// The old seed+group+1 sub-seed scheme made seed=1/group=1 replay
+	// seed=2/group=0; SplitMix derivation must keep them independent.
+	a := NewSampler(50, 1, 1)
+	b := NewSampler(50, 2, 0)
+	same := true
+	for i := 0; i < 50; i++ {
+		if a.Next() != b.Next() {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Error("seed=1/group=1 overlapped seed=2/group=0")
 	}
 }
 

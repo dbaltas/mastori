@@ -57,7 +57,10 @@ func run(benchmarkRoot, outDir string) error {
 	}
 
 	for _, exp := range experiments {
-		storyMD := filepath.Join(benchmarkRoot, "results", exp.Dir, "story.md")
+		if exp.StoryPath == "" {
+			return fmt.Errorf("experiment %s has no story path", exp.Dir)
+		}
+		storyMD := filepath.Join(benchmarkRoot, filepath.FromSlash(exp.StoryPath))
 		bodyHTML, err := renderMarkdown(storyMD)
 		if err != nil {
 			return err

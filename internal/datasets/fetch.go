@@ -1,10 +1,12 @@
 package datasets
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,7 +15,7 @@ import (
 const rowsAPI = "https://datasets-server.huggingface.co/rows"
 
 // The datasets-server API is a shared free service and throttles bursts with
-// 5xx responses, so fetches retry with exponential backoff.
+// 429 and 5xx responses, so fetches retry both with exponential backoff.
 const maxRetries = 6
 
 type Fetcher struct {
@@ -36,14 +38,17 @@ func NewFetcher() *Fetcher {
 	}
 }
 
-func (f *Fetcher) fetchPage(d Dataset, offset, length int) ([]map[string]any, error) {
+func (f *Fetcher) fetchPage(ctx context.Context, d Dataset, offset, length int) ([]map[string]any, error) {
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		rows, retryable, err := f.fetchPageOnce(d, offset, length)
+		rows, retryable, err := f.fetchPageOnce(ctx, d, offset, length)
 		if err == nil {
 			return rows, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if !retryable || attempt == maxRetries {
 			break
 		}
@@ -52,10 +57,16 @@ func (f *Fetcher) fetchPage(d Dataset, offset, length int) ([]map[string]any, er
 	return nil, lastErr
 }
 
-func (f *Fetcher) fetchPageOnce(d Dataset, offset, length int) ([]map[string]any, bool, error) {
-	url := fmt.Sprintf("%s?dataset=%s&config=%s&split=%s&offset=%d&length=%d",
-		f.BaseURL, d.Source, d.Config, d.Split, offset, length)
-	req, err := http.NewRequest("GET", url, nil)
+func (f *Fetcher) fetchPageOnce(ctx context.Context, d Dataset, offset, length int) ([]map[string]any, bool, error) {
+	q := url.Values{}
+	q.Set("dataset", d.Source)
+	q.Set("config", d.Config)
+	q.Set("split", d.Split)
+	q.Set("offset", fmt.Sprint(offset))
+	q.Set("length", fmt.Sprint(length))
+	u := f.BaseURL + "?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -65,7 +76,7 @@ func (f *Fetcher) fetchPageOnce(d Dataset, offset, length int) ([]map[string]any
 	}
 	resp, err := f.Client.Do(req)
 	if err != nil {
-		return nil, true, fmt.Errorf("request %s: %w", url, err)
+		return nil, true, fmt.Errorf("request %s: %w", u, err)
 	}
 	defer resp.Body.Close()
 
@@ -74,7 +85,7 @@ func (f *Fetcher) fetchPageOnce(d Dataset, offset, length int) ([]map[string]any
 		return nil, false, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		retryable := resp.StatusCode >= 500
+		retryable := resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
 		return nil, retryable, fmt.Errorf("HF API returned %d: %s", resp.StatusCode, truncate(body, 300))
 	}
 	var parsed struct {
@@ -142,10 +153,17 @@ func extractRow(d Dataset, index int, row map[string]any) (map[string]any, error
 }
 
 // Fetch downloads the selection for a dataset and writes it as JSONL to
-// <cacheDir>/<name>.jsonl. The rows API serves the current revision of the
-// dataset; the pinned revision in the manifest documents the state the sample
-// was generated from.
-func (f *Fetcher) Fetch(d Dataset, cacheDir string) (string, error) {
+// <cacheDir>/<name>.jsonl.
+//
+// Two provenance caveats, visible in the row payloads:
+//   - extracted rows carry `index`, the row's position within the
+//     selection (0-based from Selection.Start), not the row's position in
+//     the source dataset.
+//   - the rows API serves whatever revision it currently resolves; the
+//     pinned `revision` in the manifest documents the expected state but is
+//     not enforced by the API. The manifest SHA-256 that keys the cache
+//     covers the manifest file (including that pin), not the served data.
+func (f *Fetcher) Fetch(ctx context.Context, d Dataset, cacheDir string) (string, error) {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", fmt.Errorf("create cache dir: %w", err)
 	}
@@ -158,7 +176,7 @@ func (f *Fetcher) Fetch(d Dataset, cacheDir string) (string, error) {
 		if remaining < pageSize {
 			pageSize = remaining
 		}
-		page, err := f.fetchPage(d, offset, pageSize)
+		page, err := f.fetchPage(ctx, d, offset, pageSize)
 		if err != nil {
 			return "", err
 		}
@@ -176,19 +194,34 @@ func (f *Fetcher) Fetch(d Dataset, cacheDir string) (string, error) {
 	}
 
 	outPath := filepath.Join(cacheDir, d.Name+".jsonl")
-	out, err := os.Create(outPath)
-	if err != nil {
-		return "", fmt.Errorf("create %s: %w", outPath, err)
-	}
-	defer out.Close()
+	return outPath, writeJSONLAtomic(outPath, rows)
+}
 
-	enc := json.NewEncoder(out)
+// writeJSONLAtomic writes the rows as JSONL through a temp file and a
+// rename, so a crash (or a concurrent reader) never observes a half-written
+// cache file at the final path.
+func writeJSONLAtomic(outPath string, rows []extracted) error {
+	tmp, err := os.CreateTemp(filepath.Dir(outPath), ".tmp-"+filepath.Base(outPath)+"-")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	enc := json.NewEncoder(tmp)
 	for _, r := range rows {
 		if err := enc.Encode(r); err != nil {
-			return "", fmt.Errorf("encode row %d: %w", r.Index, err)
+			tmp.Close()
+			return fmt.Errorf("encode row %d: %w", r.Index, err)
 		}
 	}
-	return outPath, nil
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		return fmt.Errorf("rename %s: %w", tmpPath, err)
+	}
+	return nil
 }
 
 func truncate(b []byte, n int) string {

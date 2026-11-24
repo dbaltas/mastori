@@ -2,15 +2,18 @@ package traffic
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"math/rand/v2"
+	mathrand "math/rand/v2"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -56,7 +59,13 @@ type Config struct {
 	// RecordsStdout also streams every record as a JSON line to stdout, so
 	// a run executed inside the cluster is recoverable from the pod logs
 	// (distroless images have no shell, so results cannot be copied out).
+	// The startup line and the final summary go to stderr in that mode so
+	// stdout stays parseable JSONL.
 	RecordsStdout bool
+	// VCSRev and VCSModified record the binary's build provenance in the
+	// summary (set by the CLI from debug.ReadBuildInfo; empty when unknown).
+	VCSRev      string
+	VCSModified bool
 	// preflightHealthy stores the preflight workers_healthy observation for
 	// the summary (set by Run when the scheduler gate is configured).
 	preflightHealthy int
@@ -76,6 +85,28 @@ type Config struct {
 	InterruptKey string
 }
 
+// applyDefaults fills in unset fields with their defaults, mutating cfg.
+// Run calls it before Validate; Validate itself never mutates.
+func (c *Config) applyDefaults() {
+	if c.Timeout <= 0 {
+		c.Timeout = 65 * time.Second
+	}
+	if c.DrainGrace <= 0 {
+		c.DrainGrace = c.Timeout + 10*time.Second
+	}
+	if c.RunID == "" {
+		c.RunID = NewRunID()
+	}
+	if c.InterruptKey == "" {
+		c.InterruptKey = "run:interrupted"
+	}
+	if c.Arrival == "" {
+		c.Arrival = "constant"
+	}
+}
+
+// Validate reports whether the config is well-formed. It does not mutate;
+// applyDefaults must run first so defaulted fields validate.
 func (c *Config) Validate() error {
 	if c.URL == "" {
 		return fmt.Errorf("url is required")
@@ -86,39 +117,43 @@ func (c *Config) Validate() error {
 	if c.Duration <= 0 {
 		return fmt.Errorf("duration must be positive")
 	}
-	if c.Timeout <= 0 {
-		c.Timeout = 65 * time.Second
+	if c.Concurrency < 0 {
+		return fmt.Errorf("concurrency must not be negative")
 	}
-	if c.DrainGrace < 0 {
-		return fmt.Errorf("drain grace must not be negative")
-	}
-	if c.RunID == "" {
-		c.RunID = time.Now().UTC().Format("20060102T150405")
-	}
-	if c.InterruptKey == "" {
-		c.InterruptKey = "run:interrupted"
+	if c.MaxInflight < 0 {
+		return fmt.Errorf("max-inflight must not be negative")
 	}
 	if c.Concurrency > 0 {
 		return nil
 	}
-	if c.Rate <= 0 {
+	// With steps, the base --rate is never consulted: each segment carries
+	// its own rate, so requiring it here would force a meaningless flag.
+	if len(c.Steps) == 0 && c.Rate <= 0 {
 		return fmt.Errorf("rate must be positive in open-loop mode (or set concurrency for closed-loop)")
 	}
 	if c.RampEndRate < 0 {
 		return fmt.Errorf("ramp-end-rate must not be negative")
 	}
-	if len(c.Steps) == 0 && c.RampEndRate == 0 {
-		a := c.Arrival
-		if a == "" {
-			a = "constant"
+	if len(c.Steps) > 0 || c.RampEndRate > 0 {
+		if c.Arrival != "" && c.Arrival != "constant" {
+			return fmt.Errorf("arrival %q cannot be combined with steps or a ramp: those patterns define their own deterministic schedule", c.Arrival)
 		}
-		if a != "constant" && a != "poisson" {
-			return fmt.Errorf("arrival must be \"constant\" or \"poisson\"")
-		}
+		return nil
+	}
+	a := c.Arrival
+	if a == "" {
+		a = "constant"
+	}
+	if a != "constant" && a != "poisson" {
+		return fmt.Errorf("arrival must be \"constant\" or \"poisson\"")
 	}
 	return nil
 }
 
+// inflightLimit is the in-flight ceiling the run enforces in open-loop mode.
+// It derives from the peak scheduled rate, not the base --rate flag: with
+// steps like "10:60s,200:60s" the knee segment needs 4*200 in-flight room,
+// and a cap sized from the 10 base rate would clip the knee by default.
 func (c *Config) inflightLimit() int {
 	if c.MaxInflight > 0 {
 		return c.MaxInflight
@@ -126,7 +161,28 @@ func (c *Config) inflightLimit() int {
 	if c.Concurrency > 0 {
 		return c.Concurrency
 	}
-	return int(math.Max(1, math.Ceil(4*c.Rate)))
+	peak := c.Rate
+	for _, s := range c.Steps {
+		if s.Rate > peak {
+			peak = s.Rate
+		}
+	}
+	if c.RampEndRate > peak {
+		peak = c.RampEndRate
+	}
+	return int(math.Max(1, math.Ceil(4*peak)))
+}
+
+// NewRunID returns a run identifier: a UTC timestamp plus random hex bytes,
+// so runs started within the same second remain distinct. The same format is
+// used by the CLI and by the Run fallback.
+func NewRunID() string {
+	var b [3]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		// The timestamp alone still identifies the run well enough.
+		return time.Now().UTC().Format("20060102T150405Z")
+	}
+	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
 }
 
 // Run statuses. The summary file is written with StatusRunning at run start
@@ -137,6 +193,66 @@ const (
 	StatusValid   = "valid"
 	StatusInvalid = "invalid"
 )
+
+// RunConfig records the resolved run configuration in the summary, so a
+// summary reproduces its run without access to the CLI invocation.
+type RunConfig struct {
+	URL          string             `json:"url"`
+	Model        string             `json:"model,omitempty"`
+	Seed         int64              `json:"seed"`
+	WarmupMs     int64              `json:"warmup_ms"`
+	DurationMs   int64              `json:"duration_ms"`
+	Concurrency  int                `json:"concurrency"`
+	Rate         float64            `json:"rate"`
+	Arrival      string             `json:"arrival,omitempty"`
+	RampEndRate  float64            `json:"ramp_end_rate,omitempty"`
+	Steps        string             `json:"steps,omitempty"`
+	MaxInflight  int                `json:"max_inflight,omitempty"`
+	Stream       bool               `json:"stream"`
+	TimeoutMs    int64              `json:"timeout_ms"`
+	DrainGraceMs int64              `json:"drain_grace_ms,omitempty"`
+	Weights      map[string]float64 `json:"weights,omitempty"`
+	GenerationParams
+	SchedulerURL    string `json:"scheduler_url,omitempty"`
+	ExpectedWorkers int    `json:"expected_workers,omitempty"`
+	Smoke           bool   `json:"smoke,omitempty"`
+	RedisAddr       string `json:"redis_addr,omitempty"`
+	InterruptKey    string `json:"interrupt_key,omitempty"`
+}
+
+// RunConfig renders the resolved configuration for the summary.
+func (c *Config) RunConfig() *RunConfig {
+	rc := &RunConfig{
+		URL:              c.URL,
+		Model:            c.Model,
+		Seed:             c.Seed,
+		WarmupMs:         c.Warmup.Milliseconds(),
+		DurationMs:       c.Duration.Milliseconds(),
+		Concurrency:      c.Concurrency,
+		Rate:             c.Rate,
+		Arrival:          c.Arrival,
+		RampEndRate:      c.RampEndRate,
+		MaxInflight:      c.MaxInflight,
+		Stream:           c.Stream,
+		TimeoutMs:        c.Timeout.Milliseconds(),
+		DrainGraceMs:     c.DrainGrace.Milliseconds(),
+		Weights:          c.Weights,
+		GenerationParams: c.GenerationParams,
+		SchedulerURL:     c.SchedulerURL,
+		ExpectedWorkers:  c.ExpectedWorkers,
+		Smoke:            c.Smoke,
+		RedisAddr:        c.RedisAddr,
+		InterruptKey:     c.InterruptKey,
+	}
+	if len(c.Steps) > 0 {
+		parts := make([]string, len(c.Steps))
+		for i, s := range c.Steps {
+			parts[i] = fmt.Sprintf("%g:%s", s.Rate, s.Duration)
+		}
+		rc.Steps = strings.Join(parts, ",")
+	}
+	return rc
+}
 
 type Summary struct {
 	SchemaVersion     string         `json:"schema_version"`
@@ -152,36 +268,55 @@ type Summary struct {
 	Failures          int            `json:"failures"`
 	ByStatus          map[int]int    `json:"by_status"`
 	Errors            map[string]int `json:"errors"`
-	RequestedRate     float64        `json:"requested_rate"`
-	AchievedSendRate  float64        `json:"achieved_send_rate"`
+	// RequestedRate is the schedule-implied offered average rate for the
+	// measured window (open-loop only; omitted for closed-loop runs, where
+	// the base --rate flag describes nothing).
+	RequestedRate    float64 `json:"requested_rate,omitempty"`
+	AchievedSendRate float64 `json:"achieved_send_rate"`
 	// OfferedRequests is the schedule-implied arrival count for the
 	// measured window (expected for Poisson); SkippedOffered is how many
-	// of those were never sent because the in-flight semaphore held the
-	// sender back (open-loop only; closed-loop reports neither).
-	OfferedRequests int     `json:"offered_requests,omitempty"`
-	SkippedOffered  int     `json:"skipped_offered,omitempty"`
-	Throughput      float64 `json:"throughput_rps"`
+	// of those were neither sent nor rejected by the in-flight semaphore
+	// — the residual schedule-vs-clock error (open-loop only; closed-loop
+	// reports neither). SkippedBackpressure counts arrivals the semaphore
+	// refused before they could be sent.
+	OfferedRequests     int     `json:"offered_requests,omitempty"`
+	SkippedOffered      int     `json:"skipped_offered,omitempty"`
+	SkippedBackpressure int     `json:"skipped_backpressure,omitempty"`
+	Throughput          float64 `json:"throughput_rps"`
 	// MaxInflight records the in-flight ceiling the run enforced (open
 	// loop), so saturated-latency numbers are read together with the cap
 	// that produced them (Little's law: the cap sets the latency band).
-	MaxInflight    int            `json:"max_inflight,omitempty"`
-	LatencyMsP50   float64        `json:"latency_ms_p50"`
-	LatencyMsP95   float64        `json:"latency_ms_p95"`
-	LatencyMsP99   float64        `json:"latency_ms_p99"`
-	LatencyMsMean  float64        `json:"latency_ms_mean"`
-	LatencyMsMin   float64        `json:"latency_ms_min"`
-	LatencyMsMax   float64        `json:"latency_ms_max"`
-	TTFTMsP50      float64        `json:"ttft_ms_p50"`
-	TTFTMsP95      float64        `json:"ttft_ms_p95"`
-	TTFTMsMean     float64        `json:"ttft_ms_mean"`
-	TokensOutTotal int64          `json:"tokens_out_total"`
-	TokensInTotal  int64          `json:"tokens_in_total"`
-	OutputPath     string         `json:"output_path"`
-	Mode           string         `json:"mode"`
-	Datasets       map[string]int `json:"datasets"`
+	MaxInflight    int     `json:"max_inflight,omitempty"`
+	LatencyMsP50   float64 `json:"latency_ms_p50"`
+	LatencyMsP95   float64 `json:"latency_ms_p95"`
+	LatencyMsP99   float64 `json:"latency_ms_p99"`
+	LatencyMsMean  float64 `json:"latency_ms_mean"`
+	LatencyMsMin   float64 `json:"latency_ms_min"`
+	LatencyMsMax   float64 `json:"latency_ms_max"`
+	TTFTMsP50      float64 `json:"ttft_ms_p50"`
+	TTFTMsP95      float64 `json:"ttft_ms_p95"`
+	TTFTMsP99      float64 `json:"ttft_ms_p99"`
+	TTFTMsMean     float64 `json:"ttft_ms_mean"`
+	TokensOutTotal int64   `json:"tokens_out_total"`
+	TokensInTotal  int64   `json:"tokens_in_total"`
+	// TokensOutEstimatedResponses counts successful measured responses
+	// whose tokens_out was estimated rather than reported by the backend;
+	// tok/s claims are only trustworthy when it is zero.
+	TokensOutEstimatedResponses int            `json:"tokens_out_estimated_responses,omitempty"`
+	OutputPath                  string         `json:"output_path"`
+	Mode                        string         `json:"mode"`
+	Datasets                    map[string]int `json:"datasets"`
 	// GenerationParams records the run's output-control parameters, so a
 	// summary is self-describing about what shaped its output lengths.
 	GenerationParams
+	// Config is the resolved run configuration (seed, arrival, steps,
+	// concurrency, timeouts, weights, generation params), so a summary
+	// reproduces its run.
+	Config *RunConfig `json:"config,omitempty"`
+	// VCSRev/VCSModified record the traffic binary's build provenance
+	// (debug.ReadBuildInfo); empty when built without VCS stamping.
+	VCSRev      string `json:"vcs_rev,omitempty"`
+	VCSModified bool   `json:"vcs_modified,omitempty"`
 	// SmokeCheck records the preflight smoke request's result when the
 	// smoke gate is enabled.
 	SmokeCheck *SmokeCheck `json:"smoke_check,omitempty"`
@@ -197,6 +332,10 @@ type Summary struct {
 	// DatasetManifestSHA256 identifies the seed data the run replayed
 	// (SHA-256 of the dataset manifest), empty when unknown.
 	DatasetManifestSHA256 string `json:"dataset_manifest_sha256,omitempty"`
+	// InterruptedBeforeRun records whether the infra-level interruption
+	// flag was already set when the run started (it is cleared afterwards,
+	// so the finalize check reflects only interruptions during this run).
+	InterruptedBeforeRun bool `json:"interrupted_before_run,omitempty"`
 }
 
 // accumulator collects counters from concurrent send goroutines.
@@ -206,6 +345,7 @@ type accumulator struct {
 	requests  int
 	successes int
 	failures  int
+	estimated int
 	byStatus  map[int]int
 	errors    map[string]int
 	tokensOut int64
@@ -237,15 +377,20 @@ func (a *accumulator) add(r Record, ok bool) {
 	a.byStatus[r.Status]++
 	if ok {
 		a.successes++
-		a.latency.Add(float64(r.LatencyMs))
-		if r.TTFTMs > 0 {
-			a.ttft.Add(float64(r.TTFTMs))
+		a.latency.AddUS(r.LatencyUs)
+		if r.HasTTFT {
+			a.ttft.AddUS(r.TTFTUs)
 		}
 		a.tokensOut += r.TokensOut
+		if r.TokensSource == "estimated" {
+			a.estimated++
+		}
 	} else {
 		a.failures++
-		if r.Error != "" {
-			a.errors[r.Error]++
+		if r.ErrorKind != "" {
+			a.errors[r.ErrorKind]++
+		} else if r.Error != "" {
+			a.errors["transport"]++
 		}
 	}
 	// Counted for every record: rejected requests carry 0 prompt tokens
@@ -322,8 +467,90 @@ func (b *warmupBarrier) close(ctx context.Context) (time.Duration, bool) {
 	return b.drainWall, b.drainOK
 }
 
+// pendingSend is one scheduled request, drawn by the scheduler goroutine so
+// the arrival->prompt mapping is deterministic for a seed: the row choice
+// and the send sequence number are assigned when the arrival is scheduled,
+// not when its response completes.
+type pendingSend struct {
+	row Row
+	seq int64
+}
+
+// runner owns the shared state of one run. Methods serialize their own
+// access; send goroutines only touch the accumulator and writer, which are
+// safe for concurrent use.
+type runner struct {
+	cfg      *Config
+	sender   *Sender
+	selector *WeightedRowSource
+	writer   *ResultWriter
+	acc      *accumulator
+	barrier  *warmupBarrier
+
+	sem                 chan struct{}
+	seq                 atomic.Int64
+	skippedBackpressure atomic.Int64
+}
+
+// nextPending draws the row and the send sequence number. It must run in the
+// scheduling goroutine (closed-loop worker or the open-loop scheduler), so
+// two runs with the same seed replay the same send->prompt sequence.
+func (r *runner) nextPending() pendingSend {
+	return pendingSend{row: r.selector.Next(), seq: r.seq.Add(1)}
+}
+
+// send executes one request and records it. It returns the classification
+// of the failure ("" on success) so closed-loop workers can back off.
+func (r *runner) send(ctx context.Context, pending pendingSend, warmup, tracked bool) (bool, string) {
+	if tracked {
+		defer r.barrier.done()
+	}
+	sctx, cancel := context.WithTimeout(ctx, r.cfg.Timeout+5*time.Second)
+	defer cancel()
+
+	sendAt := time.Now()
+	res, err := r.sender.Send(sctx, pending.row)
+	latency := time.Since(sendAt)
+	ok := err == nil && res.Status == 200
+
+	rec := Record{
+		SchemaVersion: SchemaVersion,
+		RunID:         r.cfg.RunID,
+		Seq:           pending.seq,
+		Dataset:       pending.row.Dataset,
+		RowIndex:      pending.row.Index,
+		Warmup:        warmup,
+		SendAt:        sendAt,
+		Status:        res.Status,
+		LatencyUs:     latency.Microseconds(),
+		TPOTUs:        res.TPOT.Microseconds(),
+		Chunks:        res.Chunks,
+		TokensIn:      res.APIResp.TokensIn,
+		TokensOut:     res.APIResp.TokensOut,
+		TokensSource:  res.TokensSource,
+		MaxTokens:     r.cfg.GenerationParams.MaxTokens,
+		APITotalMs:    res.APIResp.TotalMs,
+	}
+	if res.TTFT > 0 {
+		rec.HasTTFT = true
+		rec.TTFTUs = res.TTFT.Microseconds()
+		rec.FirstChunkAt = &res.FirstChunkAt
+		rec.LastChunkAt = &res.LastChunkAt
+	}
+	rec.ErrorKind = classifySendError(err, res)
+	if err != nil {
+		rec.Error = err.Error()
+	}
+	if werr := r.writer.Write(rec); werr != nil {
+		fmt.Fprintf(os.Stderr, "warning: write result: %v\n", werr)
+	}
+	r.acc.add(rec, ok)
+	return ok, rec.ErrorKind
+}
+
 // Run executes the configured traffic run and returns its summary.
 func Run(ctx context.Context, cfg *Config) (*Summary, error) {
+	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -349,29 +576,47 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		}
 	}
 
+	// Interruption flag lifecycle: snapshot and clear a stale flag at run
+	// start, so the finalize check reflects only interruptions that happen
+	// during this run (a previous incident must not invalidate every run
+	// for the flag's remaining TTL).
+	var interruptedBeforeRun bool
+	if cfg.RedisAddr != "" {
+		interruptedBeforeRun = checkInterrupted(cfg)
+		if interruptedBeforeRun {
+			clearInterrupted(cfg)
+		}
+	}
+
 	fileWriter, err := NewResultWriter(cfg.OutputPath)
 	if err != nil {
 		return nil, err
 	}
 	defer fileWriter.Close()
-	var writer *ResultWriter
 	if cfg.RecordsStdout {
-		writer = NewResultWriterTo(io.MultiWriter(fileWriter.f, os.Stdout))
-	} else {
-		writer = fileWriter
+		fileWriter.Tee(os.Stdout)
 	}
 
-	sender := NewSender(cfg.URL, cfg.Model, cfg.Stream, cfg.GenerationParams, cfg.Timeout)
-	selector := NewWeightedRowSource(cfg.Rows, cfg.Weights, cfg.Seed)
+	// sendCtx is derived so a hung drain can be cancelled without
+	// cancelling the caller's context: after the drain timeout the run
+	// still finalizes a summary, and in-flight sends must stop writing to
+	// (soon closed) results files.
+	sendCtx, sendCancel := context.WithCancel(ctx)
+	defer sendCancel()
+
+	r := &runner{
+		cfg:      cfg,
+		sender:   NewSender(cfg.URL, cfg.Model, cfg.Stream, cfg.GenerationParams, cfg.Timeout),
+		selector: NewWeightedRowSource(cfg.Rows, cfg.Weights, cfg.Seed),
+		writer:   fileWriter,
+		acc:      newAccumulator(),
+		sem:      make(chan struct{}, cfg.inflightLimit()),
+	}
 	pattern := buildPattern(cfg)
 	total := cfg.Warmup + cfg.Duration
 	started := time.Now()
 	warmupEnd := started.Add(cfg.Warmup)
-	drainGrace := cfg.DrainGrace
-	if drainGrace <= 0 {
-		drainGrace = cfg.Timeout + 10*time.Second
-	}
-	barrier := newWarmupBarrier(warmupEnd, drainGrace)
+	r.barrier = newWarmupBarrier(warmupEnd, cfg.DrainGrace)
 	var offered float64
 	if cfg.Concurrency == 0 {
 		offered = pattern.Offered(cfg.Duration)
@@ -385,95 +630,126 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 		StartedAt:     started,
 		Mode:          modeLabel(cfg),
 		OutputPath:    cfg.OutputPath,
+		Config:        cfg.RunConfig(),
+		VCSRev:        cfg.VCSRev,
+		VCSModified:   cfg.VCSModified,
 	}
 	if err := WriteSummary(summaryPath, startSummary); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: write start summary: %v\n", err)
 	}
 
-	var seq atomic.Int64
-	acc := newAccumulator()
-
 	var wg sync.WaitGroup
 	if cfg.Concurrency > 0 {
+		// Closed loop: each worker is its own scheduler; it draws the row
+		// and send_seq itself right before sending, so the send order is
+		// the arrival order and the mapping stays deterministic.
 		for i := 0; i < cfg.Concurrency; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				crossed := false
 				deadline := started.Add(total)
+				backoff := time.Duration(0)
 				for {
 					now := time.Now()
 					warmup := now.Before(warmupEnd)
 					if !warmup && !crossed {
 						// Drain in-flight warmup requests before
 						// the first measured send leaves this worker.
-						barrier.close(ctx)
+						r.barrier.close(sendCtx)
 						deadline = time.Now().Add(cfg.Duration)
 						crossed = true
 					}
 					if !now.Before(deadline) {
 						return
 					}
-					tracked := barrier.mark(now)
-					runSend(ctx, sender, selector, writer, acc, &seq, cfg, warmup, barrier, tracked)
-					if ctx.Err() != nil {
+					tracked := r.barrier.mark(now)
+					_, kind := r.send(sendCtx, r.nextPending(), warmup, tracked)
+					if sendCtx.Err() != nil {
 						return
+					}
+					// Back off on connection-level failures so a dead
+					// API cannot turn a worker into a failure-record
+					// generator; status-code failures are real server
+					// answers and keep the loop tight.
+					switch kind {
+					case "", "http_429", "http_5xx":
+						if kind == "" {
+							backoff = 0
+						}
+					default:
+						backoff = maxBackoff(backoff)
+						select {
+						case <-time.After(backoff):
+						case <-sendCtx.Done():
+							return
+						}
 					}
 				}
 			}()
 		}
 	} else {
-		sem := make(chan struct{}, cfg.inflightLimit())
+		// Open loop: one scheduler goroutine owns the pattern clock. Each
+		// send time is computed from the absolute schedule (anchored at the
+		// phase start), not from the wall clock after the previous launch,
+		// so timer and spawn overhead cannot drift the arrivals; running
+		// late only collapses the next delay, never shifts the schedule.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			launch := func(delay time.Duration, sendAt time.Time, warmup, tracked bool) bool {
+			launch := func(delay time.Duration, warmup, tracked bool) bool {
 				timer := time.NewTimer(delay)
+				defer timer.Stop()
 				select {
-				case <-ctx.Done():
-					timer.Stop()
-					if tracked {
-						barrier.done()
-					}
+				case <-sendCtx.Done():
 					return false
 				case <-timer.C:
 				}
 				select {
-				case <-ctx.Done():
-					if tracked {
-						barrier.done()
-					}
+				case <-sendCtx.Done():
 					return false
-				case sem <- struct{}{}:
+				case r.sem <- struct{}{}:
+				default:
+					// Non-blocking try: the scheduled arrival was offered
+					// but the in-flight cap prevents it from being sent at
+					// all. Counted separately from the offered-sent gap.
+					r.skippedBackpressure.Add(1)
+					if tracked {
+						r.barrier.done()
+					}
+					return true
 				}
+				pending := r.nextPending()
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					defer func() { <-sem }()
-					runSend(ctx, sender, selector, writer, acc, &seq, cfg, warmup, barrier, tracked)
+					defer func() { <-r.sem }()
+					r.send(sendCtx, pending, warmup, tracked)
 				}()
 				return true
 			}
 
 			// Warmup phase: pattern clock anchored at the run start,
-			// stopping at the boundary.
+			// stopping at the boundary. Warmup sends register with the
+			// barrier at their scheduled time.
 			if cfg.Warmup > 0 {
+				next := started
 				for {
-					now := time.Now()
-					if !now.Before(warmupEnd) {
-						break
-					}
-					sendAt := now.Add(pattern.NextDelay(now.Sub(started)))
-					if !sendAt.Before(warmupEnd) {
+					next = next.Add(pattern.NextDelay(next.Sub(started)))
+					if !next.Before(warmupEnd) {
 						// The next scheduled send lands past the
 						// boundary; cut warmup traffic here.
 						break
 					}
-					if !launch(sendAt.Sub(now), sendAt, true, barrier.mark(sendAt)) {
+					tracked := r.barrier.mark(next)
+					if !launch(time.Until(next), true, tracked) {
+						if tracked {
+							r.barrier.done()
+						}
 						return
 					}
 				}
-				barrier.close(ctx)
+				r.barrier.close(sendCtx)
 			}
 
 			// Measured phase: pattern clock anchored at measuredStart so
@@ -481,14 +757,13 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 			// step patterns span the measured window.
 			measuredStart := time.Now()
 			end := measuredStart.Add(cfg.Duration)
+			next := measuredStart
 			for {
-				now := time.Now()
-				if !now.Before(end) {
+				next = next.Add(pattern.NextDelay(next.Sub(measuredStart)))
+				if !next.Before(end) {
 					return
 				}
-				delay := pattern.NextDelay(now.Sub(measuredStart))
-				sendAt := now.Add(delay)
-				if !launch(delay, sendAt, false, false) {
+				if !launch(time.Until(next), false, false) {
 					return
 				}
 			}
@@ -505,30 +780,44 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(total + drainGrace + cfg.Timeout + 10*time.Second):
-		fmt.Fprintf(os.Stderr, "warning: in-flight requests did not drain within grace; returning partial summary\n")
+	case <-time.After(total + cfg.DrainGrace + cfg.Timeout + 10*time.Second):
+		// Cancel the in-flight sends and wait briefly: after Run returns
+		// the results file closes, and sends must not outlive it.
+		fmt.Fprintf(os.Stderr, "warning: in-flight requests did not drain within grace; cancelling and returning a partial summary\n")
+		sendCancel()
+		select {
+		case <-done:
+		case <-time.After(cfg.DrainGrace):
+			fmt.Fprintf(os.Stderr, "warning: sends still in flight after cancel; their records are missing from the summary\n")
+		}
 	}
 	finished := time.Now()
 
-	s := acc.snapshot(cfg)
+	s := r.acc.snapshot(cfg)
 	s.SchemaVersion = SchemaVersion
 	s.RunID = cfg.RunID
 	s.StartedAt = started
-	s.MeasuredStartedAt = barrier.start
+	s.MeasuredStartedAt = r.barrier.start
 	if s.MeasuredStartedAt.IsZero() {
 		s.MeasuredStartedAt = started
 	}
-	s.WarmupDrainMs = barrier.drainWall.Milliseconds()
+	s.WarmupDrainMs = r.barrier.drainWall.Milliseconds()
 	s.FinishedAt = finished
 	s.OutputPath = cfg.OutputPath
+	s.Config = cfg.RunConfig()
+	s.VCSRev = cfg.VCSRev
+	s.VCSModified = cfg.VCSModified
+	s.InterruptedBeforeRun = interruptedBeforeRun
 	if cfg.Concurrency == 0 {
 		// Open-loop: offered is the schedule-implied arrival count for the
 		// measured window, and requested_rate is the true offered average
 		// (with steps, cfg.Rate is just the base flag, not what was
-		// scheduled).
+		// scheduled). skipped_backpressure is reported separately; the
+		// residual gap is the schedule-vs-clock error.
 		s.OfferedRequests = int(math.Round(offered))
-		if s.Requests < s.OfferedRequests {
-			s.SkippedOffered = s.OfferedRequests - s.Requests
+		s.SkippedBackpressure = int(r.skippedBackpressure.Load())
+		if residual := s.OfferedRequests - s.Requests - s.SkippedBackpressure; residual > 0 {
+			s.SkippedOffered = residual
 		}
 		s.RequestedRate = offered / cfg.Duration.Seconds()
 	}
@@ -560,6 +849,18 @@ func Run(ctx context.Context, cfg *Config) (*Summary, error) {
 	return s, nil
 }
 
+// maxBackoff doubles the previous backoff up to one second; the first
+// failure starts at 10ms.
+func maxBackoff(prev time.Duration) time.Duration {
+	if prev == 0 {
+		return 10 * time.Millisecond
+	}
+	if next := 2 * prev; next < time.Second {
+		return next
+	}
+	return time.Second
+}
+
 // checkInterrupted reports whether the infra-level interruption flag is set
 // in Redis. Without a Redis address (or if the check fails) the run is not
 // considered interrupted: request failures remain the observable signal.
@@ -581,49 +882,21 @@ func checkInterrupted(cfg *Config) bool {
 	return false
 }
 
-func runSend(ctx context.Context, sender *Sender, selector *WeightedRowSource, writer *ResultWriter, acc *accumulator, seq *atomic.Int64, cfg *Config, warmup bool, barrier *warmupBarrier, tracked bool) {
-	if tracked {
-		defer barrier.done()
-	}
-	sctx, cancel := context.WithTimeout(ctx, cfg.Timeout+5*time.Second)
+// clearInterrupted deletes the interruption flag, so a stale flag from a
+// previous incident does not invalidate this run. Failures are warnings:
+// a leftover flag still shows up in the finalize check.
+func clearInterrupted(cfg *Config) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-
-	row := selector.Next()
-	sendAt := time.Now()
-	res, err := sender.Send(sctx, row)
-	latency := time.Since(sendAt)
-	ok := err == nil && res.Status == 200
-
-	errMsg := ""
-	if err != nil {
-		errMsg = err.Error()
+	client := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	defer func() { _ = client.Close() }()
+	if err := client.Del(ctx, cfg.InterruptKey).Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: clear interruption flag: %v\n", err)
 	}
-	rec := Record{
-		SchemaVersion: SchemaVersion,
-		RunID:         cfg.RunID,
-		Seq:           seq.Add(1),
-		Dataset:       row.Dataset,
-		RowIndex:      row.Index,
-		Warmup:        warmup,
-		SendAt:        sendAt,
-		Status:        res.Status,
-		LatencyMs:     latency.Milliseconds(),
-		TTFTMs:        res.TTFT.Milliseconds(),
-		Chunks:        res.Chunks,
-		TokensIn:      res.APIResp.TokensIn,
-		TokensOut:     res.APIResp.TokensOut,
-		MaxTokens:     cfg.GenerationParams.MaxTokens,
-		APITotalMs:    res.APIResp.TotalMs,
-		Error:         errMsg,
-	}
-	if werr := writer.Write(rec); werr != nil {
-		fmt.Fprintf(os.Stderr, "warning: write result: %v\n", werr)
-	}
-	acc.add(rec, ok)
 }
 
 func buildPattern(cfg *Config) Pattern {
-	rng := rand.New(rand.NewPCG(uint64(cfg.Seed*17+3), uint64(cfg.Seed)))
+	rng := mathrand.New(mathrand.NewPCG(mixSeed(uint64(cfg.Seed), 1), mixSeed(uint64(cfg.Seed), 2)))
 	if len(cfg.Steps) > 0 {
 		return StepPattern{Segments: cfg.Steps}
 	}
@@ -635,6 +908,7 @@ func buildPattern(cfg *Config) Pattern {
 	}
 	return NewConstantPattern(cfg.Rate)
 }
+
 func (a *accumulator) snapshot(cfg *Config) *Summary {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -648,7 +922,6 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		TokensOutTotal: a.tokensOut,
 		TokensInTotal:  a.tokensIn,
 		Datasets:       a.datasets,
-		RequestedRate:  cfg.Rate,
 	}
 	if cfg.Duration > 0 {
 		s.AchievedSendRate = float64(a.requests) / cfg.Duration.Seconds()
@@ -671,13 +944,16 @@ func (a *accumulator) snapshot(cfg *Config) *Summary {
 		s.LatencyMsMin = a.latency.Min()
 		s.LatencyMsMax = a.latency.Max()
 	}
-	s.Mode = modeLabel(cfg)
 	if cfg.Stream {
 		s.Mode += "+stream"
-		s.TTFTMsP50 = a.ttft.Percentile(50)
-		s.TTFTMsP95 = a.ttft.Percentile(95)
-		s.TTFTMsMean = a.ttft.Mean()
+		if a.ttft.Count() > 0 {
+			s.TTFTMsP50 = a.ttft.Percentile(50)
+			s.TTFTMsP95 = a.ttft.Percentile(95)
+			s.TTFTMsP99 = a.ttft.Percentile(99)
+			s.TTFTMsMean = a.ttft.Mean()
+		}
 	}
+	s.TokensOutEstimatedResponses = a.estimated
 	return s
 }
 
@@ -689,7 +965,9 @@ func modeLabel(cfg *Config) string {
 }
 
 // RunSignalContext wraps ctx with SIGINT/SIGTERM cancellation for graceful
-// shutdown of a run started from the CLI.
+// shutdown of a run started from the CLI. SIGKILL cannot be caught by any
+// process; the signal list covers what a driver (and Kubernetes eviction,
+// which sends SIGTERM) can deliver.
 func RunSignalContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(ctx, os.Interrupt, os.Kill)
+	return signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 }

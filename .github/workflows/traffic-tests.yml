@@ -35,6 +35,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
       - name: Vet
         run: go vet ./cmd/traffic/... ./internal/traffic/...
       - name: Unit tests

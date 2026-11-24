@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ObjectStore is the remote cache the datasets initContainer exchanges pack
@@ -92,7 +93,7 @@ func Prepare(ctx context.Context, o CacheOptions, f *Fetcher) error {
 	if o.Bucket == "" {
 		// No remote cache configured (local kind runs): fetch from the
 		// source service directly, the pre-S3 behavior.
-		return fetchAll(f, o.ManifestPath, o.CacheDir)
+		return fetchAll(ctx, f, o.ManifestPath, o.CacheDir)
 	}
 	if err := o.validate(); err != nil {
 		return err
@@ -121,7 +122,7 @@ func Seed(ctx context.Context, o CacheOptions, f *Fetcher) error {
 	if err := o.validate(); err != nil {
 		return err
 	}
-	if err := fetchAll(f, o.ManifestPath, o.CacheDir); err != nil {
+	if err := fetchAll(ctx, f, o.ManifestPath, o.CacheDir); err != nil {
 		return err
 	}
 	return uploadPack(ctx, o)
@@ -145,6 +146,16 @@ func Restore(ctx context.Context, o CacheOptions) (bool, error) {
 		return false, fmt.Errorf("check %s: %w", packKey, err)
 	}
 	if !present {
+		return false, nil
+	}
+	// A seeder that dies between its two PUTs leaves a pack without a
+	// sidecar; treating that as a hit would make the run a permanent
+	// checksum failure. A missing sidecar is a cache miss.
+	sidecarPresent, err := o.Store.Exists(ctx, checkKey)
+	if err != nil {
+		return false, fmt.Errorf("check %s: %w", checkKey, err)
+	}
+	if !sidecarPresent {
 		return false, nil
 	}
 
@@ -216,13 +227,13 @@ func uploadPack(ctx context.Context, o CacheOptions) error {
 
 // fetchAll fetches every dataset in the manifest into cacheDir — the same
 // traversal as the plain fetch command without --dataset.
-func fetchAll(f *Fetcher, manifestPath, cacheDir string) error {
+func fetchAll(ctx context.Context, f *Fetcher, manifestPath, cacheDir string) error {
 	manifest, err := LoadManifest(manifestPath)
 	if err != nil {
 		return err
 	}
 	for name, d := range manifest.Datasets {
-		path, err := f.Fetch(d, cacheDir)
+		path, err := f.Fetch(ctx, d, cacheDir)
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -271,6 +282,19 @@ func Pack(cacheDir, dstPath string) (string, error) {
 		if err != nil {
 			return err
 		}
+		// Normalize every header field that is not content: tar headers
+		// otherwise embed the file's mtime (and uid/gid), so two seeders
+		// of the same data would produce different pack bytes and could
+		// interleave their pack/sidecar PUTs into a permanent checksum
+		// mismatch. With identical bytes, last writer wins harmlessly.
+		hdr.ModTime = time.Time{}
+		hdr.AccessTime = time.Time{}
+		hdr.ChangeTime = time.Time{}
+		hdr.Uid = 0
+		hdr.Gid = 0
+		hdr.Uname = ""
+		hdr.Gname = ""
+		hdr.Mode = 0o644
 		// Use forward slashes and no absolute paths in the archive; the
 		// extraction is rooted at the cache dir.
 		hdr.Name = filepath.ToSlash(rel)
@@ -344,6 +368,17 @@ func Unpack(packPath, cacheDir string) error {
 		dst := filepath.Join(cacheDir, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
+		}
+		// O_CREATE|O_TRUNC follows a pre-existing symlink at dst, so a
+		// planted link could redirect the extraction. Lstat (not Stat)
+		// sees the link itself; refuse anything that is not a regular
+		// file (or absent).
+		if info, err := os.Lstat(dst); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return fmt.Errorf("refusing to write through non-regular path %s (%s)", dst, info.Mode())
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("lstat %s: %w", dst, err)
 		}
 		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
 		if err != nil {
