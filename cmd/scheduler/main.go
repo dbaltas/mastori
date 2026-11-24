@@ -42,6 +42,7 @@ func main() {
 		ConsumerID:         cfg.consumerID,
 		WorkerStreamPrefix: cfg.workerStreamPrefix,
 		JobTTL:             cfg.jobTTL,
+		WorkerQueueLimit:   cfg.workerQueueLimit,
 	})
 
 	mux := http.NewServeMux()
@@ -91,6 +92,18 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http shutdown failed", "error", err)
+	}
+
+	// Do not exit mid-transaction: wait for the dispatch loop to return
+	// (context.Canceled is the signal path, anything else is a failure).
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("scheduler failed", "error", err)
+			os.Exit(1)
+		}
+	case <-time.After(5 * time.Second):
+		logger.Warn("scheduler run did not stop in time")
 	}
 	logger.Info("scheduler stopped")
 }

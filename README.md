@@ -77,9 +77,10 @@ API --XADD--> jobs --scheduler--> jobs:worker:<id> --> worker --XADD--> jobs:chu
 
 - **Registry.** Workers heartbeat a hash `workers:<id>` with a 3-heartbeat TTL (`WORKER_HEARTBEAT_MS`, default 1s). A worker that stops heartbeating drops out of scheduling when the key expires. A gracefully stopped worker deregisters immediately. `WORKER_MODELS` (comma-separated) restricts which models a worker serves; empty serves any.
 - **Policies.** `SCHEDULER_POLICY` selects `round-robin` (default) or `least-loaded`. Load is the length of the worker's stream: queued plus running jobs.
+- **Admission cap.** `SCHEDULER_WORKER_QUEUE_LIMIT` (default 100, 0 disables) caps each worker's unfinished jobs: the scheduler only dispatches to a worker whose stream holds fewer than that many entries, and leaves the job in `jobs` while every eligible worker is at the cap. Bursts therefore queue in the platform queue instead of vLLM's waiting queue — which is what makes `queue_wait_seconds` and the policy comparison meaningful. `dispatch_errors_total{reason="workers_full"}` counts the rejected attempts.
 - **No workers.** Jobs stay in `jobs` until a worker is available. Jobs older than `SCHEDULER_JOB_TTL` seconds (default 60, 0 disables) are dropped, since the API has already timed out.
 - **Metrics** (`:8081/metrics`): `mastori_scheduler_dispatched_total{worker}`, `dispatch_errors_total{reason}`, `jobs_dropped_total{reason}`, `scheduling_seconds`, `queue_wait_seconds`, `queue_depth`, `workers_healthy`, `worker_queue_depth{worker}`.
-- **Not yet handled.** Jobs already dispatched to a worker that crashes are not reclaimed or re-dispatched, and a dead worker's stream is not cleaned up. Multiple scheduler replicas are safe (shared consumer group), but each worker-list read is cached for 250ms, so policies see slightly stale membership.
+- **Not yet handled.** A worker restart replays its stream from `0`, so pre-restart jobs run again, and a scheduler crash between read and dispatch leaves the entry stuck in its consumer's PEL until the process returns with the same consumer ID. Dispatch is best-effort for abandoned (client-gone) jobs that have not started yet.
 
 ### Tests
 

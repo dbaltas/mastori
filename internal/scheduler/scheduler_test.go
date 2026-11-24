@@ -364,6 +364,78 @@ func TestResumesPendingEntriesNotLost(t *testing.T) {
 	}
 }
 
+func TestWorkerQueueLimitHoldsJobsBack(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	// w1 is already at the cap of 2 unfinished jobs.
+	for _, id := range []string{"pre1", "pre2"} {
+		h.client.XAdd(context.Background(), &redis.XAddArgs{
+			Stream: "jobs:worker:w1",
+			Values: queue.JobValues(queue.Job{ID: id, Model: "m", Prompt: "p"}),
+		})
+	}
+	h.enqueue("j1", "m")
+	h.enqueue("j2", "m")
+
+	h.start(&RoundRobin{}, Config{WorkerQueueLimit: 2})
+
+	// The scheduler keeps trying and rejecting: the jobs stay queued in the
+	// jobs stream instead of being pushed to the worker.
+	eventually(t, "workers_full error recorded", func() bool {
+		return testutil.ToFloat64(h.m.DispatchErrors.WithLabelValues("workers_full")) > 0
+	})
+	if got := h.streamLen("jobs:worker:w1"); got != 2 {
+		t.Errorf("full worker stream length = %d, want 2 (untouched)", got)
+	}
+	if got := h.streamLen("jobs"); got != 2 {
+		t.Errorf("jobs stream length = %d, want 2 (backpressure)", got)
+	}
+
+	// A worker finishing a job (entry deleted) frees an admission slot.
+	first := h.client.XRange(context.Background(), "jobs:worker:w1", "-", "+").Val()[0].ID
+	h.client.XDel(context.Background(), "jobs:worker:w1", first)
+	eventually(t, "j1 dispatched into the freed slot", func() bool {
+		return h.streamLen("jobs:worker:w1") == 2 && h.streamLen("jobs") == 1
+	})
+	if got := h.jobsOn("w1"); got[len(got)-1] != "j1" {
+		t.Errorf("w1 jobs = %v, want j1 last", got)
+	}
+
+	// The freed slot is taken: w1 is at the cap again, j2 waits.
+	second := h.client.XRange(context.Background(), "jobs:worker:w1", "-", "+").Val()[0].ID
+	h.client.XDel(context.Background(), "jobs:worker:w1", second)
+	eventually(t, "j2 dispatched after the next slot frees", func() bool {
+		return h.streamLen("jobs:worker:w1") == 2 && h.streamLen("jobs") == 0
+	})
+}
+
+func TestWorkerQueueLimitSpreadsAcrossWorkers(t *testing.T) {
+	h := newHarness(t)
+	h.worker("w1")
+	h.worker("w2")
+	// w1 is at the cap of 1, so both jobs must go to w2 — and the second one
+	// must stop there too instead of pushing w2 past the cap.
+	h.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "jobs:worker:w1",
+		Values: queue.JobValues(queue.Job{ID: "pre1", Model: "m", Prompt: "p"}),
+	})
+	h.enqueue("j1", "m")
+	h.enqueue("j2", "m")
+
+	h.start(&RoundRobin{}, Config{WorkerQueueLimit: 1})
+
+	eventually(t, "j1 on w2", func() bool { return h.streamLen("jobs:worker:w2") == 1 })
+	if got := h.jobsOn("w2"); got[0] != "j1" {
+		t.Errorf("w2 jobs = %v, want [j1]", got)
+	}
+	if h.streamLen("jobs:worker:w1") != 1 {
+		t.Error("job routed to a worker at the queue limit")
+	}
+	if got := h.streamLen("jobs"); got != 1 {
+		t.Errorf("jobs stream length = %d, want 1 (j2 held back)", got)
+	}
+}
+
 func TestReclaimsStrandedJobsFromDeadWorker(t *testing.T) {
 	h := newHarness(t)
 	h.worker("w1")

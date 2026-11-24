@@ -22,7 +22,10 @@ import (
 	"github.com/dbaltas/mastori/internal/registry"
 )
 
-var errNoWorker = errors.New("scheduler: no eligible worker")
+var (
+	errNoWorker    = errors.New("scheduler: no eligible worker")
+	errWorkersFull = errors.New("scheduler: every eligible worker is at the queue limit")
+)
 
 // Config holds the scheduler's tunables. Zero values select the defaults
 // applied by New.
@@ -40,6 +43,12 @@ type Config struct {
 	ReclaimInterval    time.Duration // dead-worker reclaim pass interval
 	InterruptKey       string        // Redis key set when a reclaim invalidates a run
 	InterruptTTL       time.Duration // TTL of the interruption flag
+	// WorkerQueueLimit is the admission cap: a worker is only dispatched to
+	// while its stream holds fewer than this many unfinished jobs (queued
+	// plus running). When every worker is at the cap the job waits in the
+	// jobs stream, so the platform queue — not the engine — holds the
+	// backlog. 0 or negative disables the cap.
+	WorkerQueueLimit int64
 }
 
 func (c Config) withDefaults() Config {
@@ -139,7 +148,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			if errors.Is(err, redis.Nil) || ctx.Err() != nil {
 				continue
 			}
-			if strings.Contains(err.Error(), "NOGROUP") {
+			if redis.HasErrorPrefix(err, "NOGROUP") {
 				s.logger.Warn("consumer group missing, recreating", "stream", s.cfg.Stream, "group", s.cfg.Group)
 				s.dispatchError("nogroup")
 				if gerr := s.ensureGroup(ctx); gerr != nil {
@@ -154,8 +163,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 		for _, st := range res {
 			for _, msg := range st.Messages {
+				// handle only returns an error when ctx is canceled; every
+				// dispatch failure is retried in place.
 				if err := s.handle(ctx, msg); err != nil {
-					return nil // only returned when ctx is canceled
+					return err
 				}
 			}
 		}
@@ -165,7 +176,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 func (s *Scheduler) ensureGroup(ctx context.Context) error {
 	err := s.client.XGroupCreateMkStream(ctx, s.cfg.Stream, s.cfg.Group, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+	if err != nil && !redis.HasErrorPrefix(err, "BUSYGROUP") {
 		return fmt.Errorf("scheduler: create consumer group: %w", err)
 	}
 	return nil
@@ -202,9 +213,12 @@ func (s *Scheduler) handle(ctx context.Context, msg redis.XMessage) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if errors.Is(err, errNoWorker) {
+		switch {
+		case errors.Is(err, errNoWorker):
 			s.dispatchError("no_worker")
-		} else {
+		case errors.Is(err, errWorkersFull):
+			s.dispatchError("workers_full")
+		default:
 			s.logger.Error("dispatch failed", "job_id", job.ID, "error", err)
 			s.dispatchError("redis")
 		}
@@ -246,6 +260,8 @@ func (s *Scheduler) place(ctx context.Context, src, group, entryID string, job q
 }
 
 // pickWorker asks the policy to select a live worker able to serve the job.
+// When WorkerQueueLimit is set, workers at the cap are not eligible and the
+// job is left in the jobs stream instead (errWorkersFull).
 func (s *Scheduler) pickWorker(ctx context.Context, job queue.Job) (string, error) {
 	workers, err := s.liveWorkers(ctx)
 	if err != nil {
@@ -262,9 +278,21 @@ func (s *Scheduler) pickWorker(ctx context.Context, job queue.Job) (string, erro
 		return "", errNoWorker
 	}
 
-	if s.policy.NeedsLoad() {
+	if s.cfg.WorkerQueueLimit > 0 || s.policy.NeedsLoad() {
 		if err := s.fillLoads(ctx, candidates); err != nil {
 			return "", err
+		}
+	}
+	if s.cfg.WorkerQueueLimit > 0 {
+		eligible := candidates[:0]
+		for _, c := range candidates {
+			if c.Load < s.cfg.WorkerQueueLimit {
+				eligible = append(eligible, c)
+			}
+		}
+		candidates = eligible
+		if len(candidates) == 0 {
+			return "", errWorkersFull
 		}
 	}
 
@@ -458,7 +486,7 @@ func (s *Scheduler) reclaimStream(ctx context.Context, key, workerID string) err
 		case err == nil:
 			moved++
 			delete(s.reclaimWarned, workerID)
-		case errors.Is(err, errNoWorker):
+		case errors.Is(err, errNoWorker), errors.Is(err, errWorkersFull):
 			stranded++
 			if !s.reclaimWarned[workerID] {
 				s.reclaimWarned[workerID] = true

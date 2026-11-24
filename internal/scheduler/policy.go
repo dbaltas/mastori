@@ -83,15 +83,15 @@ func (p *LeastLoaded) Select(_ queue.Job, candidates []Candidate) int {
 	if len(candidates) == 0 {
 		return -1
 	}
-	min := candidates[0].Load
+	lowest := candidates[0].Load
 	for _, c := range candidates[1:] {
-		if c.Load < min {
-			min = c.Load
+		if c.Load < lowest {
+			lowest = c.Load
 		}
 	}
 	var ties []int
 	for i, c := range candidates {
-		if c.Load == min {
+		if c.Load == lowest {
 			ties = append(ties, i)
 		}
 	}

@@ -21,6 +21,7 @@ type config struct {
 	registryPrefix     string
 	policy             string
 	jobTTL             time.Duration
+	workerQueueLimit   int64
 	logLevel           string
 }
 
@@ -35,6 +36,7 @@ func loadConfig() (*config, error) {
 		registryPrefix:     getenvOr("REDIS_WORKER_REGISTRY_PREFIX", registry.DefaultPrefix),
 		policy:             getenvOr("SCHEDULER_POLICY", "round-robin"),
 		jobTTL:             60 * time.Second,
+		workerQueueLimit:   100,
 		logLevel:           getenvOr("LOG_LEVEL", "info"),
 	}
 
@@ -46,6 +48,17 @@ func loadConfig() (*config, error) {
 			return nil, fmt.Errorf("invalid SCHEDULER_JOB_TTL %q: must be a non-negative integer (seconds, 0 disables)", v)
 		}
 		cfg.jobTTL = time.Duration(secs) * time.Second
+	}
+
+	// Admission cap: a worker only receives a job while its stream holds
+	// fewer unfinished jobs than this, so bursts queue in Redis instead of
+	// in the engine. 0 disables the cap.
+	if v := os.Getenv("SCHEDULER_WORKER_QUEUE_LIMIT"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid SCHEDULER_WORKER_QUEUE_LIMIT %q: must be a non-negative integer (0 disables)", v)
+		}
+		cfg.workerQueueLimit = n
 	}
 	return cfg, nil
 }
