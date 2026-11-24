@@ -27,7 +27,7 @@ jobs:
   kustomize:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Render every overlay
         run: make kustomize-verify
 
@@ -42,7 +42,7 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # 1.14.8 matches the local toolchain (was 1.9.8 — review T-L1).
       - uses: hashicorp/setup-terraform@v3
         with:
