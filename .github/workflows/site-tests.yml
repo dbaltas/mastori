@@ -6,6 +6,11 @@ on:
       - "cmd/sitegen/**"
       - "internal/sitegen/**"
       - ".github/workflows/site-tests.yml"
+  pull_request:
+    paths:
+      - "cmd/sitegen/**"
+      - "internal/sitegen/**"
+      - ".github/workflows/site-tests.yml"
 
 permissions:
   contents: read

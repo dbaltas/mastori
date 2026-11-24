@@ -48,7 +48,7 @@ spec:
       labels:
         app: fakegpu
     spec:
-      serviceAccountName: fakegpu
+      serviceAccountName: fakegpu # patches node status via the API
       nodeSelector:
         mastori/pool: gpu
       tolerations:
@@ -56,6 +56,10 @@ spec:
           operator: Equal
           value: "true"
           effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: fakegpu
           image: mastori/api:latest
@@ -68,6 +72,11 @@ spec:
                   fieldPath: spec.nodeName
             - name: FAKE_GPU_COUNT
               value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           resources:
             requests:
               cpu: 10m
@@ -75,3 +84,9 @@ spec:
             limits:
               cpu: 100m
               memory: 32Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

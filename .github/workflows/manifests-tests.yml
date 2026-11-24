@@ -1,5 +1,5 @@
 # Fast manifests/infra CI: renders every kustomize overlay (fails on
-# malformed manifests) and validates the Terraform module. Part of the
+# malformed manifests) and validates both Terraform roots. Part of the
 # Milestone 0 "Fast CI" tier (todos.md); no cluster or cloud spend needed.
 name: Manifests and Terraform
 
@@ -7,15 +7,17 @@ on:
   push:
     paths:
       - "deploy/kubernetes/**"
-      - "infra/aws/**"
+      - "infra/**"
       - "Makefile"
+      - "Dockerfile"
       - ".github/workflows/manifests-tests.yml"
     branches: [main]
   pull_request:
     paths:
       - "deploy/kubernetes/**"
-      - "infra/aws/**"
+      - "infra/**"
       - "Makefile"
+      - "Dockerfile"
       - ".github/workflows/manifests-tests.yml"
 
 permissions:
@@ -31,17 +33,23 @@ jobs:
 
   terraform:
     runs-on: ubuntu-latest
+    # Both Terraform roots (infra/aws was covered before; infra/aws-ecr —
+    # the long-lived registry state — was not, review low).
+    strategy:
+      matrix:
+        dir: [infra/aws, infra/aws-ecr]
     defaults:
       run:
-        working-directory: infra/aws
+        working-directory: ${{ matrix.dir }}
     steps:
       - uses: actions/checkout@v4
+      # 1.14.8 matches the local toolchain (was 1.9.8 — review T-L1).
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.8
+          terraform_version: 1.14.8
       - name: Init (no backend)
         run: terraform init -backend=false
       - name: Format
-        run: terraform fmt -check
+        run: terraform fmt -check -recursive
       - name: Validate
         run: terraform validate

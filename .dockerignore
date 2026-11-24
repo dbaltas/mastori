@@ -1,0 +1,21 @@
+# Review C-M3: the build context went to the builder and cache wholesale,
+# including git history, worktrees, the benchmark submodule and local
+# Terraform state/plans (which hold the cluster CA, ARNs and admin /32).
+# The image needs only the Go module.
+.git
+.github
+.kilo
+benchmark
+deploy
+docs
+infra
+site
+**/terraform.tfstate*
+**/tfplan*
+**/*.tfvars
+*.md
+!go.mod
+!go.sum
+Dockerfile
+.dockerignore
+Makefile

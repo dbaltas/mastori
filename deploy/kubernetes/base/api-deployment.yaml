@@ -17,6 +17,11 @@ spec:
     spec:
       nodeSelector:
         mastori/pool: cpu
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       # Drain window in cmd/api = REQUEST_TIMEOUT (60s) + 5s buffer; the kube
       # grace must cover it or SIGKILL arrives mid-drain.
       terminationGracePeriodSeconds: 75
@@ -41,11 +46,18 @@ spec:
             requests:
               cpu: 100m
               memory: 256Mi
+            # No CPU limit (review K-M2): with MAX_INFLIGHT=5000 the api is in
+            # the measured path — CFS throttling shows up as tail latency.
+            # Memory keeps a hard limit for OOM protection.
             limits:
-              cpu: "1"
               # 512Mi held ~3k concurrent SSE streams/pod but MAX_INFLIGHT=5000
               # (deep-queue regime, 2026-11-22) needs headroom: ~5k streams/pod.
               memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -58,3 +70,9 @@ spec:
               port: http
             initialDelaySeconds: 2
             periodSeconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

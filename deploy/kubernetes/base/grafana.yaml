@@ -65,14 +65,26 @@ spec:
     spec:
       nodeSelector:
         mastori/pool: cpu
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472 # the grafana user in the image
+        runAsGroup: 472
+        fsGroup: 472
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: grafana
           image: grafana/grafana:11.6.0
           env:
             - name: GF_AUTH_ANONYMOUS_ENABLED
               value: "true"
+            # Viewer, not Admin (review K-M5): anonymous visitors can look,
+            # not change dashboards/datasources. Combined with the kind
+            # port-mapping fix (listenAddress 127.0.0.1) nobody on the same
+            # network gets cluster control via Grafana.
             - name: GF_AUTH_ANONYMOUS_ORG_ROLE
-              value: Admin
+              value: Viewer
             - name: GF_AUTH_BASIC_ENABLED
               value: "false"
           ports:
@@ -85,12 +97,23 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           readinessProbe:
             httpGet:
               path: /api/health
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           volumeMounts:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
@@ -98,6 +121,12 @@ spec:
               mountPath: /etc/grafana/provisioning/dashboards
             - name: dashboards
               mountPath: /var/lib/grafana/dashboards
+            # Grafana needs writable scratch for its sqlite db (dash prefs,
+            # alert state) and temp files (review K-M4); data is ephemeral.
+            - name: grafana-data
+              mountPath: /var/lib/grafana
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: datasources
           configMap:
@@ -108,6 +137,10 @@ spec:
         - name: dashboards
           configMap:
             name: grafana-dashboards
+        - name: grafana-data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

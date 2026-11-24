@@ -1,29 +1,28 @@
 # Real vLLM server on the GPU pool (cloud-specific: ECR images from the
 # long-lived infra/aws-ecr registry). The weights image
-# (mastori/weights:qwen3-4b) is exported into an emptyDir by an initContainer
-# (crane streams the flattened layers out of the registry — the pull runs
-# over the VPC endpoints, NAT-free) and the vLLM container serves it from
-# disk, so a GPU node boot needs no Hugging Face download.
+# (mastori/weights:qwen3-4b-1cfa9a7) is busybox-based (bake job: crane append
+# --base busybox:1.37, 2026-11-24 review K-H2): the kubelet pulls it with the
+# node role's read-only ECR permission over the VPC endpoints — no
+# ecr-push-creds secret on the pod path, so a node replacement or a next-day
+# scale-up cannot fail on the 12h push token. The initContainer only copies
+# the files into the emptyDir; vLLM serves them from disk.
 #
 # vllmworker (components/inference) points INFERENCE_BASE_URL at the vllm
 # Service directly: vLLM serves the OpenAI-compatible API natively, so the
 # Ollama-translation adapter is not in the cloud path.
 #
-# The weights image layout: the baked Qwen3-4B files sit at the image ROOT
-# (crane append of the /work/weights tar; the bake job's own manifest
-# confirms). The initContainer exports the flattened image into the emptyDir
-# mounted at /models, and vLLM serves --model /models directly.
-#
 # Serving: --served-model-name qwen3-4b keeps job model names short and
 # stable across model-image changes; --max-model-len bounds KV-cache
 # allocation so the L4's 24GB leaves headroom for concurrency.
 #
-# Scheduler knobs are pinned explicitly rather than left at engine defaults:
-# the 2026-11-23 GPU session assumed --max-num-seqs 1024 while the engine ran
-# the default 256 (vllm:num_requests_running peaked at exactly 256), which is
-# what capped saturation and KV usage at ~29% (2026-11-24 review, H5). Any
-# sweep of these values must be a deliberate, recorded experiment: change the
-# pin here, re-capture the environment, and cite both in the story.
+# Scheduler knobs are pinned explicitly rather than left at engine defaults
+# (review K-M1): the 2026-11-23 GPU session assumed --max-num-seqs 1024 while
+# the engine ran the default 256 (vllm:num_requests_running peaked at exactly
+# 256), which is what capped saturation and KV usage at ~29% (2026-11-24
+# review, H5). Version defaults drift between vLLM releases, so dtype, seed,
+# batched tokens, memory fraction, prefix caching and chunked prefill are all
+# set here. Any sweep of these values must be a deliberate, recorded
+# experiment: change the pin, re-capture the environment, and cite both.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,9 +32,8 @@ metadata:
     app: vllm
 spec:
   replicas: 1
-  # Single-replica GPU pod on a 1-GPU node: RollingUpdate deadlocks (the new
-  # pod needs the GPU the old pod still holds — observed live 2026-11-24,
-  # review P3 #20). Recreate terminates before creating.
+  # Recreate (review K-H2): a single GPU pod with the default RollingUpdate
+  # (maxSurge=1) leaves the new pod Pending forever and deadlocks the rollout.
   strategy:
     type: Recreate
   selector:
@@ -57,59 +55,47 @@ spec:
           operator: Equal
           value: "true"
           effect: NoSchedule
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       initContainers:
         - name: weights
-          image: public.ecr.aws/docker/library/alpine:3.21
+          # The busybox-based weights image itself — pushed by bake-weights
+          # (mirror-jobs.yaml), tag pinned to the HF revision short sha.
+          # Pulled with node credentials (ECR read-only via the node role).
+          image: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/weights:qwen3-4b-1cfa9a7
           command:
             - sh
             - -c
             - |
               set -e
-              apk add --no-cache curl tar >/dev/null
-              # ECR auth: pods cannot reach IMDS (hop limit 1), so the token
-              # comes from the ecr-push-creds secret (12h validity; refresh
-              # with make aws-mirror-images). Pulls are read-only.
-              mkdir -p /tmp/dockercfg
-              printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" \
-                "$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 | tr -d '\n')" \
-                > /tmp/dockercfg/config.json
-              export DOCKER_CONFIG=/tmp/dockercfg
-              case $(uname -m) in
-                aarch64) CRANE_ARCH=arm64 ;;
-                x86_64)  CRANE_ARCH=x86_64 ;;
-                *) CRANE_ARCH=$(uname -m) ;;
-              esac
-              curl -fsSL -o /tmp/pkg.tgz \
-                "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$CRANE_ARCH.tar.gz"
-              tar xzf /tmp/pkg.tgz -C /tmp crane && chmod +x /tmp/crane
-              /tmp/crane export \
-                273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/weights:qwen3-4b \
-                - | tar xf - -C /models
+              cp -a /weights/. /models/
               test -f /models/model.safetensors.index.json
               du -sh /models
-          env:
-            - name: AWS_REGION
-              value: eu-north-1
-            - name: REGISTRY
-              value: 273354666694.dkr.ecr.eu-north-1.amazonaws.com
-            - name: ECR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: ecr-push-creds
-                  key: password
           resources:
             requests: { cpu: 250m, memory: 256Mi }
-            limits: { cpu: "2", memory: 1Gi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           volumeMounts:
             - name: models
               mountPath: /models
       containers:
         - name: vllm
           image: 273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/vllm:v0.34.0
-          # Always: the tag is re-pointed in ECR when the amd64 image is
-          # re-mirrored (mirror-jobs.yaml), but nodes keep the old arch cached
-          # under the same tag — IfNotPresent then crashes with
-          # "exec format error" and never re-resolves (seen 2026-11-22).
+          # Always: the tag was re-pointed in ECR when the amd64 image was
+          # re-mirrored (mirror-jobs.yaml) and nodes kept the old arch cached
+          # under the same tag — IfNotPresent then crashes with "exec format
+          # error" and never re-resolves (seen 2026-11-22). ECR tags are
+          # IMMUTABLE since 2026-11-24, so new pushes land under new tags;
+          # this stays until manifests pin digests.
           imagePullPolicy: Always
           args:
             - --model
@@ -118,10 +104,30 @@ spec:
             - qwen3-4b
             - --max-model-len
             - "8192"
+            # ---- pinned engine knobs (review K-M1); see the header comment.
             # Pinned at the engine default (256) so the running config is
-            # explicit and captured; see the comment above the Deployment.
+            # explicit and captured; sweep only as a recorded experiment.
             - --max-num-seqs
             - "256"
+            # 90% of the L4's 24GB for KV cache + activations (engine default
+            # is 0.9; pinned so a vLLM bump cannot change the budget silently).
+            - --gpu-memory-utilization
+            - "0.90"
+            # 8192 = max-model-len (chunked-prefill batch budget; engine
+            # default varies by version).
+            - --max-num-batched-tokens
+            - "8192"
+            # dtype: follow the checkpoint config (bf16 for Qwen3-4B), but
+            # pinned so "auto" resolution cannot drift between releases.
+            - --dtype
+            - auto
+            # Fixed seed to match TRAFFIC_SEED=42 and temperature=0 runs.
+            - --seed
+            - "42"
+            # Pinned ON (v1-engine defaults as of v0.34) — a release that
+            # flips either default would change the benchmark silently.
+            - --enable-prefix-caching
+            - --enable-chunked-prefill
           ports:
             - containerPort: 8000
               name: http
@@ -136,23 +142,45 @@ spec:
               path: /health
               port: http
             periodSeconds: 5
+          # Liveness (review low): a hung engine (stuck generation loop) must
+          # be restarted; /health stays responsive while serving.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          env:
+            # torch compile-cache writes go to $HOME (default /root is not
+            # writable for uid 1000); point HOME at the writable emptyDir.
+            - name: HOME
+              value: /tmp
           resources:
             # g6.xlarge allocatable: 3920m CPU, 14.4Gi memory, 1x L4 (24GB).
             # vLLM is GPU-bound; CPU RAM holds the weight load + process
-            # overhead, KV cache lives in VRAM (--gpu-memory-utilization).
+            # overhead, KV cache lives in VRAM (--gpu-memory-utilization
+            # 0.90). No CPU limit (review K-M2): CFS throttling shows up as
+            # tail latency in the system under test; requests keep the
+            # scheduler honest.
             requests:
               cpu: "2"
               memory: 6Gi
               nvidia.com/gpu: 1
             limits:
-              cpu: "3"
               memory: 10Gi
               nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           volumeMounts:
             - name: models
               mountPath: /models
             - name: shm
               mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: models
           emptyDir:
@@ -160,6 +188,9 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
             sizeLimit: 2Gi
 ---
 apiVersion: v1

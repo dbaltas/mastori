@@ -3,13 +3,17 @@ CLUSTER_NAME := mastori
 AWS_DIR := infra/aws
 AWS_ECR_DIR := infra/aws-ecr
 
-.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-metrics-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-datasets-cache-config aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-status traffic-configmaps traffic-wait
+# Region for the AWS targets (aws-mirror-images, aws-kubeconfig,
+# aws-gpu-scale) — hardcoded eu-north-1 before (review low).
+AWS_REGION ?= eu-north-1
+
+.PHONY: build test test-integration redis-flush vet fmt site run docker-build docker-ghcr-build docker-ghcr-push cluster-up cluster-down cluster-status cluster-env-capture cluster-metrics-capture cluster-deploy cluster-redeploy-api cluster-deploy-inference cluster-run-traffic cluster-traffic-results kustomize-verify aws-init aws-plan aws-apply aws-destroy aws-ecr-init aws-ecr-plan aws-ecr-apply aws-ecr-destroy aws-mirror-images aws-kubeconfig aws-datasets-cache-config aws-run-traffic aws-deploy aws-nvidia aws-deploy-inference aws-gpu-scale aws-gpu-type-check aws-status traffic-configmaps traffic-wait
 
 build:
 	go build ./...
 
 test:
-	go test ./...
+	go test -race ./...
 
 # Starts a throwaway Redis (7099) and LocalStack S3 (7098) on loopback, runs
 # the integration tests against them, then removes both. LocalStack backs the
@@ -36,8 +40,10 @@ vet:
 site:
 	go run ./cmd/sitegen -benchmark benchmark -out site
 
+# Parity with CI: fails when any file is unformatted (make fmt only listed
+# them before, and never failed — review low). Run `gofmt -w .` to fix.
 fmt:
-	gofmt -l .
+	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "unformatted files:"; echo "$$out"; exit 1; fi
 
 run: build
 	go run ./cmd/api
@@ -101,7 +107,12 @@ aws-plan:
 aws-apply:
 	cd $(AWS_DIR) && terraform apply
 
+# Guarded destroy (review low): an accidental `make aws-destroy` must not
+# tear down a cluster mid-experiment. Export results first, then confirm.
 aws-destroy:
+	@test "$(CONFIRM_DESTROY)" = "1" || { \
+	  echo "ERROR: set CONFIRM_DESTROY=1 to run this (irreversible)." >&2; \
+	  echo "Export results first: cluster-traffic-results, cluster-metrics-capture, cluster-env-capture." >&2; exit 1; }
 	cd $(AWS_DIR) && terraform destroy
 
 # Long-lived ECR layer (infra/aws-ecr, separate state): survives
@@ -116,25 +127,28 @@ aws-ecr-apply:
 	cd $(AWS_ECR_DIR) && terraform apply
 
 aws-ecr-destroy:
+	@echo "NOTE: this always fails by design — prevent_destroy on the" >&2
+	@echo "repositories rejects every destroy plan. See infra/aws-ecr/README.md." >&2
 	cd $(AWS_ECR_DIR) && terraform destroy
 
 # Refresh the ECR push token (12h) and (re)run the in-cluster mirror jobs
 # (deploy/kubernetes/overlays/aws/mirror-jobs.yaml). Run after the long-lived
 # ECR layer is applied; jobs fetch vllm + weights into mastori/vllm and
 # mastori/weights once — later node pulls go over the VPC endpoints NAT-free.
+# The token is piped straight into the secret (no temp file left behind on a
+# kubectl failure — review low). IMMUTABLE ECR tags: re-running skips
+# already-present tags; corrected re-mirrors go to NEW tags.
 aws-mirror-images:
-	aws ecr get-login-password --region eu-north-1 > /tmp/kilo/ecr-token
 	kubectl -n mastori create secret generic ecr-push-creds \
 	  --from-literal=username=AWS \
-	  --from-file=password=/tmp/kilo/ecr-token \
+	  --from-literal=password="$$(aws ecr get-login-password --region $(AWS_REGION))" \
 	  --dry-run=client -o yaml | kubectl apply -f -
-	rm /tmp/kilo/ecr-token
 	kubectl -n mastori delete job mirror-vllm bake-weights --ignore-not-found
 	kubectl apply -f deploy/kubernetes/overlays/aws/mirror-jobs.yaml
 	kubectl -n mastori get pods -l app=mastori-mirror
 
 aws-kubeconfig:
-	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region eu-north-1
+	aws eks update-kubeconfig --name $(CLUSTER_NAME) --region $(AWS_REGION)
 
 # Prints the S3 dataset-cache values to paste into
 # deploy/kubernetes/overlays/aws/traffic/{service-account,s3}.yaml (the
@@ -166,31 +180,51 @@ aws-nvidia:
 	helm repo add nvdp https://nvidia.github.io/k8s-device-plugin 2>/dev/null || true
 	helm repo add nvidia-dcgm https://nvidia.github.io/dcgm-exporter/helm-charts 2>/dev/null || true
 	helm repo update >/dev/null
-	helm upgrade --install nvdp nvdp/nvidia-device-plugin -n nvidia \
+	# --version pins (review K-M1): chart defaults drift over time and that
+	# changes the hardware under test (GFD labels, dcgm metric set).
+	helm upgrade --install nvdp nvdp/nvidia-device-plugin --version 0.20.2 -n nvidia \
 	  --set gfd.enabled=true \
 	  --set-json 'tolerations=$(NVIDIA_TOLERATIONS)' \
 	  --set-json 'nodeSelector={"mastori/pool":"gpu"}' \
 	  --set-json 'nfd.worker.tolerations=[{"key":"mastori/gpu","operator":"Exists","effect":"NoSchedule"},{"operator":"Exists"}]'
-	helm upgrade --install dcgm-exporter nvidia-dcgm/dcgm-exporter -n nvidia \
+	helm upgrade --install dcgm-exporter nvidia-dcgm/dcgm-exporter --version 4.9.0 -n nvidia \
 	  --set-json 'tolerations=$(NVIDIA_TOLERATIONS)' \
 	  --set-json 'nodeSelector={"mastori/pool":"gpu"}' \
 	  --set serviceMonitor.enabled=false
 	kubectl -n nvidia get ds
 
-# Applies the GPU inference workloads (adapter + vllmworker, GHCR images) to
-# the current kubectl context. vllmworker stays Pending until the GPU node
-# group is scaled up (aws-gpu-scale) and the device plugin advertises GPUs.
+# Applies the GPU inference workloads (vllm + vllmworker, GHCR images) to
+# the current kubectl context. vllm stays Pending until the GPU node group
+# is scaled up (aws-gpu-scale) and the device plugin advertises GPUs.
 aws-deploy-inference:
 	kubectl apply -k deploy/kubernetes/overlays/aws-inference
-	kubectl -n mastori get pods -l app=inference-adapter -l app=vllmworker
+	# Single label selector: two `-l` flags in one command silently drop all
+	# but the last (review nit).
+	kubectl -n mastori get pods -l 'app in (inference-adapter,vllmworker,vllm)'
+
+# Verifies the GPU pool's instance type before a measured run (review T-M4):
+# with a mixed gpu_instance_types list, AWS can schedule a different chip
+# than the experiment declares (the 2026-11-23 run got an A10G from a
+# g6.xlarge,g5.xlarge mix). Usage: make aws-gpu-type-check INSTANCE_TYPE=g6.xlarge
+INSTANCE_TYPE ?= g6.xlarge
+aws-gpu-type-check:
+	@types=$$(kubectl get nodes -l mastori/pool=gpu -o jsonpath='{range .items[*]}{.metadata.labels.node\.kubernetes\.io/instance-type}{"\n"}{end}' | sort -u | paste -sd, -); \
+	if [ -z "$$types" ]; then echo "no GPU nodes present (scale up first: make aws-gpu-scale)" >&2; exit 1; fi; \
+	if [ "$$types" != "$(INSTANCE_TYPE)" ]; then \
+	  echo "ERROR: GPU instance types $$types != declared $(INSTANCE_TYPE)" >&2; \
+	  echo "Mixed/mismatched hardware invalidates the run: scale down, fix gpu_instance_types, re-scale." >&2; exit 1; fi; \
+	echo "GPU instance type OK: $$types"
 
 # Scale the GPU node group for a run (and back to 0 after). Scale to zero is
 # the cost guardrail (decision 8): `make aws-gpu-scale GPU_NODES=0` when done.
+# maxSize is clamped to 1 when GPU_NODES=0 — AWS rejects maxSize=0 (todos:
+# observed 2026-11-23); Terraform ignores desired/min so applies never undo
+# a manual scale mid-run.
 GPU_NODES ?= 1
 aws-gpu-scale:
-	aws eks update-nodegroup-config --cluster-name $(CLUSTER_NAME) --region eu-north-1 \
+	aws eks update-nodegroup-config --cluster-name $(CLUSTER_NAME) --region $(AWS_REGION) \
 	  --nodegroup-name $(CLUSTER_NAME)-gpu \
-	  --scaling-config minSize=$(GPU_NODES),maxSize=$(GPU_NODES),desiredSize=$(GPU_NODES)
+	  --scaling-config minSize=$(GPU_NODES),maxSize=$(if $(filter 0,$(GPU_NODES)),1,$(GPU_NODES)),desiredSize=$(GPU_NODES)
 
 # Rollout + pod state for the Milestone 1 acceptance check (all pods healthy
 # before the first traffic run).
@@ -429,11 +463,12 @@ cluster-metrics-capture:
 	@test -n "$(EXPERIMENT)" || { echo "ERROR: set EXPERIMENT=<name>, e.g. make cluster-metrics-capture EXPERIMENT=20261123-eks-gpu-vllm" >&2; exit 1; }
 	@mkdir -p benchmark/results/$(EXPERIMENT)/metrics
 	@kubectl -n mastori get deploy/prometheus >/dev/null 2>&1 || { echo "ERROR: prometheus deployment not found in namespace mastori" >&2; exit 1; }
-	@kubectl -n mastori port-forward deploy/prometheus 9091:9090 >/dev/null 2>&1 & \
+	# Host port 7091 per the 7000-7999 local-port convention (review nit).
+	@kubectl -n mastori port-forward deploy/prometheus 7091:9090 >/dev/null 2>&1 & \
 	pfpid=$$!; trap 'kill $$pfpid 2>/dev/null' EXIT; \
 	sleep 2; \
 	go run ./cmd/promcapture \
-	  -url http://localhost:9091 \
+	  -url http://localhost:7091 \
 	  -out benchmark/results/$(EXPERIMENT)/metrics \
 	  $(if $(START),-start $(START)) $(if $(END),-end $(END)) \
 	  -step $(if $(STEP),$(STEP),15s) \

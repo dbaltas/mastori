@@ -15,7 +15,12 @@ variable "repositories" {
 }
 
 variable "image_tag_mutability" {
-  description = "Tag mutability of the repository. IMMUTABLE forbids overwrites (digest pinning safe), MUTABLE allows latest-style tags."
+  description = "Tag mutability of the repositories. IMMUTABLE (review T-L8): a tag always resolves to the same image, so a tag reference in a manifest is an effective pin; republishing an arch-corrected image requires a NEW tag (e.g. v0.34.0-2), never a re-point. MUTABLE allows overwrites (the pre-2026-11-24 default)."
   type        = string
-  default     = "MUTABLE"
+  default     = "IMMUTABLE"
+
+  validation {
+    condition     = contains(["IMMUTABLE", "MUTABLE"], var.image_tag_mutability)
+    error_message = "Must be \"IMMUTABLE\" or \"MUTABLE\"."
+  }
 }

@@ -22,6 +22,9 @@ metadata:
   namespace: mastori
 spec:
   backoffLimit: 0
+  # Bounded run (review low): a stuck runner must end the Job loudly, not
+  # hold a node hostage. 4h covers the longest ladder plus cache seeding.
+  activeDeadlineSeconds: 14400
   ttlSecondsAfterFinished: 3600
   template:
     metadata:
@@ -31,6 +34,11 @@ spec:
       restartPolicy: Never
       nodeSelector:
         mastori/pool: cpu
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532 # nonroot's gid: the distroless containers need group write on /data
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: traffic
       initContainers:
         - name: datasets
@@ -49,12 +57,13 @@ spec:
               readOnly: true
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 100m
               memory: 64Mi
             limits:
-              cpu: "1"
               memory: 512Mi
         # Fail the Job before any traffic if the fetched cache does not match
         # the manifest's row count, required fields, and spot checks.
@@ -74,6 +83,14 @@ spec:
               readOnly: true
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
       containers:
         - name: traffic
           image: mastori/api:latest
@@ -88,18 +105,24 @@ spec:
             - name: manifest
               mountPath: /etc/mastori
               readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           resources:
             requests:
               cpu: 250m
               memory: 256Mi
             limits:
-              cpu: "2"
               # 512Mi OOMKilled at 20K-30K with MAX_INFLIGHT=5000 (api-config):
               # the open-loop sender holds ~5k concurrent SSE streams + record
               # buffers. 1Gi covers the deep-queue regime (2026-11-22).
               memory: 1Gi
       volumes:
         - name: data
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
         - name: manifest
           configMap:

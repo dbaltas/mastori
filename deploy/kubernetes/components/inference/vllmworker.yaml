@@ -29,6 +29,11 @@ spec:
           labelSelector:
             matchLabels:
               app: vllmworker
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: vllmworker
           image: mastori/api:latest
@@ -50,6 +55,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: inference-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           resources:
             requests:
               cpu: 100m
@@ -59,3 +69,9 @@ spec:
               cpu: "1"
               memory: 256Mi
               nvidia.com/gpu: 1
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

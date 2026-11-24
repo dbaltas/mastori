@@ -9,6 +9,14 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/datasets-tests.yml"
+  pull_request:
+    paths:
+      - "cmd/datasets/**"
+      - "internal/datasets/**"
+      - "benchmark/workloads/datasets.yaml"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/datasets-tests.yml"
 
 permissions:
   contents: read

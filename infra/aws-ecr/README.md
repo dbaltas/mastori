@@ -15,15 +15,20 @@ touches this state.
 
 - Repositories (variables `repositories`): `mastori` (API/worker images),
   `mastori/vllm` (vLLM server image, mirrored `vllm/vllm-openai:v0.34.0`),
-  `mastori/weights` (per-model-tag weights images; `qwen3-4b` today). All
-  scan-on-push, `force_delete = false`.
+  `mastori/weights` (per-model-tag weights images; `qwen3-4b-<rev-short>`
+  today). All scan-on-push, `force_delete = false`, **tags IMMUTABLE**
+  (since 2026-11-24): a tag always resolves to the same image, so a tag
+  reference in a manifest is an effective pin. Re-publishing a corrected
+  image therefore needs a NEW tag (e.g. `v0.34.0-2`), never a re-point.
+  (The mutability change is an in-place ECR update; no repo recreation.)
 - A lifecycle policy on each repo: expire untagged images after 7 days
   (rule 1), keep the last 30 images (rule 2 — `tagStatus: any` MUST be the
   lowest-priority rule per ECR validation).
-- **Weights image layout gotcha:** the weights image holds the model files
-  at the image ROOT (`crane append` of the weights tar), not under
-  `models/` — the vllm-server initContainer validates
-  `/models/model.safetensors.index.json` and vLLM serves `--model /models`.
+- **Weights image layout:** since 2026-11-24 the weights image is
+  `busybox`-based (`crane append --base busybox:1.37` of the weights tar at
+  `/weights`) so the kubelet can pull it with the node role's read-only ECR
+  permission and an initContainer just copies the files — vLLM pod starts
+  no longer depend on the 12h `ecr-push-creds` push token (review K-H2).
 
 ## IAM (operator identity, deliberately outside Terraform)
 
@@ -39,6 +44,16 @@ Two operational notes learned live:
 - ECR lifecycle policies validate strictly (`tagPattern` unsupported with
   count-based rules; `tagStatus: any` must sort last).
 
+## State
+
+Local state today (`terraform.tfstate`, 8.7 KB — the **only record** of these
+three long-lived repositories; losing it means re-importing repos and
+lifecycle policies by hand). Back it up and migrate to S3: the backend block
+is prepared (commented) in `versions.tf`; the migration steps are in
+`infra/aws/README.md` ("State"). `prevent_destroy` protects the *code path*,
+not the state file — the backend migration is what makes the state
+survivable.
+
 ## Apply / destroy
 
 ```
@@ -47,11 +62,11 @@ terraform init
 terraform apply        # or: make aws-ecr-apply
 ```
 
-Destroy (empty the repositories first, e.g. via the ECR console):
-
-```
-make aws-ecr-destroy
-```
+Destroy: `make aws-ecr-destroy` **always fails** by design —
+`prevent_destroy` rejects every destroy plan here. It is a seatbelt, not a
+teardown path: to actually remove the repositories, comment out
+`prevent_destroy`, run `terraform destroy`, then restore it. Do not do this
+between experiments; the whole point of this stack is to outlive them.
 
 ## Use
 
@@ -73,8 +88,9 @@ make aws-ecr-destroy
 - **Pods can't pull with node creds**: IMDS is unreachable from containers
   (hop limit 1), so any in-pod registry access (`crane`, `skopeo`) uses the
   `ecr-push-creds` k8s secret — a 12h `get-login-password` token refreshed by
-  `make aws-mirror-images`. Pulls inside pods (weights export for vllm) use
-  it too, read-only.
+  `make aws-mirror-images`. That only affects the mirror/bake Jobs: the vLLM
+  weights initContainer now pulls the busybox-based weights image with node
+  credentials (no secret, no 12h expiry — review K-H2).
 - **In-cluster mirroring**: heavy images (vllm, weights) are fetched once by
   Jobs on the CPU pool (`deploy/kubernetes/overlays/aws/mirror-jobs.yaml`,
   `make aws-mirror-images`), not from the workstation — uplink from local

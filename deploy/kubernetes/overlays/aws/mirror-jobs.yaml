@@ -6,8 +6,18 @@
 #    Pin --override-arch amd64: this Job runs on the ARM64 CPU node and
 #    skopeo otherwise copies the node's arch — the 2026-11-22 mirror pushed
 #    arm64 and the GPU pod crash-looped with "exec format error".
-#  - bake-weights: downloads Qwen/Qwen3-4B from Hugging Face, tars it, and
-#    pushes a scratch-based weights image with crane.
+#    Skips the copy when the tag already exists: ECR tags are IMMUTABLE
+#    (2026-11-24, review T-L8), so a corrected re-mirror goes to a NEW tag
+#    (e.g. v0.34.0-2), never a re-point.
+#  - bake-weights: downloads Qwen/Qwen3-4B at a PINNED HF revision
+#    (1cfa9a7208912126459214e8b04321603b3df60c, review K-M1 — resolve/main is
+#    a moving branch), verifies every file's sha256 (main files fetched and
+#    hashed locally; safetensors/tokenizer digests are the HF LFS sha256),
+#    and pushes a busybox-based weights image with crane (review K-H2: the
+#    kubelet pulls the busybox-based image with the node role's read-only
+#    ECR permission, so vLLM pod starts no longer need the 12h push token;
+#    the initContainer only copies files). crane is pinned to v0.22.1 with a
+#    sha256 check (review K-M1: releases/latest was a supply-chain risk).
 # Both need ECR push creds (secret ecr-push-creds, 12h token) and are
 # recreated with `make aws-mirror-images` when the token expires.
 apiVersion: batch/v1
@@ -26,6 +36,8 @@ spec:
         app: mastori-mirror
     spec:
       restartPolicy: Never
+      nodeSelector:
+        mastori/pool: cpu
       containers:
         - name: skopeo
           image: public.ecr.aws/docker/library/alpine:3.21
@@ -34,8 +46,16 @@ spec:
             - -c
             - |
               set -e
-              apk add --no-cache skopeo >/dev/null
+              # Pinned apk versions (alpine 3.21 repos, review low): the
+              # runtime install was not reproducible.
+              apk add --no-cache skopeo=1.16.1-r5 >/dev/null
               skopeo --version
+              if skopeo inspect \
+                  docker://273354666694.dkr.ecr.eu-north-1.amazonaws.com/mastori/vllm:v0.34.0 \
+                  --creds "AWS:$ECR_PASSWORD" >/dev/null 2>&1; then
+                echo "v0.34.0 already in ECR (immutable): nothing to do"
+                exit 0
+              fi
               skopeo copy \
                 --override-os linux \
                 --override-arch amd64 \
@@ -52,7 +72,7 @@ spec:
                   key: password
           resources:
             requests: { cpu: "1", memory: 1Gi }
-            limits: { cpu: "2", memory: 4Gi }
+            limits: { memory: 4Gi }
 ---
 apiVersion: batch/v1
 kind: Job
@@ -70,6 +90,8 @@ spec:
         app: mastori-mirror
     spec:
       restartPolicy: Never
+      nodeSelector:
+        mastori/pool: cpu
       containers:
         - name: bake
           image: public.ecr.aws/docker/library/alpine:3.21
@@ -79,36 +101,52 @@ spec:
             - -c
             - |
               set -e
-              apk add --no-cache curl tar >/dev/null
+              # Pinned apk version (alpine 3.21 main, review low).
+              apk add --no-cache curl=8.14.1-r3 >/dev/null
               mkdir -p /work/weights /work/bin /work/dockercfg
-              base=https://huggingface.co/Qwen/Qwen3-4B/resolve/main
-              for f in config.json generation_config.json merges.txt \
-                       model-00001-of-00003.safetensors \
-                       model-00002-of-00003.safetensors \
-                       model-00003-of-00003.safetensors \
-                       model.safetensors.index.json \
-                       tokenizer.json tokenizer_config.json vocab.json; do
-                echo "fetching $f"
-                curl -fsSL -o "/work/weights/$f" "$base/$f"
-              done
-              du -sh /work/weights
+              REV=1cfa9a7208912126459214e8b04321603b3df60c
+              base="https://huggingface.co/Qwen/Qwen3-4B/resolve/$REV"
+              cd /work/weights
+              # sha256 sidecar for the non-LFS files (fetched and hashed at
+              # this revision, 2026-11-24) plus the HF LFS digests for the
+              # big files. Any drift fails the bake loudly (review K-M1).
+              cat > /work/weights.sha256 <<'EOF'
+              8ba006f74fecfaaeb392872a60f4a480e7ec9860153d2e1b769ec81f9a147f8a  config.json
+              2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2  generation_config.json
+              8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5  merges.txt
+              328a91d3122359d5547f9d79521205bc0a46e1f79a792dfe650e99fc2d651223  model-00001-of-00003.safetensors
+              6cd087b316306a68c562436b5492edbcf6e16c6dba3a1308279caa5a58e21ca5  model-00002-of-00003.safetensors
+              e4bf436957184f4eeb86a80e9db394503f1f56446b2e6b7edeac5b81470f4ca1  model-00003-of-00003.safetensors
+              6dc0981b8829fead746441f68f38f24c5ca4a3a66351f652c26c6df0efc43ab2  model.safetensors.index.json
+              aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  tokenizer.json
+              d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101  tokenizer_config.json
+              ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910  vocab.json
+              EOF
+              sha256sum -c /work/weights.sha256 || exit 1
+              # crane: pinned release + sha256 (review K-M1).
               case $(uname -m) in
-                aarch64) CRANE_ARCH=arm64 ;;
-                x86_64)  CRANE_ARCH=x86_64 ;;
-                *) CRANE_ARCH=$(uname -m) ;;
+                aarch64) CRANE_ARCH=arm64; CRANE_SHA=898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110 ;;
+                x86_64)  CRANE_ARCH=x86_64; CRANE_SHA=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0 ;;
+                *) echo "unexpected arch $(uname -m)"; exit 1 ;;
               esac
               curl -fsSL -o /work/bin/pkg.tgz \
-                "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$CRANE_ARCH.tar.gz"
+                "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_$CRANE_ARCH.tar.gz"
+              echo "$CRANE_SHA  /work/bin/pkg.tgz" | sha256sum -c -
               tar xzf /work/bin/pkg.tgz -C /work/bin crane && chmod +x /work/bin/crane
               printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" \
                 "$(printf 'AWS:%s' "$ECR_PASSWORD" | base64 -w 0)" \
                 > /work/dockercfg/config.json
               export DOCKER_CONFIG=/work/dockercfg
-              tar cf - -C /work/weights . \
-                | /work/bin/crane append \
-                  -f - \
-                  -t "$REGISTRY/mastori/weights:qwen3-4b"
-              /work/bin/crane digest "$REGISTRY/mastori/weights:qwen3-4b" \
+              # busybox base (review K-H2): the image keeps a shell for the
+              # vLLM initContainer, and the kubelet can pull it with the node
+              # role's read-only ECR permission. Tag carries the HF revision
+              # short sha; IMMUTABLE tags mean a new revision = a new tag.
+              tar cf /work/weights.tar -C /work/weights .
+              /work/bin/crane append \
+                --base busybox:1.37 \
+                -f /work/weights.tar \
+                -t "$REGISTRY/mastori/weights:qwen3-4b-1cfa9a7"
+              /work/bin/crane digest "$REGISTRY/mastori/weights:qwen3-4b-1cfa9a7" \
                 && echo WEIGHTS-OK
           env:
             - name: ECR_PASSWORD
@@ -120,11 +158,13 @@ spec:
               value: 273354666694.dkr.ecr.eu-north-1.amazonaws.com
           resources:
             requests: { cpu: "1", memory: 6Gi }
-            limits: { cpu: "4", memory: 12Gi }
+            limits: { memory: 12Gi }
           volumeMounts:
             - name: work
               mountPath: /work
       volumes:
         - name: work
           emptyDir:
-            sizeLimit: 12Gi
+            # 8.1GB of model files + the 8.1GB tar layer (both live at once);
+            # the CPU pool's 50GB root disk (launch template) covers it.
+            sizeLimit: 20Gi

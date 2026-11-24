@@ -2,3 +2,10 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: mastori
+  labels:
+    # Pod Security Admission (review K-M4): baseline enforced (no privileged,
+    # no hostPath), restricted warned. Every workload here already satisfies
+    # it; the nvidia namespace (device plugin DaemonSet) is the privileged
+    # exception and labels itself privileged.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted

@@ -29,19 +29,30 @@ variable "vpc_cidr" {
 }
 
 variable "azs" {
-  description = "Availability zones. EKS requires subnets in 2 AZs; workloads run in one (azs[0] = eu-north-1b, where GPU capacity actually exists — 1a is regularly dry)."
+  description = "Availability zones. EKS requires subnets in 2 AZs; the CPU pool and the workload AZ is azs[0] = eu-north-1b (1a is regularly dry for GPU types). The GPU pool spans both (g6.xlarge capacity is per-AZ; see eks.tf)."
   type        = list(string)
   default     = ["eu-north-1b", "eu-north-1a"]
 }
 
-variable "pod_cidr" {
-  description = "Secondary CIDR for pod networking on the VPC."
-  type        = string
-  default     = "100.64.0.0/16"
-}
-
 variable "admin_cidrs" {
   description = "CIDRs allowed to reach the EKS API endpoint over the public endpoint. No public endpoint access at all when empty."
+  type        = list(string)
+  default     = []
+}
+
+variable "cluster_authentication_mode" {
+  description = "EKS access management mode. API_AND_CONFIG_MAP is the safe migration step for the live cluster (aws-auth keeps working while access entries are applied); set \"API\" for fresh clusters. See eks.tf and README."
+  type        = string
+  default     = "API_AND_CONFIG_MAP"
+
+  validation {
+    condition     = contains(["API", "API_AND_CONFIG_MAP"], var.cluster_authentication_mode)
+    error_message = "Must be \"API\" or \"API_AND_CONFIG_MAP\"."
+  }
+}
+
+variable "admin_principals" {
+  description = "IAM principal ARNs (user/role) granted AmazonEKSClusterAdminPolicy via EKS access entries. Must be non-empty before moving to API-only mode."
   type        = list(string)
   default     = []
 }

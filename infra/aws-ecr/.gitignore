@@ -4,6 +4,7 @@
 *.tfstate.*
 .terraform/
 crash.log
+*.log
 tfplan
 tfplan*
 tfplan.json

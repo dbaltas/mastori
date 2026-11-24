@@ -7,6 +7,11 @@ metadata:
     app: prometheus
 spec:
   replicas: 1
+  # Recreate (review low): TSDB on one node; a rolling pair would double the
+  # scrape state. Data is ephemeral — run `make cluster-metrics-capture`
+  # BEFORE teardown (24h retention is a safety net, not the export path).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: prometheus
@@ -15,15 +20,25 @@ spec:
       labels:
         app: prometheus
     spec:
-      serviceAccountName: prometheus
+      serviceAccountName: prometheus # kubernetes_sd needs the API token
       nodeSelector:
         mastori/pool: cpu
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534 # nobody: the image's default USER
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: prometheus
           image: prom/prometheus:v3.2.1
           args:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.retention.time=24h
+            # Size cap (review low): with no cap a long experiment can fill
+            # the node disk; 2Gi holds days of 5s scrapes for these series.
+            - --storage.tsdb.retention.size=2Gi
           ports:
             - containerPort: 9090
               name: http
@@ -34,19 +49,42 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           readinessProbe:
             httpGet:
               path: /-/ready
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
           volumeMounts:
             - name: config
               mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: prometheus-config
+        # TSDB on an emptyDir with a sizeLimit (review low): the container
+        # layer previously held it, so a pod restart lost the experiment's
+        # metrics before capture. Restart still loses data — capture first.
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: ServiceAccount

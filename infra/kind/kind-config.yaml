@@ -15,11 +15,16 @@ nodes:
     labels:
       mastori/pool: infra
     extraPortMappings:
+      # listenAddress 127.0.0.1 (review K-M5): the API and Grafana must not be
+      # reachable by anyone on the same Wi-Fi — a laptop-wide default bind of
+      # 0.0.0.0 is not part of the local benchmark loop.
       - containerPort: 30080
         hostPort: 7080
+        listenAddress: "127.0.0.1"
         protocol: TCP
       - containerPort: 30081
         hostPort: 7081
+        listenAddress: "127.0.0.1"
         protocol: TCP
   - role: worker
     labels:

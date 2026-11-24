@@ -30,6 +30,8 @@ Provider candidates (maturity to be re-checked at integration time, not assumed)
 7. **Results survive teardown in the git results repo.** Before `destroy`: export JSONL results, run manifest (provider, instance types, driver, image digests, node info), and a Prometheus snapshot; push to the results repo. A destroyed cluster must not erase an experiment.
 8. **Cost guardrails:** GPU node group scales to zero, AWS Budgets alert, explicit `make destroy` teardown target, and the provision → run → export → destroy loop is a documented, repeatable make target sequence.
 9. **Spot discipline:** CPU pool (API, Redis, scheduler, observability) runs **on-demand** — it is the benchmark control plane and holds in-memory state. Spot GPUs are allowed only with the rule that an interrupted run is discarded (status `invalid`).
+10. **No NetworkPolicy by design (2026-11-24).** Redis and the API are reachable from every pod in the cluster. The cluster is private (no LB/ingress, nodes in private subnets, endpoint restricted to admin /32), so the blast radius is pod compromise — acceptable for an ephemeral benchmark cluster; revisit when the stack becomes long-lived or shared.
+11. **PDB only on the api Deployment (2026-11-24).** The api has 2 replicas, so a voluntary disruption budget (`api-pdb.yaml`) keeps drain-capacity. Every other singleton (redis, scheduler, vllm, prometheus) deliberately has NO PDB: a PDB on a singleton blocks all node drains (nothing can ever be evicted) — with Recreate strategies the single replica is allowed to go down for its own rollouts.
 
 ## Claims to verify before relying on them
 

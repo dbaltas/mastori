@@ -7,11 +7,13 @@
 #  - INFERENCE_MODEL: fallback model sent to vLLM when the job says "default".
 #    Patched here too because the ConfigMap patch only updates the ConfigMap,
 #    while components/inference hardcodes the env in the Deployment.
-#
-# The GPU request from components/inference (fakegpu's mechanism) must NOT
-# apply here: the worker is a CPU bridge making HTTP calls and the L4 belongs
-# to the vllm server. Strategic merge cannot delete map keys, so the
-# nvidia.com/gpu removal is a JSON6902 patch.
+#  - Runs on the CPU pool (review K-M2): the worker is a CPU bridge making
+#    HTTP calls — co-locating it on the 4-vCPU GPU node stole vLLM's CPU and
+#    showed up as CFS-throttled tail latency. The GPU request from
+#    components/inference (fakegpu's mechanism) must NOT apply here; the
+#    nvidia.com/gpu removal is a JSON6902 patch in the overlay kustomization
+#    (strategic merge cannot delete map keys). nodeSelector is overridden
+#    map-style; tolerations (no merge key) is replaced with an empty list.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,6 +22,9 @@ metadata:
 spec:
   template:
     spec:
+      nodeSelector:
+        mastori/pool: cpu
+      tolerations: []
       containers:
         - name: vllmworker
           env:

@@ -19,6 +19,43 @@ resource "aws_s3_bucket" "datasets_cache" {
   }
 }
 
+# BucketOwnerEnforced: ACLs disabled — S3 object ownership stays with the
+# bucket owner for every write, including cross-account writes (review T-L4).
+resource "aws_s3_bucket_ownership_controls" "datasets_cache" {
+  bucket = aws_s3_bucket.datasets_cache.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+# TLS-only (review T-L4): deny any S3 API call that does not arrive over
+# HTTPS. Data goes to the S3 gateway endpoint over TLS, but the policy makes
+# plaintext access structurally impossible, not just unlikely.
+resource "aws_s3_bucket_policy" "datasets_cache" {
+  bucket = aws_s3_bucket.datasets_cache.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.datasets_cache.arn,
+          "${aws_s3_bucket.datasets_cache.arn}/*",
+        ]
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
+      }
+    ]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.datasets_cache]
+}
+
 resource "aws_s3_bucket_public_access_block" "datasets_cache" {
   bucket = aws_s3_bucket.datasets_cache.id
 
@@ -55,6 +92,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "datasets_cache" {
       days = 90
     }
   }
+
+  # Abort multipart uploads left open by a killed seeder (review T-L4):
+  # incomplete MPU parts keep billing storage until aborted explicitly.
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 3
+    }
+  }
 }
 
 # Trust policy: only the traffic ServiceAccount in the mastori namespace.
@@ -70,6 +120,13 @@ data "aws_iam_policy_document" "datasets_cache_assume" {
       variable = "${local.irsa_oidc_issuer}:sub"
       values   = ["system:serviceaccount:mastori:traffic"]
     }
+    condition {
+      # Restrict the audience to STS (review T-L2): without this the token
+      # is valid for any OIDC audience registered on the provider.
+      test     = "StringEquals"
+      variable = "${local.irsa_oidc_issuer}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
   }
 }
 
@@ -83,10 +140,16 @@ resource "aws_iam_role" "datasets_cache" {
 }
 
 # Read + write: prepare restores on a hit and seeds on a miss. Scoped to this
-# bucket only.
+# bucket only. s3:HeadObject is covered by s3:GetObject (HEAD is the same
+# object-read permission); s3:AbortMultipartUpload covers the seeder's
+# aborted uploads (review T-L3).
 data "aws_iam_policy_document" "datasets_cache" {
   statement {
-    actions   = ["s3:GetObject", "s3:HeadObject", "s3:PutObject"]
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:AbortMultipartUpload",
+    ]
     resources = ["${aws_s3_bucket.datasets_cache.arn}/*"]
   }
 

@@ -4,35 +4,40 @@
 # aws-nvidia) advertise the real nvidia.com/gpu extended resource, and
 # fakegpu would fight it.
 #
-# Deltas from base + components/inference:
-#  - images: the mastori/api image comes from GHCR (CI-published on every
-#    main push, see overlays/aws/kustomization.yaml; the image is small so
-#    NAT pulls are negligible). The vLLM server and model weights in
-#    vllm-server.yaml keep their absolute ECR references — they are GB-scale
-#    and must stay on the NAT-free VPC-endpoint path.
-#  - imagePullPolicy: Always for the inference deployments (pull-policy.yaml).
-#  - vllm server (vllm-server.yaml): the real vLLM backend (mastori/vllm
-#    image + Qwen3-4B weights exported from mastori/weights into an
-#    emptyDir), served OpenAI-compatible on vllm:8000.
-#  - vllmworker-patch.yaml: the bridge worker calls the vLLM Service
-#    directly (no Ollama adapter in the cloud path) and registers for the
-#    qwen3-4b model so the scheduler routes GPU jobs to it.
-#  - inference-config-patch.yaml: default inference model = qwen3-4b.
+# Builds FROM ../aws (review K-H1), not ../../base directly: ../aws already
+# carries the EKS-only patches (GHCR image rewrite for mastori/api,
+# imagePullPolicy Always for api/scheduler/mockworker), so those settings
+# can no longer be silently dropped by building around the overlay.
 #
-# Nothing here bills by itself: vllmworker/vllm request nvidia.com/gpu and
-# stay Pending until a GPU node is scaled up (make aws-gpu-scale) and the
-# device plugin DaemonSet is running. The Ollama adapter from
-# components/inference is scaled to 0 here: the cloud path is
-# vllmworker → vLLM (OpenAI-compatible) directly, so the adapter is
-# unused on EKS and was only ever a readiness-gate red herring on the
-# GPU pool (observed 2026-11-23).
+# Deltas on top of ../aws:
+#  - vllm server (vllm-server.yaml): the real vLLM backend (mastori/vllm
+#    image + Qwen3-4B weights from mastori/weights into an emptyDir), served
+#    OpenAI-compatible on vllm:8000. The vLLM + weights references keep
+#    absolute ECR URLs — they are GB-scale and must stay on the NAT-free
+#    VPC-endpoint path.
+#  - vllmworker-patch.yaml: the bridge worker calls the vLLM Service
+#    directly (no Ollama adapter in the cloud path), registers for the
+#    qwen3-4b model so the scheduler routes GPU jobs to it, and runs on the
+#    CPU pool (review K-M2: it only proxies HTTP — it must not compete with
+#    vLLM for the GPU node's 4 vCPU).
+#  - inference-config-patch.yaml: default inference model = qwen3-4b.
+#  - inference-adapter and mockworker scale to 0 (cloud path is
+#    vllmworker → vLLM directly; mock workers are excluded from GPU runs —
+#    the component also pins WORKER_MODELS=mock as defense in depth).
+#
+# Nothing here bills by itself: vllm requests nvidia.com/gpu and stays
+# Pending until a GPU node is scaled up (make aws-gpu-scale) and the device
+# plugin DaemonSet is running.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - ../../base
+  - ../aws
   - vllm-server.yaml
 components:
   - ../../components/inference
+# Same rewrite as ../aws — repeated here because a parent's images transform
+# does not reach resources added by components at this level (adapter,
+# vllmworker, fakegpu images would leak as mastori/api:latest).
 images:
   - name: mastori/api
     newName: ghcr.io/dbaltas/mastori

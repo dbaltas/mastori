@@ -8,9 +8,7 @@ components:
   # inference component against the real GPU node group and device plugin.
   - ../../components/fakegpu
   - ../../components/inference
-# Keep the host port mappings (7080/7081) that the local overlay provides;
-# applying this overlay must not revert them. kustomize cannot load files
-# outside this directory, so the patches are duplicated from overlays/local.
-patches:
-  - path: api-service-nodeport.yaml
-  - path: grafana-nodeport.yaml
+  # Keep the host port mappings (7080/7081) that the local overlay provides;
+  # applying this overlay must not revert them. Shared component instead of
+  # the previously duplicated patch files (review nit).
+  - ../../components/nodeport

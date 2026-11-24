@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # GitHub Actions are pinned by major tag, not SHA (review low); Dependabot
+  # keeps the pins current and is the first hardening step. SHA pinning of
+  # the docker-publish (packages: write) actions is the follow-up.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

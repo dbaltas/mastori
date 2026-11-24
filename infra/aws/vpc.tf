@@ -1,7 +1,11 @@
 # VPC: 2 AZs of private subnets (EKS requirement), everything private.
-# Workloads run in azs[0] (eu-north-1b — 1a is regularly dry for GPU types);
-# the second subnet exists only to satisfy EKS.
-# Single NAT Gateway + EIP for outbound (image pulls, AWS API calls).
+# The CPU pool runs in azs[0] = eu-north-1b (1a is regularly dry for GPU
+# types), where the single NAT + ECR endpoints live. The GPU pool spans BOTH
+# AZs — g6.xlarge capacity is per-AZ — so a GPU node in azs[1] = 1a pays
+# cross-AZ transfer on its ECR/weights pull and on measured-path traffic to
+# the CPU pool; GPU-to-CPU traffic is same-AZ while GPU nodes land in 1b.
+# Endpoint pairs in the second AZ were considered and dropped for cost
+# (2 interface endpoints ≈ $14/mo); see infra/aws/README.md.
 
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
@@ -31,7 +35,8 @@ resource "aws_subnet" "private" {
   # Nodes get no public IPs; outbound goes through NAT.
   map_public_ip_on_launch = false
 
-  # EKS-managed LBs / ENIs only in azs[0] — workloads stay in one AZ.
+  # Internal ELBs may be placed in either AZ (both subnets carry the tag);
+  # the CPU pool itself node-selects azs[0] and the GPU pool spans both.
   tags = {
     Name                                        = "${var.cluster_name}-private-${element(var.azs, count.index)}"
     "kubernetes.io/cluster/${var.cluster_name}" = "shared"

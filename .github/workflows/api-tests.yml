@@ -18,6 +18,23 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/api-tests.yml"
+  pull_request:
+    paths:
+      - "cmd/api/**"
+      - "cmd/mockworker/**"
+      - "cmd/adapter/**"
+      - "cmd/vllmworker/**"
+      - "internal/api/**"
+      - "internal/queue/**"
+      - "internal/metrics/**"
+      - "internal/tracing/**"
+      - "internal/config/**"
+      - "internal/worker/**"
+      - "internal/registry/**"
+      - "internal/adapter/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/api-tests.yml"
 
 permissions:
   contents: read

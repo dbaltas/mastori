@@ -34,6 +34,11 @@ spec:
           operator: Equal
           value: "true"
           effect: NoSchedule
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: adapter
           image: mastori/api:latest
@@ -45,6 +50,11 @@ spec:
           ports:
             - containerPort: 8080
               name: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           readinessProbe:
             httpGet:
               path: /health
@@ -57,6 +67,12 @@ spec:
             limits:
               cpu: "1"
               memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

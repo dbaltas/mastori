@@ -1,3 +1,9 @@
+# Redis is the queue/state backing the benchmark: a restart voids the run,
+# and persistence on the node's ephemeral disk gives no durability anyway
+# (decision 6 + review K-M3). So: no AOF, no RDB — fail loudly via OOM guard
+# (--maxmemory + noeviction) instead of OOMKilling the pod mid-run, Recreate
+# so two Redis pods never briefly split the stream state, and a liveness
+# probe so a wedged redis is restarted. Pinned to 7.4-alpine by index digest.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,6 +13,8 @@ metadata:
     app: redis
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: redis
@@ -17,10 +25,29 @@ spec:
     spec:
       nodeSelector:
         mastori/pool: cpu
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999 # the redis user in the alpine image
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: redis
-          image: redis:7-alpine
-          args: ["redis-server", "--appendonly", "yes"]
+          image: redis@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe # redis:7.4-alpine
+          args:
+            - redis-server
+            - --appendonly
+            - "no"
+            - --save
+            - ""
+            # Guardrail: 1600mb of the 2Gi memory limit; hitting it returns
+            # errors loudly instead of OOMKilling the pod (review K-M3).
+            - --maxmemory
+            - 1600mb
+            - --maxmemory-policy
+            - noeviction
           ports:
             - containerPort: 6379
               name: redis
@@ -29,13 +56,30 @@ spec:
               cpu: 100m
               memory: 256Mi
             limits:
-              cpu: "1"
               memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
           readinessProbe:
             tcpSocket:
               port: redis
             initialDelaySeconds: 2
             periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        # Ephemeral by design (decision 6): the run state must not outlive the
+        # pod, and persistence would add fsync/rewrite I/O to the measured path.
+        - name: data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

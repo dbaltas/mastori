@@ -55,7 +55,6 @@ resource "aws_iam_role_policy_attachment" "node_ecr" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
-resource "aws_iam_instance_profile" "node" {
-  name = "${var.cluster_name}-node"
-  role = aws_iam_role.node.name
-}
+# No aws_iam_instance_profile here: managed node groups reference the role
+# directly (node_role_arn) and EKS creates the instance profile itself — a
+# TF-managed profile would be unused (review nit).

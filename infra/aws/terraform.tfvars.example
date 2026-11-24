@@ -2,14 +2,26 @@
 # With no admin_cidrs the cluster has no public endpoint: access requires a
 # tunnel from inside the VPC. Add your public IP as /32 to use the public
 # endpoint (still no in-cluster load balancer; benchmark traffic stays private).
+# The supported access path is the public endpoint restricted to your /32:
+# private-only mode has no fallback (no bastion, SSM or VPN exists).
 
 # admin_cidrs = ["203.0.113.5/32"]
+
+# EKS access entries (review T-M1): your IAM principal ARN(s) get
+# AmazonEKSClusterAdminPolicy. Required before switching
+# cluster_authentication_mode to "API".
+# admin_principals = ["arn:aws:iam::<account-id>:user/<you>"]
+# cluster_authentication_mode = "API"
 
 # node_instance_type = "m6g.xlarge"
 # node_count         = 1
 
 # GPU pool (Milestone 2): scales to zero by default; change max/min only when
-# quota is approved and eu-north-1 capacity is confirmed.
-# gpu_instance_types = ["g5.xlarge"]
+# quota is approved and eu-north-1 capacity is confirmed. NOTE: g5.* is NOT
+# offered in eu-north-1a (verified 2026-11-21); the default is g6.xlarge (L4).
+# Prefer a single type per experiment series — mixed types (g6.xlarge,g5.xlarge)
+# let AWS pick a different chip per node and silently change the hardware
+# under test (the 2026-11-23 run got an A10G this way).
+# gpu_instance_types = ["g6.xlarge"]
 # gpu_node_max_count = 1
 # gpu_capacity_type  = "ON_DEMAND"  # SPOT allowed: interrupted run -> invalid

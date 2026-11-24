@@ -427,6 +427,110 @@ error/edge cases.
   handling, goroutine lifetimes, error wrapping, test coverage gaps
   flagged in the local-quality items above.
 
+### Infra review 2026-11-24 (mastori-notes/review-2026-11-24/04-infra-terraform-k8s-ci.md)
+
+Done 2026-11-24 (uncommitted in the `tf` worktree — coordinate applies):
+
+- [x] **T-H1** — node groups `ignore_changes` desired/min (CPU + GPU); an
+  apply can no longer drain scaled nodes mid-run. `make aws-gpu-scale
+  GPU_NODES=0` clamps maxSize=1 (AWS rejects maxSize=0).
+- [x] **T-H2 (prepared, not activated)** — commented S3 backend blocks in
+  both `versions.tf` (`use_lockfile`), migration steps in
+  `infra/aws/README.md`. Activation = bucket create + `terraform init
+  -migrate-state` in both roots; deliberately NOT run while another session
+  may be executing terraform.
+- [x] **T-M1** — EKS access management: `access_config` +
+  `aws_eks_access_entry`/`aws_eks_access_policy_association`
+  (AmazonEKSClusterAdminPolicy), bootstrap creator-admin off.
+  Default mode `API_AND_CONFIG_MAP` (safe on the live cluster); flip tfvars
+  to `"API"` after `admin_principals` is set and verified.
+- [x] **T-M2** — node groups follow `launch_template.latest_version` (both).
+- [x] **T-M3** — GPU LT: gp3 throughput 500 / iops 6000, `encrypted`, IMDS
+  hop limit 1 + required tokens; CPU LT: 50GB root + same metadata_options.
+- [x] **T-M4** — tfvars example g5→g6 + single-type-per-series warning;
+  README AZ/cross-AZ section rewritten; `make aws-gpu-type-check
+  INSTANCE_TYPE=…` guard fails a mismatched run before traffic.
+- [x] **T-M5** — managed `aws_eks_addon` for vpc-cni/kube-proxy/coredns/
+  eks-pod-identity-agent (adopt on the live cluster restarts aws-node /
+  coredns pods — not mid-run); unused `pod_cidr` removed.
+- [x] **T-M6/T-M7** — log group `depends_on`; `upgrade_policy STANDARD`.
+- [x] **T-L1** — provider `~> 6.0` (lock already on 6.73.0, no re-init);
+  CI terraform 1.9.8 → 1.14.8 to match local.
+- [x] **T-L2/L3/L4** — IRSA `aud` condition; `s3:HeadObject` dropped,
+  `AbortMultipartUpload` added; TLS-only bucket policy, MPU abort rule,
+  `BucketOwnerEnforced`.
+- [x] **T-L6** — public endpoint + /32 documented as the supported path;
+  `public_access_cidrs` uses null (no permanent diff).
+- [x] **T-L8** — ECR default `IMMUTABLE` (in-place update; corrected
+  re-mirrors need NEW tags, mirror-vllm skips existing); aws-ecr-destroy
+  failure documented in Makefile + README; `*.log` gitignored.
+- [x] **Nits** — unused instance profile dropped; ManagedBy/Stack default
+  tags; stale vpc.tf comment fixed.
+- [x] **K-H1** — aws-inference builds from `../aws` (+ images rewrite kept
+  at overlay level: a parent's images transform does not reach component
+  resources); mockworker→0 + WORKER_MODELS=mock stay as defense in depth.
+  The code-level "empty WORKER_MODELS ≠ match-all" change is deliberately
+  NOT made: the local stack's serve-any default is load-bearing there; the
+  overlays pin explicitly instead.
+- [x] **K-H2** — vLLM Recreate (deadlock gone); weights image is now
+  busybox-based (bake: `crane append --base busybox:1.37`, tag
+  `qwen3-4b-1cfa9a7`), pulled by the kubelet with node credentials — the
+  12h push token is out of the vLLM pod-start path entirely.
+- [x] **K-M1** — vLLM args pinned (gpu-mem-util, batched tokens, dtype,
+  seed, prefix caching, chunked prefill); HF weights pinned to revision
+  1cfa9a7… with per-file sha256 checks; crane pinned v0.22.1 + sha256;
+  helm charts pinned (nvdp 0.20.2, dcgm-exporter 4.9.0).
+- [x] **K-M2** — vLLM/api CPU limits removed (CFS throttling in the
+  measured path); vllmworker moved to the CPU pool on EKS.
+- [x] **K-M3** — redis: Recreate, `--appendonly no --save ""`,
+  maxmemory 1600mb noeviction, liveness probe, `redis:7.4-alpine` digest.
+- [x] **K-M4** — securityContext (runAsNonRoot, seccomp, drop ALL,
+  readOnlyRootFilesystem + tmp emptyDirs) on every workload; PSA labels
+  (mastori/observability baseline, nvidia privileged);
+  automountServiceAccountToken=false except prometheus/fakegpu/traffic(IRSA).
+- [x] **K-M5** — Grafana anonymous Viewer; kind port mappings bind
+  127.0.0.1 (needs a cluster recreate to take effect).
+- [x] **Lows/nits** — prometheus emptyDir + retention.size + Recreate;
+  liveness probes everywhere; otel health_check + debug exporter removed;
+  tempo sizeLimit; traffic Job resources + activeDeadlineSeconds + node
+  securityContext; mirror jobs nodeSelector + pinned apk versions + pinned
+  revisions/checksums; kind NodePort patches → shared component;
+  decisions 10/11 (NetworkPolicy-by-design, PDB-only-on-api) documented.
+- [x] **C-M1** — promcapture CI workflow added; pull_request triggers on
+  all test workflows; terraform CI covers infra/aws-ecr + `fmt -recursive`
+  + terraform 1.14.8.
+- [x] **C-M2** — docker-publish gated behind vet+test (`needs:`), digest
+  output exposed, provenance+sbom attestations.
+- [x] **C-M3** — `.dockerignore` (git/worktrees/benchmark/infra/state).
+- [x] **C lows/nits** — Dockerfile single cached `-trimpath` build, digest-
+  pinned bases; ECR token piped (no temp file); `CONFIRM_DESTROY=1` guard;
+  `AWS_REGION ?=`; `make test -race`; `make fmt` fails on unformatted;
+  single `-l` selector; metrics capture port 7091; QEMU dropped; pages
+  permissions job-scoped; paths-ignore infra/deploy; Dependabot
+  (actions+docker).
+
+Still open (deliberate deferrals, need coordination or tooling):
+
+- [ ] **State backend activation** (T-H2): create the versioned bucket,
+  uncomment backend blocks, `terraform init -migrate-state` in both roots —
+  when no other session is running terraform.
+- [ ] **Live-cluster applies** (access entries before the API flip; addon
+  adoption restarts aws-node/coredns pods; LT edits roll node groups).
+- [ ] **OIDC thumbprint → `tls_certificate` data source** (needs the TLS
+  provider installed: one `terraform init`).
+- [ ] **KMS CMK for k8s Secrets** (T-L7), **CNI policy split off the node
+  role** (T-L5), **enhanced ECR scanning** — each is an apply-time cost
+  change; decide per cost guardrail.
+- [ ] **Digest pinning everywhere** (workload images, remaining third-party
+  images; GHCR digests now surfaced via the publish workflow output).
+- [ ] **Actions pinned to SHA** (Dependabot added as the first step);
+  cosign signing + Trivy in CI.
+- [ ] **kubeconform + reject-mutable-tags check** in kustomize CI
+  (Milestone 0 item).
+- [ ] **Account ID → kustomize replacements** (tracked in the older entry
+  above); **inference-adapter fully dropped from the cloud path** (kept at
+  replicas 0 — dropping it requires restructuring components/inference).
+
 ## Milestone 3 — Azure, concrete
 
 - [ ] Port the same base + `azure` overlay + Terraform for AKS (on-demand
