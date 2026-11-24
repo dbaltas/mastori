@@ -5,6 +5,8 @@ A benchmarking platform for LLM inference on GPU infrastructure.
 Run the same LLM workload on identical GPU resources across different providers — AWS, Azure, Nebius, Verda, or any other — and compare throughput, latency, utilization, and cost.
 
 > **Status: cloud-ready.** The local stack runs end to end with mock workers: a Go API with synchronous and streaming generation, a Redis job queue, a traffic generator (`cmd/traffic`), dataset fetch/validation (`benchmark/workloads`), Prometheus metrics, and Grafana dashboards — deployed on a local kind cluster. The same stack runs on AWS EKS: Terraform IaC (`infra/aws`) provisions the cluster with a CPU node pool and a scale-to-zero GPU node pool, real inference runs vLLM (`mastori/vllm`) serving Qwen3-4B from ECR-backed weights, and the traffic generator measures knee points with per-run provenance, metrics export, and results that survive teardown (`benchmark/results/`). See the [design document](gpu-inference-benchmarking-platform.md) for the full plan. Benchmark results are published to [the GitHub Pages site](https://dbaltas.github.io/mastori/).
+>
+> **GPU measurements are exploratory and under correction.** The 2026-11-22/23 headline numbers are retracted pending a formal rerun: the 11-22 traffic split ~2:1 to mock workers, the completions-stream parser dropped all vLLM tokens (client TTFT ≈ e2e), and vLLM's default `max_tokens=16` silently capped every measured output. Details in the correction blocks at the top of each story (`benchmark/results/20261122-eks-gpu-vllm-knee/story.md`, `benchmark/results/20261123-eks-gpu-vllm-toks/story.md`); only the site's mock-worker story should be cited as-is.
 
 ![Grafana dashboard](docs/grafana-overview.png)
 
@@ -34,6 +36,24 @@ Run the same LLM workload on identical GPU resources across different providers 
 5. ~~Cloud deployment with mock workers (CPU pool, IaC)~~
 6. ~~Cloud deployment with GPU inference (GPU pool, vLLM)~~
 7. Cross-provider experiments
+
+## Deliberate non-production omissions
+
+This is a benchmarking and learning platform, not a service. The gaps below
+are conscious choices, not oversights; none of them affect single-user
+benchmark runs:
+
+- **No auth or TLS** on the API, Redis, or OTLP; Grafana is anonymous admin.
+- **No retries or idempotency** — a worker error surfaces on the client as
+  a 60s timeout; abandoned (client-gone) jobs are not yet drained.
+- **Single ephemeral Redis** with no AOF/PVC — a Redis restart invalidates
+  the in-flight run (by design: a run is a repeatable experiment).
+- **No graceful drain** — pods get 10s to exit while streams can run 60s.
+- **Single point of everything**: one scheduler, one NAT, one workload AZ.
+- **Mutable tags everywhere** (`:latest` images, unpinned ECR tags); digest
+  pinning is an open todo. Terraform state is local.
+- **No pod security**: no securityContext, PodSecurity admission, or
+  NetworkPolicy.
 
 ## Running locally
 
