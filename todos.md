@@ -377,6 +377,36 @@ error/edge cases.
     utilization runs: open admission (no 429 shaping, MAX_INFLIGHT high) so
     the engine is driven to true saturation and peak tok/s is measurable;
     the 429-at-cap variant stays an option for a later formal knee run.
+### GPU/vLLM queue-cap re-baseline 2026-11-24 (`benchmark/results/20261124-redis-queue-cap/`)
+
+First session with every P0 measurement fix live + the scheduler admission
+cap (`SCHEDULER_WORKER_QUEUE_LIMIT=100`, `fa078c7`), run as the randomized
+protocol pilot (`scripts/randomized-protocol.sh`, review 05 §6/H7). 8 runs,
+two shuffled passes of the 5/10/20/40 ladder, 2m windows, 30s warmup, Redis
+flush between runs. Story + experiment YAML written; story numbers generated
+by `scripts/story-numbers.py` (review 05 §6 analysis rule). Results still in
+`results/cluster/` + untracked experiment dir — needs submodule commit/push.
+
+- Findings: queue moved home (vLLM waiting 0 all session, platform queue
+  up to ~2,260, worker stream pinned at cap 100, vLLM running max 100 of
+  the pinned max_num_seqs 256, 10,077 `workers_full`); A10G decode ceiling
+  ~2.6K output tok/s at batch ~100 (TPOT p50 ~38.7 ms), valid-run p50
+  6.09–10.02 s = service time at the cap (TTFT p50 70–130 ms); above
+  capacity (~10 r/s at 256 tokens) the 60 s `REQUEST_TIMEOUT` valve is
+  deterministic (successes 1,200/800 repeat across reps, clean timeout_504
+  stream errors, no 429/503/OOM).
+- New issue found: **the 60 s valve wastes ~24% of decode** (917,200 of
+  3,795,664 engine tokens generated for requests abandoned at the
+  deadline — abandon-after-dispatch; rate-40 warmups hit the valve too).
+  Fix direction: deadline-aware dispatch in the scheduler.
+- Open for the formal re-baseline / Experiment 7 (review §5): N ≥ 5 per
+  config with engine restarts between configs (the restart step did not
+  fire this session — RESTART_ENGINE=0; 23.2% cache-hit carryover),
+  cache control or ≥10× unique prompts (M1), direct `vllm bench serve`
+  baseline (M3), Poisson arrivals (M2), scrape ≤ 5 s, DCGM diag (M7),
+  billing log (M8), and the `skipped_offered` 1–6 root cause on valid
+  runs. Cap × `max_num_seqs` sweep still pending (H5).
+
 ### Benchmark methodology review 2026-11-24 (mastori-notes/review-2026-11-24/05-benchmark-methodology.md)
 
 - [x] **H2 — completions stream mis-parsed.** `internal/worker/openai.go`
