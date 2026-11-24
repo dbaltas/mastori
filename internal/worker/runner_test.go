@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +40,7 @@ func newRunnerHarness(t *testing.T) *runnerHarness {
 	return &runnerHarness{t: t, mr: mr, client: client, q: q, reg: registry.New(client, "", time.Minute)}
 }
 
-func (h *runnerHarness) start(id string, gen *MockGenerator, models ...string) (stop func()) {
+func (h *runnerHarness) startGen(id string, gen Generator, models ...string) (stop func()) {
 	h.t.Helper()
 	r := NewRunner(h.client, h.reg, gen, slog.New(slog.DiscardHandler), RunnerConfig{
 		ID: id, Models: models, ReadBlock: 20 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond,
@@ -56,6 +58,10 @@ func (h *runnerHarness) start(id string, gen *MockGenerator, models ...string) (
 	}
 	h.t.Cleanup(stop)
 	return stop
+}
+
+func (h *runnerHarness) start(id string, gen *MockGenerator, models ...string) (stop func()) {
+	return h.startGen(id, gen, models...)
 }
 
 // dispatch places a job on the worker's stream the way the scheduler does.
@@ -278,7 +284,34 @@ func TestRunnerChunksTTLOnlyAfterDone(t *testing.T) {
 
 	waitFor(t, "chunk stream created", func() bool { return h.mr.Exists("jobs:chunks:job-slow") })
 	if ttl := chunkTTL(t, h, "job-slow"); ttl != -1 {
-		t.Fatalf("chunk stream TTL before done = %v, want -1 (no expiry)", ttl)
+		t.Fatalf("chunk stream TTL while still running = %v, want -1 (no expiry yet)", ttl)
+	}
+}
+
+type failingGen struct{ err error }
+
+func (f *failingGen) Run(_ context.Context, _ queue.Job, _ func(queue.Chunk) error) error {
+	return f.err
+}
+
+func TestRunnerPublishesTerminalErrorChunk(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.startGen("w1", &failingGen{err: fmt.Errorf("backend exploded")})
+	h.dispatch("w1", queue.Job{ID: "job-fail", Prompt: "p", CreatedAt: time.Now().UTC()})
+
+	// WaitResult must fail fast with the worker's reason instead of letting
+	// the API wait out the full request timeout.
+	_, err := h.q.WaitResult(context.Background(), "job-fail")
+	if !errors.Is(err, queue.ErrJobFailed) {
+		t.Fatalf("WaitResult error = %v, want queue.ErrJobFailed", err)
+	}
+	if !strings.Contains(err.Error(), "backend exploded") {
+		t.Errorf("error = %v, want worker reason", err)
+	}
+
+	// The failed job's chunk stream must still get a TTL, not leak forever.
+	if ttl := chunkTTL(t, h, "job-fail"); ttl <= 0 {
+		t.Errorf("chunk stream TTL after generator error = %v, want expiry", ttl)
 	}
 }
 

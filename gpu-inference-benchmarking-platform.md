@@ -432,8 +432,10 @@ which layer they mean:
 
 - **Client TTFT / TPOT** — measured by the traffic generator at the SSE
   client; includes the full path (network, API, queue, inference).
-- **API TTFT / TPOT** — measured at the Go API; `mastori_api_ttft_seconds`
-  counts from request receipt to the first streamed token.
+- **API TTFT** — measured at the Go API: `mastori_api_ttft_seconds` counts
+  from request receipt to the first streamed token (the first non-empty
+  chunk). There is deliberately no API-level TPOT metric; client TPOT and
+  inference TPOT bracket the end-to-end value.
 - **Inference TTFT / TPOT** — exported by vLLM itself as Prometheus
   histograms (`vllm:time_to_first_token_seconds`,
   `vllm:time_per_output_token_seconds`); excludes the queue, API, and

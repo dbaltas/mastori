@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +119,36 @@ func TestWaitResultTimeout(t *testing.T) {
 	_, err := q.WaitResult(ctx, "job-3")
 	if err == nil {
 		t.Fatal("expected timeout error")
+	}
+}
+
+func TestWaitResultErrorChunk(t *testing.T) {
+	q, _, client := newTestQueue(t)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := q.WaitResult(context.Background(), "job-err")
+		errCh <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "jobs:chunks:job-err",
+		Values: map[string]any{"job_id": "job-err", "text": "", "done": "true", "error": "backend exploded"},
+	}).Err(); err != nil {
+		t.Fatalf("xadd: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrJobFailed) {
+			t.Fatalf("error = %v, want ErrJobFailed", err)
+		}
+		if !strings.Contains(err.Error(), "backend exploded") {
+			t.Errorf("error = %v, want worker reason", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error")
 	}
 }
 

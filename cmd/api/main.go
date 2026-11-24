@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,10 +51,19 @@ func main() {
 
 	h := api.NewHandler(cfg, q, m, logger)
 
+	// BaseContext is the root of every request context: canceling it unblocks
+	// in-flight SSE/generate handlers when the drain window closes, so Redis
+	// is only closed after the handlers have stopped.
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.NewRouter(cfg, m, logger, q.Ping, h),
 		ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return rootCtx
+		},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -73,11 +83,17 @@ func main() {
 		}
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Drain window: long enough for in-flight requests to finish within
+		// their own RequestTimeout, instead of cutting healthy streams.
+		grace := cfg.RequestTimeout + 5*time.Second
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("graceful shutdown failed", "error", err)
+			logger.Warn("graceful shutdown timed out; canceling in-flight requests", "error", err, "grace", grace)
 		}
+		// Unblock handlers still waiting so the deferred q.Close() below does
+		// not close Redis under live handlers.
+		cancelRoot()
 	}
 }
 

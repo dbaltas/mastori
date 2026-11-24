@@ -17,6 +17,9 @@ spec:
     spec:
       nodeSelector:
         mastori/pool: cpu
+      # Drain window in cmd/api = REQUEST_TIMEOUT (60s) + 5s buffer; the kube
+      # grace must cover it or SIGKILL arrives mid-drain.
+      terminationGracePeriodSeconds: 75
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname

@@ -84,9 +84,25 @@ func (h *Handler) Generate(w http.ResponseWriter, r *http.Request) {
 	waitStart := time.Now()
 	res, err := h.queue.WaitResult(waitCtx, job.ID)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		switch {
+		case r.Context().Err() != nil:
+			// Client disconnected: the worker would keep generating for a
+			// client that is gone. Abandon quietly, no error log.
+			abandonSpan(ctx, job.ID, "client_disconnected")
+			span.SetAttributes(attribute.String("job.abandon_reason", "client_disconnected"))
+			h.abandon(job.ID)
+			return
+		case errors.Is(err, queue.ErrJobFailed):
+			// The worker already reported why the job died; surface it.
+			span.RecordError(err)
+			waitSpan.RecordError(err)
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		case errors.Is(err, context.DeadlineExceeded):
 			waitSpan.SetAttributes(attribute.Bool("job.timed_out", true))
 			span.SetAttributes(attribute.Bool("job.timed_out", true))
+			abandonSpan(ctx, job.ID, "timeout")
+			h.abandon(job.ID)
 			writeError(w, http.StatusGatewayTimeout, "request timed out waiting for result")
 			return
 		}
@@ -115,7 +131,7 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "api.generate_stream")
 	defer span.End()
 
-	waitStart := time.Now()
+	reqStart := time.Now()
 
 	sq, ok := h.queue.(queue.StreamingQueue)
 	if !ok {
@@ -165,19 +181,34 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 
 	failStream := func(err error, reason string) {
 		abandonSpan(ctx, job.ID, reason)
+		if r.Context().Err() != nil {
+			// Client disconnected: either an explicit disconnect before the
+			// first chunk or a write failure. Not a timeout, no error log —
+			// abandoning quietly is the whole point of the abandon path.
+			span.SetAttributes(attribute.String("job.abandon_reason", "client_disconnected"))
+			h.abandon(job.ID)
+			return
+		}
 		msg := "failed to retrieve result"
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
 			span.SetAttributes(attribute.Bool("job.timed_out", true))
 			consumeSpan.SetAttributes(attribute.Bool("job.timed_out", true))
 			msg = "request timed out waiting for result"
-		} else {
+		case errors.Is(err, queue.ErrJobFailed):
+			// The worker already told us why the job died; pass the real
+			// reason through instead of a generic timeout.
+			span.RecordError(err)
+			consumeSpan.RecordError(err)
+			msg = err.Error()
+		default:
 			span.RecordError(err)
 			consumeSpan.RecordError(err)
 			h.logger.ErrorContext(ctx, "stream failed", "error", err, "job_id", job.ID)
 		}
 		_ = writeSSE(w, "error", map[string]string{"error": msg})
 		flusher.Flush()
-		_ = sq.Abandon(context.WithoutCancel(waitCtx), job.ID)
+		h.abandon(job.ID)
 	}
 
 	for !completed {
@@ -196,9 +227,17 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			chunkCount++
-			if firstToken {
-				ttftMs := time.Since(waitStart).Milliseconds()
-				h.m.TTFTSeconds.Observe(time.Since(waitStart).Seconds())
+			if chunk.Error != "" {
+				failStream(fmt.Errorf("%w: %s", queue.ErrJobFailed, chunk.Error), "job_error")
+				return
+			}
+			if firstToken && chunk.Text != "" {
+				// TTFT is defined against the first token, not the first
+				// chunk: the terminal Done chunk carries no text, and a
+				// stream that only produced it would otherwise record an
+				// e2e latency as TTFT.
+				ttftMs := time.Since(reqStart).Milliseconds()
+				h.m.TTFTSeconds.Observe(time.Since(reqStart).Seconds())
 				firstToken = false
 				consumeSpan.SetAttributes(attribute.Int64("stream.ttft_ms", ttftMs))
 			}
@@ -207,8 +246,7 @@ func (h *Handler) GenerateStream(w http.ResponseWriter, r *http.Request) {
 				span.AddEvent("sse.write_failed", trace.WithAttributes(
 					attribute.Int("stream.chunk", chunkCount),
 				))
-				abandonSpan(ctx, job.ID, "client_disconnected")
-				_ = sq.Abandon(context.WithoutCancel(waitCtx), job.ID)
+				failStream(errClientGone, "client_disconnected")
 				return
 			}
 			flusher.Flush()
@@ -320,6 +358,22 @@ func abandonSpan(ctx context.Context, jobID, reason string) {
 	))
 	span.End()
 }
+
+// abandon tells the queue the client is gone so the worker stops generating.
+// It uses a bounded detached context: the request context may already be
+// canceled, and the abandon publish must still go out.
+func (h *Handler) abandon(jobID string) {
+	sq, ok := h.queue.(queue.StreamingQueue)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = sq.Abandon(ctx, jobID)
+}
+
+// errClientGone marks an SSE write failure: the client stopped reading.
+var errClientGone = errors.New("client stopped reading the stream")
 
 func writeSSE(w http.ResponseWriter, event string, payload any) bool {
 	b, err := json.Marshal(payload)

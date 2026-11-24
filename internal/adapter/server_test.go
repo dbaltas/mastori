@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func newFakeOllama(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *Server) {
@@ -56,6 +58,9 @@ func TestCompletionsNonStream(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Model != "tiny" || req.Prompt != "hello world" {
 			t.Errorf("request = %+v", req)
+		}
+		if !req.Stream {
+			t.Errorf("request must set stream=true; got %+v", req)
 		}
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		_, _ = w.Write([]byte(ollamaStreamBody("a b", 5, 2, false)))
@@ -158,6 +163,9 @@ func TestChatCompletionsStreamAndNonStream(t *testing.T) {
 		if len(req.Messages) == 0 || len(req.Messages) > 2 {
 			t.Errorf("messages = %+v", req.Messages)
 		}
+		if !req.Stream {
+			t.Errorf("request must set stream=true; got %+v", req)
+		}
 		isChat := len(req.Messages) > 0
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		_, _ = w.Write([]byte(ollamaStreamBody("hi there", 9, 2, isChat)))
@@ -216,6 +224,31 @@ func extractContents(t *testing.T, body string) []string {
 		}
 	}
 	return out
+}
+
+func TestNumRequestsRunningCountedOnce(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	_, s := newFakeOllama(t, func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(ollamaStreamBody("a b", 5, 2, false)))
+	})
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NewRouter(s).ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"prompt":"hi","stream":true}`)))
+	}()
+
+	<-entered
+	if got := testutil.ToFloat64(s.Metrics.NumRequestsRunning.WithLabelValues("tiny")); got != 1 {
+		t.Errorf("num_requests_running = %v during stream, want 1 (double count)", got)
+	}
+	close(release)
+	<-done
 }
 
 func TestCompletionsInvalidPrompt(t *testing.T) {

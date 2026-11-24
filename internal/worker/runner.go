@@ -30,8 +30,8 @@ type RunnerConfig struct {
 	AbandonPrefix      string
 	HeartbeatInterval  time.Duration
 	ReadBlock          time.Duration
-	// ChunksTTL expires a job's chunk stream after the done chunk is
-	// published; zero uses the default, negative disables the TTL.
+	// ChunksTTL expires a job's chunk stream when process returns, whatever
+	// the outcome; zero uses the default, negative disables the TTL.
 	ChunksTTL time.Duration
 }
 
@@ -193,6 +193,13 @@ func (r *Runner) process(ctx context.Context, job queue.Job, entryID string) {
 		r.mu.Lock()
 		delete(r.cancels, job.ID)
 		r.mu.Unlock()
+		// Whatever the outcome — done, generator error, abandon, shutdown —
+		// the chunk stream must not outlive its usefulness in Redis without
+		// an expiry. Uses a fresh context so a canceled job context cannot
+		// skip it.
+		if r.cfg.ChunksTTL > 0 {
+			r.expireChunks(job.ID)
+		}
 	}()
 
 	// Rejoin the trace the API started: the job carries the serialized W3C
@@ -235,16 +242,35 @@ func (r *Runner) process(ctx context.Context, job queue.Job, entryID string) {
 		}).Err(); err != nil {
 			return err
 		}
-		if c.Done && r.cfg.ChunksTTL > 0 {
-			r.expireChunks(job.ID)
-		}
 		return nil
 	})
 	if err != nil && ctx.Err() == nil {
 		span.RecordError(err)
 		r.logger.Error("job generation failed", "job_id", job.ID, "error", err)
+		r.publishError(job, err)
 	}
 	r.finish(entryID)
+}
+
+// publishError writes a terminal error chunk (done=true, error=<reason>) so
+// WaitResult fails fast with queue.ErrJobFailed and the SSE stream can carry
+// the real reason to the client. It uses a fresh context: the job context may
+// already be canceled, but the reason must still reach the client.
+func (r *Runner) publishError(job queue.Job, genErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := r.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: r.cfg.ChunksPrefix + job.ID,
+		Values: map[string]any{
+			"job_id": job.ID,
+			"done":   strconv.FormatBool(true),
+			"error":  genErr.Error(),
+		},
+		MaxLen: 10000,
+		Approx: true,
+	}).Err(); err != nil {
+		r.logger.Warn("publish error chunk failed", "job_id", job.ID, "error", err)
+	}
 }
 
 // finish deletes a processed entry from the worker's stream. The scheduler
@@ -259,9 +285,9 @@ func (r *Runner) finish(entryID string) {
 	}
 }
 
-// expireChunks sets the TTL on a finished job's chunk stream so Redis cleans
-// it up. It uses a fresh context so the TTL is not skipped by a canceled job
-// context right after the final chunk was published.
+// expireChunks sets the TTL on a job's chunk stream so Redis cleans it up.
+// It runs when process returns, regardless of outcome. It uses a fresh
+// context so a canceled job context cannot skip it.
 func (r *Runner) expireChunks(jobID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

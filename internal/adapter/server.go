@@ -184,6 +184,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	result, err := s.Ollama.StreamGeneration(r.Context(), generateRequest{
 		Model:   model,
 		Prompt:  prompt,
+		Stream:  true,
 		Options: ollamaOptions(req.MaxTokens, req.Temperature),
 	}, func(ch GenerateChunk) error {
 		text.WriteString(ch.Response)
@@ -206,7 +207,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 				"finish_reason": "stop",
 			},
 		},
-		"usage": usageFromFinal(result, prompt, result.Response),
+		"usage": usageFromFinal(result, prompt, text.String()),
 	})
 }
 
@@ -250,6 +251,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	result, err := s.Ollama.StreamGeneration(r.Context(), generateRequest{
 		Model:    model,
 		Messages: messages,
+		Stream:   true,
 		Options:  ollamaOptions(maxTokens, req.Temperature),
 	}, func(ch GenerateChunk) error {
 		if ch.Message != nil {
@@ -294,7 +296,6 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, spec s
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	defer s.trackRunning(spec.model)()
 
 	object := "text_completion"
 	if spec.chat {
@@ -314,6 +315,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, spec s
 		Model:    spec.model,
 		Prompt:   spec.prompt,
 		Messages: spec.messages,
+		Stream:   true,
 		Options:  ollamaOptions(spec.maxTokens, spec.temperature),
 	}
 

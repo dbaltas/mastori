@@ -59,6 +59,9 @@ func (q *RedisQueue) WaitResult(ctx context.Context, jobID string) (Result, erro
 			if !ok {
 				return Result{}, fmt.Errorf("queue: chunk stream closed before done for job %s", jobID)
 			}
+			if chunk.Error != "" {
+				return Result{}, fmt.Errorf("%w: %s", ErrJobFailed, chunk.Error)
+			}
 			sb.WriteString(chunk.Text)
 			if chunk.Done {
 				return Result{
@@ -152,6 +155,7 @@ func chunkFromValues(values map[string]any) (Chunk, error) {
 	var c Chunk
 	c.JobID = stringValue(values["job_id"])
 	c.Text = stringValue(values["text"])
+	c.Error = stringValue(values["error"])
 	if v := values["done"]; v != nil {
 		done, err := strconv.ParseBool(stringValue(v))
 		if err != nil {

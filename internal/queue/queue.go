@@ -2,8 +2,14 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrJobFailed reports that a job terminated with an error on the worker
+// side (backend failure, malformed backend response, publish failure).
+// The underlying message carries the worker's reason.
+var ErrJobFailed = errors.New("job failed")
 
 type Job struct {
 	ID      string
@@ -37,9 +43,12 @@ type Result struct {
 }
 
 type Chunk struct {
-	JobID       string `json:"job_id"`
-	Text        string `json:"text"`
-	Done        bool   `json:"done"`
+	JobID string `json:"job_id"`
+	Text  string `json:"text"`
+	Done  bool   `json:"done"`
+	// Error, when non-empty, marks a terminal error chunk: the job failed on
+	// the worker and will never produce output. Done is also true.
+	Error       string `json:"error,omitempty"`
 	TokensIn    int64  `json:"tokens_in"`
 	TokensOut   int64  `json:"tokens_out"`
 	QueueWaitMs int64  `json:"queue_wait_ms"`

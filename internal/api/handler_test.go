@@ -511,6 +511,158 @@ func TestStreamTTFTIncludesParseAndEnqueue(t *testing.T) {
 	}
 }
 
+func TestStreamTTFTSkipsEmptyDoneChunk(t *testing.T) {
+	// A stream that only produced the terminal Done chunk (no tokens) must
+	// not record its e2e duration as TTFT.
+	fq := &fakeQueue{
+		chunkFn: func(_ context.Context, id string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk, 1)
+			chunks <- queue.Chunk{JobID: id, Text: "", Done: true, TokensOut: 0}
+			close(chunks)
+			errCh := make(chan error)
+			return chunks, errCh
+		},
+	}
+	m := metrics.New()
+	h := NewHandler(&config.Config{
+		RequestTimeout: 5 * time.Second,
+		MaxInflight:    1000,
+		DefaultModel:   "test-model",
+	}, fq, m, slog.New(slog.DiscardHandler))
+	srv := NewRouter(&config.Config{}, m, slog.New(slog.DiscardHandler), fq.Ping, h)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if count, _ := ttftSample(m.Registry); count != 0 {
+		t.Errorf("ttft sample count = %d, want 0 (no token ever arrived)", count)
+	}
+}
+
+func TestGenerateJobFailedMapsTo502(t *testing.T) {
+	fq := &fakeQueue{
+		waitFn: func(context.Context, string) (queue.Result, error) {
+			return queue.Result{}, fmt.Errorf("%w: backend exploded", queue.ErrJobFailed)
+		},
+	}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "backend exploded") {
+		t.Errorf("body = %s, want worker reason", rec.Body.String())
+	}
+}
+
+func TestGenerateSyncAbandonsOnTimeout(t *testing.T) {
+	fq := &fakeQueue{
+		waitFn: func(ctx context.Context, _ string) (queue.Result, error) {
+			<-ctx.Done()
+			return queue.Result{}, ctx.Err()
+		},
+	}
+	srv := newTestServer(t, fq, 50*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", rec.Code)
+	}
+	if len(fq.abandoned) != 1 {
+		t.Errorf("abandoned jobs = %v, want 1: sync timeout must abandon", fq.abandoned)
+	}
+}
+
+func TestGenerateSyncAbandonsOnDisconnect(t *testing.T) {
+	fq := &fakeQueue{
+		waitFn: func(ctx context.Context, _ string) (queue.Result, error) {
+			<-ctx.Done()
+			return queue.Result{}, ctx.Err()
+		},
+	}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt": "hi"}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	cancel()
+	srv.ServeHTTP(rec, req)
+
+	if len(fq.abandoned) != 1 {
+		t.Errorf("abandoned jobs = %v, want 1: client disconnect must abandon", fq.abandoned)
+	}
+}
+
+func TestStreamDisconnectIsNotTimeout(t *testing.T) {
+	// Client disconnects while the request is still queued: the common case
+	// under load. The abandon reason must be the disconnect, not a timeout.
+	fq := &fakeQueue{
+		chunkFn: func(ctx context.Context, _ string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk)
+			errCh := make(chan error, 1)
+			go func() {
+				<-ctx.Done()
+				errCh <- context.Canceled
+				close(chunks)
+			}()
+			return chunks, errCh
+		},
+	}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	cancel()
+	srv.ServeHTTP(rec, req)
+
+	if len(fq.abandoned) != 1 {
+		t.Errorf("abandoned jobs = %v, want 1", fq.abandoned)
+	}
+	if strings.Contains(rec.Body.String(), "timed out") {
+		t.Errorf("body = %s, disconnect must not be labeled as timeout", rec.Body.String())
+	}
+}
+
+func TestStreamJobFailedCarriesReason(t *testing.T) {
+	fq := &fakeQueue{
+		chunkFn: func(_ context.Context, id string) (<-chan queue.Chunk, <-chan error) {
+			chunks := make(chan queue.Chunk, 1)
+			chunks <- queue.Chunk{JobID: id, Text: "", Done: true, Error: "backend exploded"}
+			close(chunks)
+			errCh := make(chan error)
+			return chunks, errCh
+		},
+	}
+	srv := newTestServer(t, fq, 5*time.Second)
+
+	req := httptest.NewRequest(http.MethodPost, "/generate/stream", strings.NewReader(`{"prompt": "hi"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "backend exploded") {
+		t.Errorf("body missing worker reason; body:\n%s", body)
+	}
+	if strings.Contains(body, "timed out") {
+		t.Errorf("body = %s, job failure must not be labeled as timeout", body)
+	}
+	if len(fq.abandoned) != 1 {
+		t.Errorf("abandoned jobs = %v, want 1: failed job must be abandoned", fq.abandoned)
+	}
+}
+
 func ttftSample(reg *prometheus.Registry) (uint64, float64) {
 	families, err := reg.Gather()
 	if err != nil {
