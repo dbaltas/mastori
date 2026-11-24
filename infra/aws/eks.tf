@@ -176,7 +176,8 @@ resource "aws_eks_node_group" "gpu" {
 
   # GPU pool spans both private AZs: g6.xlarge capacity is per-AZ and 1a
   # regularly reports InsufficientInstanceCapacity, so the ASG must be able
-  # to launch in 1b. Cross-AZ traffic to the CPU pool is priced and modest.
+  # to launch in 1b. The CPU pool also runs in azs[0] (eu-north-1b), so
+  # GPU-to-CPU traffic is same-AZ unless a GPU node lands in 1a.
   subnet_ids = aws_subnet.private[*].id
 
   # Scale to zero (decision 8): desired=min=0 so an idle GPU pool bills

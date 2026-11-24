@@ -1,5 +1,6 @@
 # VPC: 2 AZs of private subnets (EKS requirement), everything private.
-# Workloads run in azs[0]; the second subnet exists only to satisfy EKS.
+# Workloads run in azs[0] (eu-north-1b — 1a is regularly dry for GPU types);
+# the second subnet exists only to satisfy EKS.
 # Single NAT Gateway + EIP for outbound (image pulls, AWS API calls).
 
 resource "aws_vpc" "main" {

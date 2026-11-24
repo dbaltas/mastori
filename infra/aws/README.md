@@ -10,8 +10,9 @@ directory never touches it.
 
 ## What it creates
 
-- VPC with one private subnet per AZ in `eu-north-1a`/`eu-north-1b`; workloads
-  run in `a`, subnet `b` exists to satisfy the EKS 2-AZ requirement.
+- VPC with one private subnet per AZ in `eu-north-1b`/`eu-north-1a`; workloads
+  run in `b` (azs[0] — 1a is regularly dry for GPU types), subnet `a` exists
+  to satisfy the EKS 2-AZ requirement.
 - One NAT Gateway + EIP for outbound (image pulls, AWS APIs). Image pulls from
   ECR **bypass the NAT gateway** via VPC endpoints (`ecr.api` + `ecr.dkr`
   interface endpoints in azs[0] only, plus the free S3 gateway endpoint —

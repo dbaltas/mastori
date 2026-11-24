@@ -29,9 +29,9 @@ variable "vpc_cidr" {
 }
 
 variable "azs" {
-  description = "Availability zones. EKS requires subnets in 2 AZs; workloads run in one."
+  description = "Availability zones. EKS requires subnets in 2 AZs; workloads run in one (azs[0] = eu-north-1b, where GPU capacity actually exists — 1a is regularly dry)."
   type        = list(string)
-  default     = ["eu-north-1a", "eu-north-1b"]
+  default     = ["eu-north-1b", "eu-north-1a"]
 }
 
 variable "pod_cidr" {
