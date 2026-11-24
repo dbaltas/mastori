@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y pandoc
       - name: Build site
         run: go run ./cmd/sitegen -benchmark benchmark -out site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
