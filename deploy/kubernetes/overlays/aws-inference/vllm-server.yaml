@@ -33,6 +33,11 @@ metadata:
     app: vllm
 spec:
   replicas: 1
+  # Single-replica GPU pod on a 1-GPU node: RollingUpdate deadlocks (the new
+  # pod needs the GPU the old pod still holds — observed live 2026-11-24,
+  # review P3 #20). Recreate terminates before creating.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm

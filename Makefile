@@ -437,4 +437,4 @@ cluster-metrics-capture:
 	  -out benchmark/results/$(EXPERIMENT)/metrics \
 	  $(if $(START),-start $(START)) $(if $(END),-end $(END)) \
 	  -step $(if $(STEP),$(STEP),15s) \
-	  -match "$(if $(MATCH),$(MATCH),vllm:|DCGM_|mastori_)"
+	  -match "$(if $(MATCH),$(MATCH),vllm:.*|DCGM_.*|mastori.*)"
