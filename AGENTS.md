@@ -5,6 +5,7 @@ Guidance for AI agents and contributors working on Mastori. See [README.md](READ
 ## Sessions
 
 - Unless the user specifically says otherwise, start every session by rebasing onto the latest `origin/main` (`git fetch origin && git rebase origin/main`).
+- When working in a git worktree, rebase onto the **local** `main` branch instead (`git rebase main`), NOT `origin/main`.
 
 ## Testing
 
